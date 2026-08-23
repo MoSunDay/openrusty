@@ -1,4 +1,4 @@
-//! Pure helpers for the kv-scheduler plugin (host-unit-testable).
+//! Pure helpers for the vllm-kv-scheduler plugin (host-unit-testable).
 
 use alloc::string::String;
 use alloc::vec::Vec;

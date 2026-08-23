@@ -22,6 +22,16 @@ OUT_DIR="build/plugins"
 mkdir -p "$OUT_DIR"
 
 shopt -s nullglob
+
+# Drop artifacts of plugins that were renamed or removed, so the output dir
+# only ever contains wasm files matching a current plugins/<dir>.
+for f in "$OUT_DIR"/*.wasm; do
+  if [ ! -d "plugins/$(basename "$f" .wasm)" ]; then
+    echo ">> removing stale artifact $f"
+    rm -f "$f"
+  fi
+done
+
 built=0
 for dir in plugins/*/; do
   manifest="${dir}Cargo.toml"

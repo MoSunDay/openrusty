@@ -6,7 +6,7 @@ Commit: d9a7ede
 
 ## 触发方式
 - 由转发路径自动驱动（每次 upstream 尝试前选一个健康 peer）；策略在 `config/openrusty.toml` 的 `[[upstreams]].balancer` 配置：`swrr` | `ip_hash`。
-- 插件可在 `balancer` 阶段接管 peer 选择（如 [kv-scheduler 亲和调度](../kv-scheduler/index.md)）。
+- 插件可在 `balancer` 阶段接管 peer 选择（如 [vllm-kv-scheduler 亲和调度](../vllm-kv-scheduler/index.md)）。
 
 ## 行为与规则
 - `swrr`：平滑加权轮询，按 `[[upstreams.peers]].weight` 分配，避免突发集中。

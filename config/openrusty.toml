@@ -11,7 +11,7 @@ log_level = "info"
 # Directory scanned for *.wasm plugin modules (loaded in `order`, else sorted by file name).
 dir = "build/plugins"
 # Execution order of plugins within a phase. Plugins missing from the list run after, by name.
-order = ["kv-scheduler"]
+order = ["vllm-kv-scheduler"]
 # Hard timeout for one plugin phase invocation (milliseconds). Enforced via wasmtime epoch interruption.
 timeout_ms = 50
 # Per-request memory ceiling granted to each plugin instance (MiB).
@@ -20,7 +20,7 @@ max_memory_mb = 16
 on_failure = "fail_open"
 
 # Per-plugin free-form settings, visible to the plugin as key/value strings.
-[plugins.settings.kv-scheduler]
+[plugins.settings.vllm-kv-scheduler]
 # How to extract the task key from the request:
 #   "query:<param>"   - query string parameter
 #   "path:<segment>"  - 1-based path segment
