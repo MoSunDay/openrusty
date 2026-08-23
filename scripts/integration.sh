@@ -2,8 +2,11 @@
 # OpenRusty integration drill: proxy, SSE, h2c, WebSocket, sticky
 # scheduling, hot reload (incl. in-flight + rejected reload + load),
 # passive health check, plugin fault containment, route timeouts,
-# ip_hash, health survival across reloads, KV del/TTL probes, and
-# memory-ceiling containment.
+# ip_hash, health survival across reloads, KV del/TTL probes,
+# memory-ceiling containment, /openrusty/status shape, plugin phases
+# (post_read, rewrite, access, body_filter, log), KV scan from a
+# plugin, path-key extraction + per-node task cap with fallback, and
+# OPENRUSTY_CONFIG env startup.
 set -u
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -303,6 +306,63 @@ check "fail_open contains memory-hungry plugin" test "$CODE" = "200"
 check "memory trap counted in status" bash -c "curl -s $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);print([p[\"errors\"] for p in d[\"plugins\"] if p[\"name\"]==\"glutton\"][0])' | grep -vq '^0$'"
 rm "$TMP/plugins/glutton.wasm"
 curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+
+echo "== 18. status endpoint shape =="
+check "status: generation >= 1" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d[\"generation\"]>=1'"
+check "status: plugins include kv-scheduler and kv-probe" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);names={p[\"name\"] for p in d[\"plugins\"]};assert {\"kv-scheduler\",\"kv-probe\"}<=names'"
+check "status: upstream has 3 peers, 3 healthy" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);u=d[\"upstreams\"][0];assert u[\"peers\"]==3 and u[\"healthy\"]==3'"
+check "status: routes >= 2" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d[\"routes\"]>=2'"
+
+echo "== 19. phases: post_read, rewrite, access =="
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=postread")"
+check "post_read KV visible in content" test "$CODE" = "204"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=rewritecheck")"
+check "rewrite KV visible in content" test "$CODE" = "204"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?rwdeny=1")"
+check "rewrite phase can deny (418)" test "$CODE" = "418"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?accdeny=1")"
+check "access phase can deny (403)" test "$CODE" = "403"
+
+echo "== 20. phase: body_filter =="
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?bmark=1")"
+check "body_filter observes streamed body" test "$CODE" = "200"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=bodycheck")"
+check "body_filter saw all bytes + last" test "$CODE" = "204"
+
+echo "== 21. phase: log =="
+curl -s --max-time 5 "$GATE/echo?lmark=1&task=logt1" > /dev/null
+sleep 0.5
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=logcheck")"
+check "log phase wrote KV marker" test "$CODE" = "204"
+check "plugin host_log reaches gateway log" grep -q 'kv-probe log phase marker' "$TMP/logs/gate.log"
+check "kv-scheduler log phase line present" grep -q 'kv-scheduler done task=logt1' "$TMP/logs/gate.log"
+
+echo "== 22. KV scan from plugin =="
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=scan")"
+check "kv_scan sees planted keys" test "$CODE" = "204"
+
+echo "== 23. kv-scheduler: path extraction + per-node cap =="
+sed -i 's/extract = "query:task"/extract = "path:1"/; s/max_tasks_per_node = "0"/max_tasks_per_node = "1"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+sleep 7   # let all previous aff:* entries (TTL 6s) expire so cap counts are clean
+path_node() { curl -s --max-time 5 "$GATE/$1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["node"])' 2>/dev/null; }
+PA="$(path_node pk-a)"; PB="$(path_node pk-b)"; PC="$(path_node pk-c)"
+check "capped tasks spread over all 3 nodes" test "$(printf '%s\n%s\n%s\n' "$PA" "$PB" "$PC" | sort -u | grep -c .)" = "3"
+check "path-extracted key stays sticky" test "$(path_node pk-a)" = "$PA"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/pk-d")"
+check "over-cap task still served via fallback" test "$CODE" = "200"
+sed -i 's/extract = "path:1"/extract = "query:task"/; s/max_tasks_per_node = "1"/max_tasks_per_node = "0"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+
+echo "== 24. OPENRUSTY_CONFIG env =="
+sed 's/listen = .*/listen = "127.0.0.1:18081"/' "$TMP/openrusty.toml" > "$TMP/openrusty-env.toml"
+OPENRUSTY_CONFIG="$TMP/openrusty-env.toml" "$ROOT/target/debug/openrusty" > "$TMP/logs/gate-env.log" 2>&1 &
+ENV_PID=$!; PIDS+=($ENV_PID)
+wait_port 18081 10
+check "env-config instance serves /openrusty/status" bash -c "curl -s --max-time 5 http://127.0.0.1:18081/openrusty/status | grep -q generation"
+check "env-config instance proxies" bash -c "curl -s --max-time 5 http://127.0.0.1:18081/echo | grep -q node"
+kill $ENV_PID 2>/dev/null
+
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [ "$FAIL" = "0" ]

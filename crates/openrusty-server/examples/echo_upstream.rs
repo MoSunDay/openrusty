@@ -9,6 +9,9 @@
 //!   GET /slow?ms=            -> sleeps then 200 JSON (in-flight reload tests)
 //!   GET /ws                  -> WebSocket echo (Text->Text, Binary->Binary)
 //!   GET /                    -> "node:<name>"
+//!   any other method+path    -> same JSON echo as /echo (fallback), so
+//!                               arbitrary-path probes always get 200 JSON
+//!                               carrying the `node` field
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -41,6 +44,7 @@ async fn main() {
         .route("/slow", get(slow))
         .route("/ws", get(ws))
         .route("/", get(root))
+        .fallback(echo)
         .with_state(node.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
@@ -48,7 +52,8 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-/// Echo the request back as JSON.
+/// Echo the request back as JSON. Doubles as the Router fallback so any
+/// unmatched path (any method) still yields 200 JSON with the node field.
 async fn echo(
     State(node): State<String>,
     method: Method,
