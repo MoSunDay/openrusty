@@ -37,6 +37,9 @@ for dir in plugins/*/; do
   fi
   lib="${pkg//-/_}"
 
+  echo ">> testing plugin '$name'"
+  cargo test --manifest-path "$manifest"
+
   echo ">> building plugin '$name' (crate '$pkg')"
   cargo build --manifest-path "$manifest" --target "$TARGET" --release
 
