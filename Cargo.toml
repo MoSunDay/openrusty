@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openrusty-core",
+    "crates/openrusty-wasm",
+    "crates/openrusty-proxy",
+    "crates/openrusty-server",
+    "crates/openrusty-sdk",
+    "crates/openrusty-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+openrusty-core = { path = "crates/openrusty-core" }
+openrusty-wasm = { path = "crates/openrusty-wasm" }
+openrusty-proxy = { path = "crates/openrusty-proxy" }
+openrusty-sdk = { path = "crates/openrusty-sdk" }
+openrusty-macros = { path = "crates/openrusty-macros" }
+
+axum = "0.8"
+hyper = { version = "1.11", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wasmtime = "48"
+arc-swap = "1"
+dashmap = "6"
+thiserror = "2"
+socket2 = "0.6"
+
+[profile.release]
+lto = "thin"
