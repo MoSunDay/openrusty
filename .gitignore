@@ -1,0 +1,62 @@
+.DS_Store
+node_modules
+.worktrees
+.sst
+.env
+.env.local
+.idea
+.vscode
+.codex
+.opencoder/
+*~
+playground
+tmp
+dist
+ts-dist
+.turbo
+**/.serena
+.serena/
+**/.omo
+.omo/
+/result
+refs
+Session.vim
+/opencoder.json
+a.out
+target
+.scripts
+.direnv/
+
+# Backups
+.bak-*/
+*.bak.*
+.bak*
+
+# Local dev files
+opencoder-dev
+UPCOMING_CHANGELOG.md
+logs/
+*.bun-build
+tsconfig.tsbuildinfo
+link_repos
+__pycache__/
+.cargo
+.opencode
+.opencoder
+
+# Cloned external reference repos (obscura / agent-browser / cua)
+reference/
+target-rev/
+target-clean/
+
+# Gate-test build dirs
+.target-gate/
+.target-rv2/
+.target-rv3/
+.tgt-title-task/
+.target-release/
+
+*.log
+
+# WASM plugin artifacts
+build/
