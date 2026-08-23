@@ -21,7 +21,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
   `ip_hash`, passive health checks, failure retries on another peer,
   WebSocket pass-through, SSE streaming, request timeouts.
 - **`kv-scheduler` plugin** — vLLM-style KV-cache affinity: a task key
-  extracted from the URL sticks to one peer; new tasks go to the peer with
+  extracted from the URL or the request body sticks to one peer; new tasks go to the peer with
   the fewest active tasks (tie: oldest last-schedule time); affinity entries
   expire by TTL, releasing the slot.
 
@@ -89,11 +89,13 @@ broken plugins, reload under load with zero 5xx), passive health checks,
 runaway-plugin containment under both failure policies, per-route request
 timeouts, `ip_hash` pinning, upstream health surviving reloads, the
 `kv-probe` plugin (content phase, `kv_del`, TTL release, header_filter), and
-memory-ceiling containment of a `memory.grow`-hungry plugin. Sections 18-24
+memory-ceiling containment of a `memory.grow`-hungry plugin. Sections 18-25
 round out the remaining `kv-probe` phases (`post_read`, `rewrite`, `access`,
 `body_filter`, `log`) plus plugin-driven `kv_scan`, assert the
 `/openrusty/status` JSON shape (generation, plugin list, upstream health,
 route count), exercise `kv-scheduler` path-segment key extraction with a
 `max_tasks_per_node` cap (capped tasks spread across peers; an over-cap task
-falls back to the default balancer), and boot a second gateway instance from
-the `OPENRUSTY_CONFIG` environment variable.
+falls back to the default balancer), boot a second gateway instance from
+the `OPENRUSTY_CONFIG` environment variable, and verify request-body
+`cache_salt` key extraction (sticky salts, spread over peers, and
+fallback to the default balancer when the field is missing).

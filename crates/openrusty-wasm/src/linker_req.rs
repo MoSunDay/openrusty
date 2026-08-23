@@ -26,7 +26,7 @@ pub(crate) fn link(linker: &mut Linker<HostData>) -> Result<(), wasmtime::Error>
             };
             let payload = {
                 let d = caller.data();
-                req_meta_payload(&d.ctx, &key)
+                req_meta_payload(&d.ctx, &d.req_body, &key)
             };
             mem::write_out(&mut caller, out_ptr, out_cap, &payload)
         },
@@ -71,7 +71,9 @@ pub(crate) fn link(linker: &mut Linker<HostData>) -> Result<(), wasmtime::Error>
 }
 
 /// Payload for `req_meta` (pure). Unknown keys yield an empty payload.
-fn req_meta_payload(ctx: &ReqCtx, key: &str) -> Vec<u8> {
+/// `body` is the buffered request body: seeded before the content phase,
+/// so earlier phases see an empty slice.
+fn req_meta_payload(ctx: &ReqCtx, body: &[u8], key: &str) -> Vec<u8> {
     match key {
         "method" => ctx.method.clone().into_bytes(),
         "path" => ctx.path.clone().into_bytes(),
@@ -79,6 +81,7 @@ fn req_meta_payload(ctx: &ReqCtx, key: &str) -> Vec<u8> {
         "version" => ctx.version.clone().into_bytes(),
         "client_ip" => ctx.client_addr.ip().to_string().into_bytes(),
         "upstream" => ctx.upstream.clone().unwrap_or_default().into_bytes(),
+        "body" => body.to_vec(),
         "headers" => {
             let items: Vec<String> = ctx
                 .headers
@@ -104,4 +107,47 @@ fn peer_payload(peer: &PeerView) -> Vec<u8> {
         peer.addr.as_bytes(),
         healthy.as_bytes(),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> ReqCtx {
+        ReqCtx {
+            method: "POST".into(),
+            path: "/echo".into(),
+            query: "task=t1".into(),
+            version: "HTTP/1.1".into(),
+            client_addr: "127.0.0.1:9999".parse().unwrap(),
+            headers: vec![("x-task".into(), "t1".into())],
+            route_index: None,
+            upstream: Some("vllm".into()),
+            peer_index: None,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn body_key_returns_buffered_request_body() {
+        let body = br#"{"cache_salt":"agent:s1"}"#;
+        assert_eq!(req_meta_payload(&ctx(), body, "body"), body.to_vec());
+    }
+
+    #[test]
+    fn body_key_is_empty_before_buffering() {
+        assert!(req_meta_payload(&ctx(), &[], "body").is_empty());
+    }
+
+    #[test]
+    fn known_keys_still_resolve() {
+        let c = ctx();
+        assert_eq!(req_meta_payload(&c, &[], "method"), b"POST");
+        assert_eq!(req_meta_payload(&c, &[], "path"), b"/echo");
+        assert_eq!(req_meta_payload(&c, &[], "query"), b"task=t1");
+        assert_eq!(req_meta_payload(&c, &[], "client_ip"), b"127.0.0.1");
+        assert_eq!(req_meta_payload(&c, &[], "upstream"), b"vllm");
+        assert_eq!(req_meta_payload(&c, &[], "header:x-task"), b"t1");
+        assert!(req_meta_payload(&c, &[], "no_such_key").is_empty());
+    }
 }

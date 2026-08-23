@@ -5,9 +5,10 @@ Commit: d9a7ede
 - 一方插件（`plugins/kv-scheduler`，独立 wasm workspace）：vLLM 风格的 KV-cache 亲和调度。携带同一 task key 的请求粘滞到同一上游节点，命中缓存；新任务分配给当前活跃任务最少的节点。
 
 ## 触发方式
-- 在 `balancer` 阶段生效（需在 `plugins.order` 中列出）；task key 从请求 URL 提取，规则由 `[plugins.settings.kv-scheduler].extract` 配置：
+- 在 `balancer` 阶段生效（需在 `plugins.order` 中列出）；task key 从请求提取，规则由 `[plugins.settings.kv-scheduler].extract` 配置：
   - `query:<param>` —— query 参数；
-  - `path:<n>` —— 从 1 开始计数的路径段。
+  - `path:<n>` —— 从 1 开始计数的路径段；
+  - `body:<json-field>` —— 请求体 JSON 顶层字符串字段（如 vLLM 风格 `cache_salt`）；请求体由网关在 content 阶段前缓冲（上限 16 MiB），提取失败（字段缺失、非字符串、trim 后为空）则不参与调度，回落默认均衡。
 
 ## 行为与规则
 - 粘滞：已有亲和记录（`aff:<task>`，TTL = `affinity_ttl_s`，默认 300）且目标节点健康时，续期记录并沿用该节点。

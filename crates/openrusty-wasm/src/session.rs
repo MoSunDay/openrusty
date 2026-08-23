@@ -26,6 +26,9 @@ pub struct RequestSession {
     /// Current response headers, pushed before each call and pulled back
     /// after (resp_header_set/del mutate them).
     resp_headers: Vec<(String, String)>,
+    /// Buffered request body, pushed into each instance before its call.
+    /// Empty until the server seeds it (content phase onward).
+    req_body: Bytes,
 }
 
 impl RequestSession {
@@ -46,6 +49,7 @@ impl RequestSession {
             body_chunk: Bytes::new(),
             body_last: false,
             resp_headers: Vec::new(),
+            req_body: Bytes::new(),
         }
     }
 
@@ -69,6 +73,12 @@ impl RequestSession {
     /// Seed the response headers visible to header_filter plugins.
     pub fn set_resp_headers(&mut self, h: Vec<(String, String)>) {
         self.resp_headers = h;
+    }
+
+    /// Seed the buffered request body visible to content/balancer/later
+    /// phases (pushed into instances on the next phase run).
+    pub fn set_req_body(&mut self, body: Bytes) {
+        self.req_body = body;
     }
 
     /// Current response headers as mutated by header_filter plugins
@@ -116,6 +126,7 @@ impl RequestSession {
             hd.ctx = self.ctx.clone();
             hd.peers = self.peers.clone();
             hd.resp_headers = self.resp_headers.clone();
+            hd.req_body = self.req_body.clone();
             hd.body_chunk = self.body_chunk.clone();
             hd.body_last = self.body_last;
 
