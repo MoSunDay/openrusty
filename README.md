@@ -58,20 +58,42 @@ kill -HUP $(pgrep -x openrusty)          # or:
 curl -X POST localhost:8180/openrusty/reload
 ```
 
+### Run as a service (autostart)
+
+```bash
+cargo build --release -p openrusty-server
+cargo build --release -p openrusty-server --example echo_upstream
+sudo bash scripts/install-service.sh
+```
+
+Installs and enables `openrusty.service` (gateway on `127.0.0.1:8180`) plus
+three demo echo upstreams `openrusty-echo@9001/9002/9003.service`, all
+started now and on boot. The script is idempotent: re-running it restarts
+the units so freshly built binaries are picked up. Logs live in journald
+(`journalctl -u openrusty`); stop/disable with
+`systemctl disable --now openrusty.service` (same for the echo instances).
+
 ## Tests
 
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
 bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
-bash scripts/integration.sh   # end-to-end drill: 48 checks, sections 1-17
+bash scripts/integration.sh   # end-to-end drill: 67 checks, sections 1-24
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports
-(18080/191xx) and walks through `scripts/integration.sh` sections 1-17:
+(18080/191xx) and walks through `scripts/integration.sh` sections 1-24:
 basic proxy, SSE, h2c, WebSocket, sticky scheduling with TTL release, hot
 reload (SIGHUP / POST, in-flight requests, KV survival, atomic rejection of
 broken plugins, reload under load with zero 5xx), passive health checks,
 runaway-plugin containment under both failure policies, per-route request
 timeouts, `ip_hash` pinning, upstream health surviving reloads, the
 `kv-probe` plugin (content phase, `kv_del`, TTL release, header_filter), and
-memory-ceiling containment of a `memory.grow`-hungry plugin.
+memory-ceiling containment of a `memory.grow`-hungry plugin. Sections 18-24
+round out the remaining `kv-probe` phases (`post_read`, `rewrite`, `access`,
+`body_filter`, `log`) plus plugin-driven `kv_scan`, assert the
+`/openrusty/status` JSON shape (generation, plugin list, upstream health,
+route count), exercise `kv-scheduler` path-segment key extraction with a
+`max_tasks_per_node` cap (capped tasks spread across peers; an over-cap task
+falls back to the default balancer), and boot a second gateway instance from
+the `OPENRUSTY_CONFIG` environment variable.
