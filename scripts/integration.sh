@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # OpenRusty integration drill: proxy, SSE, h2c, WebSocket, sticky
 # scheduling, hot reload (incl. in-flight + rejected reload + load),
-# passive health check, and plugin fault containment.
+# passive health check, plugin fault containment, route timeouts,
+# ip_hash, health survival across reloads, KV del/TTL probes, and
+# memory-ceiling containment.
 set -u
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -210,6 +212,97 @@ curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?task=back")"
 check "recovered after removing bad plugin" test "$CODE" = "200"
 
+
+echo "== 13. per-route request timeout =="
+cat >> "$TMP/openrusty.toml" <<'CONF'
+
+[[routes]]
+path_prefix = "/slow"
+upstream = "vllm"
+timeout_ms = 300
+CONF
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/slow?ms=100")"
+check "request within route timeout passes" test "$CODE" = "200"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/slow?ms=800")"
+check "request past route timeout yields 502" test "$CODE" = "502"
+
+echo "== 14. ip_hash balancer =="
+sed -i 's/balancer = "swrr"/balancer = "ip_hash"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+N1="$(curl -s --max-time 5 "$GATE/echo" | python3 -c 'import sys,json;print(json.load(sys.stdin)["node"])' 2>/dev/null)"
+SAME=1; [ -n "$N1" ] || SAME=0
+for _ in 1 2 3 4; do
+    X="$(curl -s --max-time 5 "$GATE/echo" | python3 -c 'import sys,json;print(json.load(sys.stdin)["node"])' 2>/dev/null)"
+    [ "$X" = "$N1" ] || SAME=0
+done
+check "ip_hash serves requests" test -n "$N1"
+check "ip_hash pins one client IP to one node" test "$SAME" = "1"
+
+echo "== 15. upstream health survives reload =="
+sed -i 's/balancer = "ip_hash"/balancer = "swrr"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+NODE3_PID=""
+for i in "${!PIDS[@]}"; do
+    if [ "$(ps -o args= -p "${PIDS[$i]}" 2>/dev/null | grep -c 19103)" = "1" ]; then NODE3_PID="${PIDS[$i]}"; fi
+done
+kill "$NODE3_PID" 2>/dev/null; sleep 0.5
+# No task key: swrr rotates over all peers and is guaranteed to hit the
+# dead one, marking it down after max_fails.
+OK=1
+for _ in 1 2 3 4 5 6; do curl -s --max-time 5 "$GATE/echo" | grep -q node || OK=0; done
+check "requests succeed while a peer dies" test "$OK" = "1"
+GEN_BEFORE="$(curl -s $GATE/openrusty/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["generation"])')"
+kill -HUP $GATE_PID
+sleep 0.5
+GEN_AFTER="$(curl -s $GATE/openrusty/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["generation"])')"
+check "SIGHUP advanced generation" test "$GEN_AFTER" -gt "$GEN_BEFORE"
+check "down peer stays down after reload (2 healthy)" bash -c "curl -s $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);print([u[\"healthy\"] for u in d[\"upstreams\"]][0])' | grep -q '^2$'"
+"$ROOT/target/debug/examples/echo_upstream" "127.0.0.1:19103" "node3" >> "$TMP/logs/up3.log" 2>&1 &
+PIDS+=($!)
+sleep 3   # > fail_timeout_s=2
+check "recovered peer visible after reload (3 healthy)" bash -c "curl -s $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);print([u[\"healthy\"] for u in d[\"upstreams\"]][0])' | grep -q '^3$'"
+
+echo "== 16. kv-probe: content phase, kv_del, TTL release =="
+cp build/plugins/kv-probe.wasm "$TMP/plugins/"
+sed -i 's/order = \["kv-scheduler"\]/order = ["kv-scheduler", "kv-probe"]/' "$TMP/openrusty.toml"
+cat >> "$TMP/openrusty.toml" <<'CONF'
+
+[[routes]]
+path_prefix = "/probe"
+upstream = "vllm"
+timeout_ms = 5000
+CONF
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=setgetdel")"
+check "content: kv set/get/del roundtrip short-circuits 204" test "$CODE" = "204"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=absent")"
+check "kv_del persisted across requests" test "$CODE" = "204"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=ttl-set")"
+check "short-TTL key accepted" test "$CODE" = "204"
+sleep 2   # > the plugin's 1.5s TTL for probe:ttl
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=ttl-check")"
+check "TTL expiry released the key" test "$CODE" = "204"
+check "header_filter: no marker yet" bash -c "curl -s -D - -o /dev/null --max-time 5 '$GATE/echo?phdr=1' | grep -qi '^x-kv-probe: -'"
+check "header_filter: marker set in content phase" bash -c "curl -s -D - -o /dev/null --max-time 5 '$GATE/echo?pset=1&phdr=1' | grep -qi '^x-kv-probe: mk'"
+check "header_filter: marker survives across requests" bash -c "curl -s -D - -o /dev/null --max-time 5 '$GATE/echo?phdr=1' | grep -qi '^x-kv-probe: mk'"
+check "header_filter: marker gone after kv_del" bash -c "curl -s -D - -o /dev/null --max-time 5 '$GATE/echo?pdel=1&phdr=1' | grep -qi '^x-kv-probe: -'"
+
+echo "== 17. memory ceiling containment =="
+cat > "$TMP/plugins/glutton.wasm" <<'WAT'
+(module
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (drop (memory.grow (i32.const 20000)))
+    (i32.const -5))
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
+  (memory (export "memory") 1))
+WAT
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?task=mem")"
+check "fail_open contains memory-hungry plugin" test "$CODE" = "200"
+check "memory trap counted in status" bash -c "curl -s $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);print([p[\"errors\"] for p in d[\"plugins\"] if p[\"name\"]==\"glutton\"][0])' | grep -vq '^0$'"
+rm "$TMP/plugins/glutton.wasm"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [ "$FAIL" = "0" ]

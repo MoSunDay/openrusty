@@ -36,6 +36,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
 | `crates/openrusty-sdk` | `no_std` guest SDK (imports, allocator, `dispatch!`) |
 | `crates/openrusty-macros` | `#[phase(...)]` proc macro |
 | `plugins/kv-scheduler` | first-party plugin (own workspace, wasm-only) |
+| `plugins/kv-probe` | drill plugin exercising KV host calls and content/header_filter phases |
 | `docs/wasm-abi.md` | the plugin ABI contract |
 | `config/openrusty.example.toml` | annotated example configuration |
 
@@ -61,11 +62,16 @@ curl -X POST localhost:8180/openrusty/reload
 
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
-bash scripts/integration.sh   # full drill: proxy/SSE/h2c/WS/stickiness/reload/faults
+bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
+bash scripts/integration.sh   # end-to-end drill: 48 checks, sections 1-17
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports
-(18080/191xx), verifies sticky scheduling across three nodes, hot reload with
-in-flight requests and KV survival, atomic rejection of broken plugins,
-reload-under-load with zero 5xx, passive health checks, and timeout kill of a
-runaway plugin under both failure policies.
+(18080/191xx) and walks through `scripts/integration.sh` sections 1-17:
+basic proxy, SSE, h2c, WebSocket, sticky scheduling with TTL release, hot
+reload (SIGHUP / POST, in-flight requests, KV survival, atomic rejection of
+broken plugins, reload under load with zero 5xx), passive health checks,
+runaway-plugin containment under both failure policies, per-route request
+timeouts, `ip_hash` pinning, upstream health surviving reloads, the
+`kv-probe` plugin (content phase, `kv_del`, TTL release, header_filter), and
+memory-ceiling containment of a `memory.grow`-hungry plugin.
