@@ -8,7 +8,7 @@ Commit: d9a7ede
 - 插件 ABI 契约的权威文档是 [docs/wasm-abi.md](./docs/wasm-abi.md)：8 个 nginx 对齐阶段、`orr_on_phase` 导出、`openrusty` 命名空间 host imports、nginx 对齐的 Decision 返回码。
 - 请求的语义骨架：请求进入后依次经过 `post_read`/`rewrite`/`access`/`content` 四个前置阶段，`content` 的默认处理器是代理转发；每次 upstream 尝试前运行 `balancer` 阶段；响应侧依次是 `header_filter`、按块流式的 `body_filter`、收尾的 `log`。
 - 配置为 TOML（示例 [config/openrusty.example.toml](./config/openrusty.example.toml)）；生产部署以 systemd 单元运行（`openrusty.service` + `openrusty-echo@.service`），详见 [运维与部署](./features/ops/index.md)。
-- 验证分三层：`cargo test --workspace`（单元）、`scripts/build-plugins.sh`（插件单测 + wasm 构建）、`scripts/integration.sh`（e2e 演练，67 checks）。
+- 验证分三层：`cargo test --workspace`（单元）、`scripts/build-plugins.sh`（插件单测 + wasm 构建）、`scripts/integration.sh`（e2e 演练，70 checks）。
 
 ## Agent 模块索引
 - [网关请求管线](./agents/gateway-pipeline/index.md) —— `openrusty-server`：接入、阶段编排、管理端点

@@ -164,6 +164,9 @@ pub async fn handle_request(
             return text_response(413, "413 payload too large\n");
         }
     };
+    // Expose the buffered body to plugins from the content phase onward
+    // (balancer and log included); earlier phases already ran without it.
+    session.set_req_body(body.clone());
 
     // 9. Content phase.
     match session.run_phase(Phase::Content) {

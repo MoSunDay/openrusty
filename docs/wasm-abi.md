@@ -64,6 +64,9 @@ host_now_ms() -> i64
 req_meta(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
   keys: "method" "path" "query" "version" "client_ip" "upstream"
         "header:<name>" (first value) "headers" (TLV list of "k: v")
+        "body" (raw request body bytes, capped at 16 MiB; buffered before
+        the content phase, so content/balancer/header_filter/body_filter/log
+        see it while post_read/rewrite/access see an empty body)
 req_peer_count() -> i32                     # healthy peers of routed upstream
 req_peer_get(idx: i32, out_ptr: i32, out_cap: i32) -> i32
   writes TLV: name, addr, healthy("1"/"0")

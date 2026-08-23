@@ -42,6 +42,9 @@ pub struct HostData {
     /// Current response headers; seeded by the server before header_filter
     /// and kept in sync by the resp_header_* imports.
     pub resp_headers: Vec<(String, String)>,
+    /// Buffered request body; seeded by the server before the content
+    /// phase (empty in earlier phases and for WebSocket upgrades).
+    pub req_body: Bytes,
     /// Current body_filter chunk.
     pub body_chunk: Bytes,
     /// True when `body_chunk` is the final one.
@@ -65,6 +68,7 @@ pub fn new_host_data(
         settings,
         resp_edits: Vec::new(),
         resp_headers: Vec::new(),
+        req_body: Bytes::new(),
         body_chunk: Bytes::new(),
         body_last: false,
         limits: StoreLimitsBuilder::new().build(),
@@ -105,6 +109,7 @@ mod tests {
         );
         assert!(d.resp_edits.is_empty());
         assert!(d.resp_headers.is_empty());
+        assert!(d.req_body.is_empty());
         assert!(d.body_chunk.is_empty());
         assert!(!d.body_last);
         assert_eq!(d.peers.len(), 1);

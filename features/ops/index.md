@@ -18,7 +18,7 @@ Commit: 2bf8269
   - 脚本幂等：重复执行会重写单元文件并 restart 全部单元，从而加载新构建的二进制；所有单元 enabled + active，开机自启。
 - 生产上游拓扑：`config/openrusty.toml` 的 upstream `vllm` 指向 node03 llama-server 集群（`192.168.31.224:9001-9003`，一卡一实例 ×3，Qwen3.8-27B-UD-Q4_K_M，`-c 150000 --no-kv-offload`（KV cache 放系统内存，约 5.3GB/实例）、q8_0 KV、MTP 投机解码（`--spec-type draft-mtp`，约 727MiB 显存/卡）），由 node03 上的模板单元 `llama-server@<gpu>:<port>.service` 管理；路由超时 120000ms（V100 生成较慢）。本地 echo 实例仅保留演示用途，生产配置不再引用。
 - 配置加载顺序：命令行参数 1 > 环境变量 `OPENRUSTY_CONFIG` > `config/openrusty.toml`；示例见 `config/openrusty.example.toml`。
-- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，67 checks，覆盖代理/流式协议、调度、热重载、健康检查、收容、路由超时、kv-probe 全阶段、status 形状、env 配置启动等）。
+- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，70 checks，覆盖代理/流式协议、调度、热重载、健康检查、收容、路由超时、kv-probe 全阶段、status 形状、env 配置启动等）。
 
 ## 关键状态与异常
 - 状态：各单元 enabled/active；`/openrusty/status` 的 `generation` 与插件错误计数。

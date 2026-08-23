@@ -5,8 +5,9 @@
 # ip_hash, health survival across reloads, KV del/TTL probes,
 # memory-ceiling containment, /openrusty/status shape, plugin phases
 # (post_read, rewrite, access, body_filter, log), KV scan from a
-# plugin, path-key extraction + per-node task cap with fallback, and
-# OPENRUSTY_CONFIG env startup.
+# plugin, path-key extraction + per-node task cap with fallback,
+# OPENRUSTY_CONFIG env startup, and request-body cache_salt key
+# extraction.
 set -u
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -362,6 +363,22 @@ wait_port 18081 10
 check "env-config instance serves /openrusty/status" bash -c "curl -s --max-time 5 http://127.0.0.1:18081/openrusty/status | grep -q generation"
 check "env-config instance proxies" bash -c "curl -s --max-time 5 http://127.0.0.1:18081/echo | grep -q node"
 kill $ENV_PID 2>/dev/null
+
+echo "== 25. kv-scheduler: body cache_salt extraction =="
+sed -i 's/extract = "query:task"/extract = "body:cache_salt"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
+sleep 7   # let all previous aff:* entries (TTL 6s) expire so counts are clean
+salt_node() { curl -s --max-time 5 -X POST -H 'Content-Type: application/json' -d "{\"cache_salt\":\"$1\"}" "$GATE/echo" | python3 -c 'import sys,json;print(json.load(sys.stdin)["node"])' 2>/dev/null; }
+S1="$(salt_node agent:session-a)"; SAME=1
+for _ in 1 2 3; do [ "$(salt_node agent:session-a)" = "$S1" ] || SAME=0; done
+[ -n "$S1" ] || SAME=0
+check "same cache_salt sticks to one node" test "$SAME" = "1"
+S2="$(salt_node agent:session-b)"; S3="$(salt_node other:session-c)"
+check "salts spread over >1 node" test "$(printf '%s\n%s\n%s\n' "$S1" "$S2" "$S3" | sort -u | wc -l)" -ge 2
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -X POST -d '{"messages":[]}' "$GATE/echo")"
+check "body without cache_salt falls back to default balancer" test "$CODE" = "200"
+sed -i 's/extract = "body:cache_salt"/extract = "query:task"/' "$TMP/openrusty.toml"
+curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="

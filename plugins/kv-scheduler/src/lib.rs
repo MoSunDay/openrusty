@@ -85,6 +85,16 @@ fn task_key() -> Option<String> {
             let path = host::req_meta_str("path")?;
             url::path_segment(&path, n)
         }
+        ExtractRule::BodyField(field) => {
+            let body = host::req_body()?;
+            let raw = choice::json_string_field(&body, &field)?;
+            let s = String::from_utf8_lossy(&raw).into_owned();
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            Some(String::from(s))
+        }
     }
 }
 

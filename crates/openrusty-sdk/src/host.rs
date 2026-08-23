@@ -54,6 +54,14 @@ pub fn req_meta_str(key: &str) -> Option<String> {
     req_meta(key).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+/// Raw request body bytes. The gateway buffers the body (capped at
+/// 16 MiB) before the content phase, so this is available from
+/// content/balancer onward; earlier phases see no body. `None` for an
+/// empty request body (same ABI limitation as [`req_meta`]).
+pub fn req_body() -> Option<Vec<u8>> {
+    req_meta("body")
+}
+
 /// One upstream peer of the routed upstream group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {

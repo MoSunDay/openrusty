@@ -21,10 +21,11 @@ on_failure = "fail_open"
 
 # Per-plugin free-form settings, visible to the plugin as key/value strings.
 [plugins.settings.kv-scheduler]
-# How to extract the task key from the request URL:
+# How to extract the task key from the request:
 #   "query:<param>"   - query string parameter
 #   "path:<segment>"  - 1-based path segment
-extract = "query:task"
+#   "body:<field>"    - top-level JSON string field of the request body (e.g. cache_salt)
+extract = "body:cache_salt"
 # Affinity entries expire after this many seconds, releasing the task slot.
 affinity_ttl_s = "300"
 # Optional cap of concurrent tasks per node (0 = unlimited).
