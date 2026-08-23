@@ -1,0 +1,71 @@
+# OpenRusty example configuration.
+# Copy to openrusty.toml (or pass any path via OPENRUSTY_CONFIG) and adjust.
+
+[server]
+# Address the gateway listens on. HTTP/1.1 and h2c are served on the same port.
+listen = "127.0.0.1:8180"
+# Logging verbosity: trace | debug | info | warn | error
+log_level = "info"
+
+[plugins]
+# Directory scanned for *.wasm plugin modules (loaded in `order`, else sorted by file name).
+dir = "build/plugins"
+# Execution order of plugins within a phase. Plugins missing from the list run after, by name.
+order = ["kv-scheduler"]
+# Hard timeout for one plugin phase invocation (milliseconds). Enforced via wasmtime epoch interruption.
+timeout_ms = 50
+# Per-request memory ceiling granted to each plugin instance (MiB).
+max_memory_mb = 16
+# Behavior when a plugin traps/times out: fail_open (decision = declined) or fail_closed (decision = deny 503).
+on_failure = "fail_open"
+
+# Per-plugin free-form settings, visible to the plugin as key/value strings.
+[plugins.settings.kv-scheduler]
+# How to extract the task key from the request URL:
+#   "query:<param>"   - query string parameter
+#   "path:<segment>"  - 1-based path segment
+extract = "query:task"
+# Affinity entries expire after this many seconds, releasing the task slot.
+affinity_ttl_s = "300"
+# Optional cap of concurrent tasks per node (0 = unlimited).
+max_tasks_per_node = "0"
+
+[[upstreams]]
+name = "vllm"
+# Load balancing policy: swrr (smooth weighted round-robin) | ip_hash
+balancer = "swrr"
+# Retry the request on another peer when a connection-level failure occurs.
+retries = 2
+# Timeout for establishing the upstream connection (milliseconds).
+connect_timeout_ms = 2000
+
+  [[upstreams.peers]]
+  addr = "127.0.0.1:9001"
+  weight = 1
+
+  [[upstreams.peers]]
+  addr = "127.0.0.1:9002"
+  weight = 1
+
+  [[upstreams.peers]]
+  addr = "127.0.0.1:9003"
+  weight = 1
+
+  [upstreams.health]
+  # Passive health check: mark a peer down after `max_fails` failures
+  # within `fail_window_s`; the peer recovers after `fail_timeout_s`.
+  max_fails = 3
+  fail_window_s = 10
+  fail_timeout_s = 10
+
+[[routes]]
+# Requests whose path starts with this prefix are forwarded to `upstream`.
+path_prefix = "/v1"
+upstream = "vllm"
+# Whole-request timeout (milliseconds); 0 disables.
+timeout_ms = 30000
+
+[[routes]]
+path_prefix = "/"
+upstream = "vllm"
+timeout_ms = 30000
