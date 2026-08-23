@@ -1,4 +1,4 @@
-//! kv-scheduler: vLLM-style KV-cache affinity balancer plugin.
+//! vllm-kv-scheduler: vLLM-style KV-cache affinity balancer plugin.
 //!
 //! Balancer phase: requests carrying the same task key are pinned to the
 //! same upstream peer while the affinity record lives (TTL renewal on every
@@ -10,7 +10,7 @@
 //! - `aff:<task>`   -> peer index, TTL = affinity_ttl_s
 //! - `sched:<idx>`  -> last-scheduled timestamp (ms), TTL = affinity_ttl_s
 //!
-//! Settings (`[plugins.settings.kv-scheduler]`):
+//! Settings (`[plugins.settings.vllm-kv-scheduler]`):
 //! - `extract`            : `query:<param>` or `path:<n>` (required)
 //! - `affinity_ttl_s`     : default 300
 //! - `max_tasks_per_node` : default 0 (unlimited)
@@ -60,10 +60,10 @@ fn on_log() -> Decision {
             let upstream = host::req_meta_str("upstream").unwrap_or_default();
             host::log(
                 host::LogLevel::Info,
-                &alloc::format!("kv-scheduler done task={task} upstream={upstream}"),
+                &alloc::format!("vllm-kv-scheduler done task={task} upstream={upstream}"),
             );
         }
-        None => host::log(host::LogLevel::Info, "kv-scheduler done"),
+        None => host::log(host::LogLevel::Info, "vllm-kv-scheduler done"),
     }
     Decision::Ok
 }

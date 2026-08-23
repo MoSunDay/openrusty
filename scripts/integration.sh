@@ -50,7 +50,7 @@ cargo build -p openrusty-server 2>&1 | tail -1
 
 echo "== setup =="
 mkdir -p "$TMP/plugins" "$TMP/logs"
-cp build/plugins/kv-scheduler.wasm "$TMP/plugins/"
+cp build/plugins/vllm-kv-scheduler.wasm "$TMP/plugins/"
 
 cat > "$TMP/openrusty.toml" <<CONF
 [server]
@@ -59,12 +59,12 @@ log_level = "info"
 
 [plugins]
 dir = "$TMP/plugins"
-order = ["kv-scheduler"]
+order = ["vllm-kv-scheduler"]
 timeout_ms = 250
 max_memory_mb = 16
 on_failure = "fail_open"
 
-[plugins.settings.kv-scheduler]
+[plugins.settings.vllm-kv-scheduler]
 extract = "query:task"
 affinity_ttl_s = "6"
 max_tasks_per_node = "0"
@@ -119,7 +119,7 @@ check "http1 still works" test "$(curl -s -o /dev/null -w '%{http_version}' --ma
 echo "== 4. websocket pass-through =="
 check "ws echo" python3 scripts/ws_client.py 127.0.0.1 $GATE_PORT /ws "hello-openrusty"
 
-echo "== 5. sticky scheduling (kv-scheduler) =="
+echo "== 5. sticky scheduling (vllm-kv-scheduler) =="
 N1A="$(node_of t1)"; SAME=1
 for _ in 1 2 3 4 5; do [ "$(node_of t1)" = "$N1A" ] || SAME=0; done
 [ -n "$N1A" ] || SAME=0
@@ -158,14 +158,14 @@ check "generation advanced again" test "$GEN_AFTER" -gt "$GEN_BEFORE"
 echo "== 9. bad reload is rejected atomically =="
 GEN_BEFORE="$GEN_AFTER"
 STICKY2="$(node_of sticky2)"
-cp "$TMP/plugins/kv-scheduler.wasm" "$TMP/kv-scheduler.wasm.good"
-printf 'this is not wasm' > "$TMP/plugins/kv-scheduler.wasm"
+cp "$TMP/plugins/vllm-kv-scheduler.wasm" "$TMP/vllm-kv-scheduler.wasm.good"
+printf 'this is not wasm' > "$TMP/plugins/vllm-kv-scheduler.wasm"
 check "reload endpoint reports failure" bash -c "curl -s -X POST --max-time 10 $GATE/openrusty/reload | grep -qi error"
 GEN_AFTER="$(curl -s $GATE/openrusty/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["generation"])')"
 check "generation unchanged" test "$GEN_AFTER" = "$GEN_BEFORE"
 check "service still proxies" bash -c "curl -s --max-time 5 $GATE/echo | grep -q node"
 check "old plugin still sticky" test "$(node_of sticky2)" = "$STICKY2"
-cp "$TMP/kv-scheduler.wasm.good" "$TMP/plugins/kv-scheduler.wasm"
+cp "$TMP/vllm-kv-scheduler.wasm.good" "$TMP/plugins/vllm-kv-scheduler.wasm"
 
 echo "== 10. reload under load: no 5xx =="
 ( for _ in $(seq 1 120); do curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "$GATE/echo?task=load$_" >> "$TMP/codes.txt"; done ) &
@@ -181,7 +181,7 @@ for i in "${!PIDS[@]}"; do
     if [ "$(ps -o args= -p "${PIDS[$i]}" 2>/dev/null | grep -c 19102)" = "1" ]; then NODE2_PID="${PIDS[$i]}"; fi
 done
 kill "$NODE2_PID" 2>/dev/null; sleep 0.5
-# No task key: kv-scheduler declines, default swrr rotates over all peers
+# No task key: vllm-kv-scheduler declines, default swrr rotates over all peers
 # and is guaranteed to hit the dead one.
 OK=1
 for _ in 1 2 3 4 5 6 7 8; do curl -s --max-time 5 "$GATE/echo" | grep -q node || OK=0; done
@@ -269,7 +269,7 @@ check "recovered peer visible after reload (3 healthy)" bash -c "curl -s $GATE/o
 
 echo "== 16. kv-probe: content phase, kv_del, TTL release =="
 cp build/plugins/kv-probe.wasm "$TMP/plugins/"
-sed -i 's/order = \["kv-scheduler"\]/order = ["kv-scheduler", "kv-probe"]/' "$TMP/openrusty.toml"
+sed -i 's/order = \["vllm-kv-scheduler"\]/order = ["vllm-kv-scheduler", "kv-probe"]/' "$TMP/openrusty.toml"
 cat >> "$TMP/openrusty.toml" <<'CONF'
 
 [[routes]]
@@ -310,7 +310,7 @@ curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 
 echo "== 18. status endpoint shape =="
 check "status: generation >= 1" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d[\"generation\"]>=1'"
-check "status: plugins include kv-scheduler and kv-probe" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);names={p[\"name\"] for p in d[\"plugins\"]};assert {\"kv-scheduler\",\"kv-probe\"}<=names'"
+check "status: plugins include vllm-kv-scheduler and kv-probe" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);names={p[\"name\"] for p in d[\"plugins\"]};assert {\"vllm-kv-scheduler\",\"kv-probe\"}<=names'"
 check "status: upstream has 3 peers, 3 healthy" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);u=d[\"upstreams\"][0];assert u[\"peers\"]==3 and u[\"healthy\"]==3'"
 check "status: routes >= 2" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d[\"routes\"]>=2'"
 
@@ -336,13 +336,13 @@ sleep 0.5
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=logcheck")"
 check "log phase wrote KV marker" test "$CODE" = "204"
 check "plugin host_log reaches gateway log" grep -q 'kv-probe log phase marker' "$TMP/logs/gate.log"
-check "kv-scheduler log phase line present" grep -q 'kv-scheduler done task=logt1' "$TMP/logs/gate.log"
+check "vllm-kv-scheduler log phase line present" grep -q 'vllm-kv-scheduler done task=logt1' "$TMP/logs/gate.log"
 
 echo "== 22. KV scan from plugin =="
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=scan")"
 check "kv_scan sees planted keys" test "$CODE" = "204"
 
-echo "== 23. kv-scheduler: path extraction + per-node cap =="
+echo "== 23. vllm-kv-scheduler: path extraction + per-node cap =="
 sed -i 's/extract = "query:task"/extract = "path:1"/; s/max_tasks_per_node = "0"/max_tasks_per_node = "1"/' "$TMP/openrusty.toml"
 curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 sleep 7   # let all previous aff:* entries (TTL 6s) expire so cap counts are clean
@@ -364,7 +364,7 @@ check "env-config instance serves /openrusty/status" bash -c "curl -s --max-time
 check "env-config instance proxies" bash -c "curl -s --max-time 5 http://127.0.0.1:18081/echo | grep -q node"
 kill $ENV_PID 2>/dev/null
 
-echo "== 25. kv-scheduler: body cache_salt extraction =="
+echo "== 25. vllm-kv-scheduler: body cache_salt extraction =="
 sed -i 's/extract = "query:task"/extract = "body:cache_salt"/' "$TMP/openrusty.toml"
 curl -s -X POST --max-time 10 $GATE/openrusty/reload > /dev/null
 sleep 7   # let all previous aff:* entries (TTL 6s) expire so counts are clean

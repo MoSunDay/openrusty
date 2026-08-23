@@ -20,7 +20,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
 - **Gateway basics** — upstreams with smooth weighted round-robin or
   `ip_hash`, passive health checks, failure retries on another peer,
   WebSocket pass-through, SSE streaming, request timeouts.
-- **`kv-scheduler` plugin** — vLLM-style KV-cache affinity: a task key
+- **`vllm-kv-scheduler` plugin** — vLLM-style KV-cache affinity: a task key
   extracted from the URL or the request body sticks to one peer; new tasks go to the peer with
   the fewest active tasks (tie: oldest last-schedule time); affinity entries
   expire by TTL, releasing the slot.
@@ -35,7 +35,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
 | `crates/openrusty-server` | the `openrusty` binary: h2c accept loop, phase pipeline, reload endpoint |
 | `crates/openrusty-sdk` | `no_std` guest SDK (imports, allocator, `dispatch!`) |
 | `crates/openrusty-macros` | `#[phase(...)]` proc macro |
-| `plugins/kv-scheduler` | first-party plugin (own workspace, wasm-only) |
+| `plugins/vllm-kv-scheduler` | first-party plugin (own workspace, wasm-only) |
 | `plugins/kv-probe` | drill plugin exercising KV host calls and content/header_filter phases |
 | `docs/wasm-abi.md` | the plugin ABI contract |
 | `config/openrusty.example.toml` | annotated example configuration |
@@ -93,7 +93,7 @@ memory-ceiling containment of a `memory.grow`-hungry plugin. Sections 18-25
 round out the remaining `kv-probe` phases (`post_read`, `rewrite`, `access`,
 `body_filter`, `log`) plus plugin-driven `kv_scan`, assert the
 `/openrusty/status` JSON shape (generation, plugin list, upstream health,
-route count), exercise `kv-scheduler` path-segment key extraction with a
+route count), exercise `vllm-kv-scheduler` path-segment key extraction with a
 `max_tasks_per_node` cap (capped tasks spread across peers; an over-cap task
 falls back to the default balancer), boot a second gateway instance from
 the `OPENRUSTY_CONFIG` environment variable, and verify request-body

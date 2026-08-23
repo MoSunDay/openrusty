@@ -19,6 +19,6 @@ Commit: d9a7ede
 
 ## Related Docs
 - [WASM 插件阶段管线与沙箱](../../plugin-pipeline/index.md)
-- [kv-scheduler 亲和调度](../../kv-scheduler/index.md)
+- [kv-scheduler 亲和调度](../../vllm-kv-scheduler/index.md)
 - [运维与部署](../../ops/index.md)
 - [网关请求管线](../../../agents/gateway-pipeline/index.md)

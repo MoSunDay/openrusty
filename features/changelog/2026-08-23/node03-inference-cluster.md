@@ -20,4 +20,4 @@ Commit: 2bf8269
 
 ## Related Docs
 - [运维与部署](../../ops/index.md)
-- [kv-scheduler 亲和调度](../../kv-scheduler/index.md)
+- [kv-scheduler 亲和调度](../../vllm-kv-scheduler/index.md)

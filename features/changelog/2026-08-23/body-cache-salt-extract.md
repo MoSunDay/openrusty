@@ -22,6 +22,6 @@ Commit: 7ef1e9f
 - `/root/opencoder` 侧是发送端实现（出站注入 `cache_salt`），本次为网关侧的提取端落地。
 
 ## Related Docs
-- [kv-scheduler 亲和调度](../../kv-scheduler/index.md)
+- [kv-scheduler 亲和调度](../../vllm-kv-scheduler/index.md)
 - [WASM ABI 契约](../../../docs/wasm-abi.md)
 - [运维与部署](../../ops/index.md)

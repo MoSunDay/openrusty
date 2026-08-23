@@ -2,7 +2,7 @@
 //! `RequestSession::set_req_body` must reach plugins through
 //! `req_meta("body")` on every phase run (not only at instantiation).
 //!
-//! Uses the real `kv-scheduler.wasm` fixture built by
+//! Uses the real `vllm-kv-scheduler.wasm` fixture built by
 //! `scripts/build-plugins.sh`; the test is skipped when the fixture is
 //! absent (fresh checkout before the plugin build).
 
@@ -36,9 +36,9 @@ impl Drop for TmpDir {
     }
 }
 
-/// The kv-scheduler fixture; `None` when not built yet (skip).
+/// The vllm-kv-scheduler fixture; `None` when not built yet (skip).
 fn fixture() -> Option<Vec<u8>> {
-    fs::read("../../build/plugins/kv-scheduler.wasm").ok()
+    fs::read("../../build/plugins/vllm-kv-scheduler.wasm").ok()
 }
 
 fn cfg(dir: &str) -> Config {
@@ -46,7 +46,7 @@ fn cfg(dir: &str) -> Config {
     kv.insert("extract".to_string(), "body:cache_salt".to_string());
     kv.insert("affinity_ttl_s".to_string(), "6".to_string());
     let mut settings = BTreeMap::new();
-    settings.insert("kv-scheduler".to_string(), kv);
+    settings.insert("vllm-kv-scheduler".to_string(), kv);
     Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -54,7 +54,7 @@ fn cfg(dir: &str) -> Config {
         },
         plugins: PluginsConfig {
             dir: dir.into(),
-            order: vec!["kv-scheduler".to_string()],
+            order: vec!["vllm-kv-scheduler".to_string()],
             timeout_ms: 60_000,
             max_memory_mb: 16,
             settings,
@@ -100,11 +100,11 @@ fn balance_peer(reg: &PluginRegistry, body: &[u8]) -> Option<u32> {
 #[test]
 fn body_field_reaches_the_balancer_and_sticks() {
     let Some(wasm) = fixture() else {
-        eprintln!("skipped: build/plugins/kv-scheduler.wasm not built");
+        eprintln!("skipped: build/plugins/vllm-kv-scheduler.wasm not built");
         return;
     };
     let dir = TmpDir::new("sched");
-    fs::write(dir.0.join("kv-scheduler.wasm"), wasm).unwrap();
+    fs::write(dir.0.join("vllm-kv-scheduler.wasm"), wasm).unwrap();
     let reg = PluginRegistry::bootstrap(&cfg(dir.0.to_str().unwrap())).unwrap();
 
     // The seeded body is visible on every run, so the same salt is
@@ -132,11 +132,11 @@ fn body_is_pushed_to_late_instantiated_plugins() {
     // The push happens before every phase call, so a plugin instance
     // created on the first run still sees a body seeded afterwards.
     let Some(wasm) = fixture() else {
-        eprintln!("skipped: build/plugins/kv-scheduler.wasm not built");
+        eprintln!("skipped: build/plugins/vllm-kv-scheduler.wasm not built");
         return;
     };
     let dir = TmpDir::new("late");
-    fs::write(dir.0.join("kv-scheduler.wasm"), wasm).unwrap();
+    fs::write(dir.0.join("vllm-kv-scheduler.wasm"), wasm).unwrap();
     let reg = PluginRegistry::bootstrap(&cfg(dir.0.to_str().unwrap())).unwrap();
 
     let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), peers());
