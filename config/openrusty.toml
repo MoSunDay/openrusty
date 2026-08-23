@@ -40,15 +40,15 @@ retries = 2
 connect_timeout_ms = 2000
 
   [[upstreams.peers]]
-  addr = "127.0.0.1:9001"
+  addr = "192.168.31.224:9001"
   weight = 1
 
   [[upstreams.peers]]
-  addr = "127.0.0.1:9002"
+  addr = "192.168.31.224:9002"
   weight = 1
 
   [[upstreams.peers]]
-  addr = "127.0.0.1:9003"
+  addr = "192.168.31.224:9003"
   weight = 1
 
   [upstreams.health]
@@ -63,9 +63,9 @@ connect_timeout_ms = 2000
 path_prefix = "/v1"
 upstream = "vllm"
 # Whole-request timeout (milliseconds); 0 disables.
-timeout_ms = 30000
+timeout_ms = 120000
 
 [[routes]]
 path_prefix = "/"
 upstream = "vllm"
-timeout_ms = 30000
+timeout_ms = 120000
