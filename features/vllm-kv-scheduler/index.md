@@ -1,8 +1,9 @@
-Commit: d9a7ede
+Commit: 74e5987
 # vllm-kv-scheduler 亲和调度
 
 ## 能力概述
 - 一方插件（`plugins/vllm-kv-scheduler`，独立 wasm workspace）：vLLM 风格的 KV-cache 亲和调度。携带同一 task key 的请求粘滞到同一上游节点，命中缓存；新任务分配给当前活跃任务最少的节点。
+- 命名约定：同类插件按 `<推理框架>-kv-scheduler` 命名，本插件面向 vLLM 风格（OpenAI 兼容 + `cache_salt`）后端，后续可为其他框架增设同构插件。
 
 ## 触发方式
 - 在 `balancer` 阶段生效（需在 `plugins.order` 中列出）；task key 从请求提取，规则由 `[plugins.settings.vllm-kv-scheduler].extract` 配置：
