@@ -7,6 +7,7 @@ mod app;
 mod body_filter;
 mod h2c;
 mod pipeline;
+mod pipeline_peer;
 mod reload;
 mod state;
 #[cfg(test)]

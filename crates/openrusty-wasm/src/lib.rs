@@ -12,6 +12,10 @@ pub mod registry;
 pub mod runner;
 pub mod session;
 
+mod linker_kv;
+mod linker_req;
+mod registry_validate;
+
 pub use host_state::HostState;
 pub use instance::{new_host_data, HeaderEdit, HostData, PeerView};
 pub use linker::{build_linker, validate_module, AbiError, AbiInfo};
