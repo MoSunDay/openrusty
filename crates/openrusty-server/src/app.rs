@@ -1,9 +1,11 @@
 //! Management endpoints (`/openrusty/status`, `/openrusty/reload`) plus the
 //! fallback that hands every other request to the proxy pipeline.
 
+use crate::metrics;
 use crate::pipeline::{handle_request, text_response};
 use crate::reload;
 use crate::state::AppState;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -21,17 +23,70 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/openrusty/status", get(status))
         .route("/openrusty/reload", post(reload_endpoint))
+        .route("/openrusty/metrics", get(metrics_endpoint))
         .fallback(fallback)
         .with_state(state)
 }
 
 /// Proxy fallback; ConnectInfo is inserted per request by `h2c::serve`.
+/// Every request that reaches this handler is counted in the Prometheus
+/// request counter and duration histogram (management routes such as
+/// `/openrusty/metrics` are matched first and bypass the fallback).
 async fn fallback(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
 ) -> Response {
-    handle_request(state, remote, req).await
+    let start = std::time::Instant::now();
+    let path = req.uri().path().to_string();
+    let resp = handle_request(state.clone(), remote, req).await;
+    let status = resp.status().as_u16();
+    let duration = start.elapsed().as_secs_f64();
+
+    let rt = state.runtime.load();
+    let route = crate::pipeline::match_route(&rt.routes, &path)
+        .and_then(|i| rt.routes.get(i))
+        .map(|r| r.path_prefix.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    state.metrics.record_request(&route, status);
+    state.metrics.record_duration(duration);
+    resp
+}
+
+/// Prometheus text exposition 0.0.4: process counters from the collector
+/// snapshot plus live gauges sampled at scrape time (peer health from the
+/// health registry, plugin KV sizes and error kinds from the registry).
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    // Live peer health gauge, upstreams sorted by name.
+    let rt = state.runtime.load();
+    let now = now_ms();
+    let mut peers = Vec::new();
+    let mut names: Vec<&String> = rt.upstreams.keys().collect();
+    names.sort();
+    for name in names {
+        let up = &rt.upstreams[name];
+        for (i, peer) in up.up.peers.iter().enumerate() {
+            let healthy = proxy::is_healthy(&state.health, name, i, now);
+            peers.push((name.clone(), peer.addr.to_string(), healthy));
+        }
+    }
+
+    // Live plugin gauges/counters: KV entry count + per-kind error counts.
+    let mut kv = Vec::new();
+    let mut plugin_errors = Vec::new();
+    for (plugin, kinds, kv_len) in state.registry.metric_view() {
+        kv.push((plugin.clone(), kv_len as u64));
+        for (kind, count) in kinds {
+            plugin_errors.push((plugin.clone(), kind, count));
+        }
+    }
+
+    let body = metrics::render(&state.metrics.snapshot(), &peers, &kv, &plugin_errors);
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| text_response(500, "500 bad response\n"))
 }
 
 /// JSON status: runtime generation, uptime, plugin error counters, route
@@ -44,10 +99,21 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .iter()
         .map(|(name, u)| {
             let healthy = proxy::healthy_indices(&state.health, name, u.up.peers.len(), now).len();
+            // Active-plane count: fail-open when active health is disabled
+            // (report all peers), otherwise count healthy addr-plane entries.
+            let active_healthy = if u.up.health.active.is_some() {
+                proxy::active_peers(&state.health)
+                    .iter()
+                    .filter(|(n, _, h)| n == name && *h)
+                    .count()
+            } else {
+                u.up.peers.len()
+            };
             json!({
                 "name": name,
                 "peers": u.up.peers.len(),
                 "healthy": healthy,
+                "active_healthy": active_healthy,
             })
         })
         .collect();
@@ -127,6 +193,10 @@ mod tests {
         assert!(body.contains("\"generation\""), "body: {body}");
         assert!(body.contains("\"upstreams\""), "body: {body}");
         assert!(body.contains("\"routes\":1"), "body: {body}");
+        // Active health is disabled in the standard config: fail-open means
+        // active_healthy reports the full peer count.
+        assert!(body.contains("\"active_healthy\":1"), "body: {body}");
+        assert!(body.contains("\"peers\":1"), "body: {body}");
     }
 
     #[tokio::test]
@@ -157,5 +227,91 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = body_string(resp).await;
         assert!(body.contains("\"generation\":1"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_counters_and_gauges() {
+        let dir = TmpDir::new("metrics");
+        // Use a port that is certainly closed: grab an ephemeral port and
+        // release it, then point the upstream there. The proxied request
+        // then fails with a connect error instead of hitting a stray
+        // listener (e.g. an echo_upstream left over from an e2e run).
+        let free_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let peer_addr = format!("127.0.0.1:{free_port}");
+        let config = dir
+            .standard_config()
+            .replace("127.0.0.1:9001", &peer_addr);
+        dir.write_config(&config);
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        // One proxied request: no upstream is listening on the test peer,
+        // so it 502s after a recorded connect_fail attempt.
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/api/hello", "127.0.0.1:40003"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+
+        // The scrape itself bypasses the fallback, so it is not counted.
+        let resp = svc
+            .oneshot(request("GET", "/openrusty/metrics", "127.0.0.1:40004"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = body_string(resp).await;
+
+        // Request counter with the routed prefix and the actual status.
+        assert!(
+            body.contains("openrusty_requests_total{route=\"/\",code=\"502\"} 1"),
+            "body: {body}"
+        );
+        // Duration histogram: buckets, sum and count.
+        assert!(
+            body.contains("openrusty_request_duration_seconds_bucket{le=\"0.005\"}"),
+            "body: {body}"
+        );
+        assert!(body.contains("openrusty_request_duration_seconds_sum "), "body: {body}");
+        assert!(
+            body.contains("openrusty_request_duration_seconds_count 1"),
+            "body: {body}"
+        );
+        // Upstream attempt counter with the recorded result label.
+        assert!(
+            body.contains(
+                "openrusty_upstream_attempts_total{upstream=\"u\",result=\"connect_fail\"} 1"
+            ),
+            "body: {body}"
+        );
+        // Live gauges: peer health line for upstream u, KV family present.
+        assert!(
+            body.contains(&format!(
+                "openrusty_peer_healthy{{upstream=\"u\",addr=\"{peer_addr}\"}}"
+            )),
+            "body: {body}"
+        );
+        assert!(body.contains("# HELP openrusty_kv_entries "), "body: {body}");
+        assert!(body.contains("# TYPE openrusty_kv_entries gauge"), "body: {body}");
+        // TYPE lines for every family.
+        for ty in [
+            "# TYPE openrusty_requests_total counter",
+            "# TYPE openrusty_request_duration_seconds histogram",
+            "# TYPE openrusty_upstream_attempts_total counter",
+            "# TYPE openrusty_plugin_errors_total counter",
+            "# TYPE openrusty_peer_healthy gauge",
+        ] {
+            assert!(body.contains(ty), "missing {ty:?} in:\n{body}");
+        }
+        // The metrics request itself must not be instrumented: a counted
+        // scrape would show up as route="unknown" (no route matches).
+        assert!(!body.contains("route=\"unknown\""), "body: {body}");
     }
 }

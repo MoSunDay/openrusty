@@ -39,6 +39,8 @@ balancer = "swrr"
 retries = 2
 # Timeout for establishing the upstream connection (milliseconds).
 connect_timeout_ms = 2000
+# retry_on_timeout = false
+# 路由超时后重试下一个 peer；默认关闭，因为 POST 重放可能使 LLM 计算成本翻倍。
 
   [[upstreams.peers]]
   addr = "127.0.0.1:9001"
@@ -58,6 +60,15 @@ connect_timeout_ms = 2000
   max_fails = 3
   fail_window_s = 10
   fail_timeout_s = 10
+
+  # Active health check: periodically probe each peer via HTTP GET.
+  # Uncomment to enable (defaults shown).
+  # [upstreams.health.active]
+  # interval_ms = 1000
+  # timeout_ms = 1000
+  # path = "/"
+  # unhealthy_threshold = 2
+  # healthy_threshold = 2
 
 [[routes]]
 # Requests whose path starts with this prefix are forwarded to `upstream`.

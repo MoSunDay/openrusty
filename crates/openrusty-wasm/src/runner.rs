@@ -140,7 +140,9 @@ pub fn run_phase_outcome(
         Ok(code) => match Decision::from_abi(code) {
             Some(d) => PhaseOutcome::Decision(d),
             None => {
-                rt.store.data().state.record_error();
+                // Kind label mirrors KIND_BAD_CODE in
+                // openrusty-server/src/metrics.rs.
+                rt.store.data().state.record_error("bad_code");
                 PhaseOutcome::Error {
                     plugin,
                     kind: ErrorKind::BadCode(code),
@@ -148,10 +150,13 @@ pub fn run_phase_outcome(
             }
         },
         Err(err) => {
-            rt.store.data().state.record_error();
+            // Kind labels mirror KIND_TIMEOUT/KIND_TRAP in
+            // openrusty-server/src/metrics.rs.
             let kind = if err.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
+                rt.store.data().state.record_error("timeout");
                 ErrorKind::Timeout
             } else {
+                rt.store.data().state.record_error("trap");
                 ErrorKind::Trap
             };
             tracing::warn!(plugin = %plugin, phase = phase.name(), error = %err, "plugin trap");

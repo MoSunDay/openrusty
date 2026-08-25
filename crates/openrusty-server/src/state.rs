@@ -4,6 +4,7 @@
 //! `RuntimeSnapshot` is swapped atomically on reload; in-flight requests
 //! keep their own `Arc` clone alive for the whole request.
 
+use crate::metrics;
 use openrusty_core::config::{Config, RouteConfig};
 use openrusty_proxy as proxy;
 use openrusty_wasm::PluginRegistry;
@@ -34,9 +35,14 @@ pub struct AppState {
     pub health: Arc<proxy::HealthRegistry>,
     /// Pooled keep-alive clients, one per peer address.
     pub pool: Arc<proxy::ClientPool>,
+    /// Prometheus counters and histogram; created once at boot and
+    /// survives reloads like the health registry.
+    pub metrics: Arc<metrics::Metrics>,
     pub runtime: arc_swap::ArcSwap<RuntimeSnapshot>,
     pub config_path: PathBuf,
     pub started_at: std::time::Instant,
+    /// Handle of the active-probe task; cancelled and replaced on reload.
+    pub probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Empty runtime used before the first [`apply_runtime`] call.

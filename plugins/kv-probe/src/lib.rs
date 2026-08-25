@@ -1,6 +1,6 @@
-//! kv-probe: E2E drill plugin exercising the host KV store across the
-//! post_read, rewrite, access, content, header_filter, body_filter and
-//! log phases.
+//! kv-probe: E2E drill plugin exercising the host KV store across all
+//! eight phases: post_read, rewrite, access, content, balancer,
+//! header_filter, body_filter and log.
 //!
 //! Content phase: requests under `/probe` run KV set/get/del roundtrips,
 //! read-after-write visibility, TTL-expiry, cross-phase visibility and
@@ -81,6 +81,9 @@ enum ProbeMode {
     LogCheck,
     /// kv_scan over the scan prefix must see both scan keys.
     Scan,
+    /// Balancer phase: assert the 3-peer healthy view and pin the
+    /// request to the first healthy peer.
+    Balancer,
 }
 
 /// Post-read phase: record the request path for cross-phase checks.
@@ -116,6 +119,40 @@ fn on_access() -> Decision {
     }
 }
 
+/// Balancer phase: for `/probe?mode=balancer` requests, assert that the
+/// routed upstream exposes exactly 3 healthy peers, that out-of-range
+/// `set_peer` calls are rejected, and pin the request to the first
+/// healthy peer. Every other request is declined untouched, so the
+/// plugin never interferes with normal balancing.
+#[openrusty_sdk::phase(balancer)]
+fn on_balancer() -> Decision {
+    let query = host::req_meta_str("query").unwrap_or_default();
+    if !matches!(parse_mode(&query), Some(ProbeMode::Balancer)) {
+        return Decision::Declined;
+    }
+    let peers = host::peers();
+    let Some(first_healthy) = valid_peer_view(&peers) else {
+        return Decision::Deny(409);
+    };
+    if host::set_peer(999) || host::set_peer(u32::MAX) {
+        return Decision::Deny(409);
+    }
+    if host::set_peer(first_healthy as u32) {
+        Decision::Declined
+    } else {
+        Decision::Deny(409)
+    }
+}
+
+/// Pure validation of the balancer-phase peer view: exactly 3 peers, all
+/// healthy; returns the first healthy index.
+fn valid_peer_view(peers: &[host::PeerInfo]) -> Option<usize> {
+    if peers.len() != 3 || peers.iter().any(|p| !p.healthy) {
+        return None;
+    }
+    peers.iter().position(|p| p.healthy)
+}
+
 /// Content phase: maintain the marker on any path, then run the
 /// requested KV probe on `/probe` paths.
 #[openrusty_sdk::phase(content)]
@@ -126,6 +163,17 @@ fn on_content() -> Decision {
     }
     if flag(&query, "pdel") {
         host::kv_del(MARKER_KEY);
+    }
+    // `meta=1` (any path): verify req_meta method/client_ip/header keys.
+    if flag(&query, "meta") {
+        let ok = host::req_meta("method").as_deref() == Some(b"GET".as_slice())
+            && host::req_meta("client_ip")
+                .map(|v| v.starts_with(b"127.0.0.1"))
+                .unwrap_or(false)
+            && host::req_meta("header:user-agent")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        return if ok { Decision::Done } else { Decision::Deny(409) };
     }
     let path = host::req_meta_str("path").unwrap_or_default();
     if !path.starts_with("/probe") {
@@ -144,24 +192,45 @@ fn on_content() -> Decision {
         Some(ProbeMode::BodyCheck) => body_check(),
         Some(ProbeMode::LogCheck) => present(LOG_RAN_KEY, b"1"),
         Some(ProbeMode::Scan) => scan(),
+        Some(ProbeMode::Balancer) => Decision::Declined,
         None => Decision::Deny(400),
     }
 }
 
 /// Header filter phase: echo the marker value (or `-` when absent)
-/// into `x-kv-probe` when the `phdr` flag is set.
+/// into `x-kv-probe` when the `phdr` flag is set. With `respset=1`,
+/// set the header and verify it reads back; with `respdel=1`, set,
+/// verify, delete and verify it is gone.
 #[openrusty_sdk::phase(header_filter)]
 fn on_header_filter() -> Decision {
     let query = host::req_meta_str("query").unwrap_or_default();
-    if !flag(&query, "phdr") {
+    if flag(&query, "phdr") {
+        let value = match host::kv_get(MARKER_KEY) {
+            Some(raw) => String::from_utf8_lossy(&raw).into_owned(),
+            None => String::from("-"),
+        };
+        host::set_resp_header(RESP_HEADER, &value);
+        return Decision::Ok;
+    }
+    if flag(&query, "respset") {
+        host::set_resp_header(RESP_HEADER, "mk");
+        if host::resp_header(RESP_HEADER).as_deref() != Some("mk") {
+            return Decision::Deny(409);
+        }
         return Decision::Declined;
     }
-    let value = match host::kv_get(MARKER_KEY) {
-        Some(raw) => String::from_utf8_lossy(&raw).into_owned(),
-        None => String::from("-"),
-    };
-    host::set_resp_header(RESP_HEADER, &value);
-    Decision::Ok
+    if flag(&query, "respdel") {
+        host::set_resp_header(RESP_HEADER, "mk");
+        if host::resp_header(RESP_HEADER).as_deref() != Some("mk") {
+            return Decision::Deny(409);
+        }
+        host::del_resp_header(RESP_HEADER);
+        if host::resp_header(RESP_HEADER).is_some() {
+            return Decision::Deny(409);
+        }
+        return Decision::Declined;
+    }
+    Decision::Declined
 }
 
 /// Body filter phase: with `bmark`, accumulate upstream body bytes and
@@ -200,6 +269,7 @@ openrusty_sdk::dispatch! {
     rewrite => on_rewrite,
     access => on_access,
     content => on_content,
+    balancer => on_balancer,
     header_filter => on_header_filter,
     body_filter => on_body_filter,
     log => on_log,
@@ -291,6 +361,7 @@ fn parse_mode(query: &str) -> Option<ProbeMode> {
         "bodycheck" => Some(ProbeMode::BodyCheck),
         "logcheck" => Some(ProbeMode::LogCheck),
         "scan" => Some(ProbeMode::Scan),
+        "balancer" => Some(ProbeMode::Balancer),
         _ => None,
     }
 }
@@ -315,6 +386,7 @@ fn flag(query: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn flag_accepts_only_one() {
@@ -350,9 +422,35 @@ mod tests {
         assert_eq!(parse_mode("mode=logcheck"), Some(ProbeMode::LogCheck));
         assert_eq!(parse_mode("mode=scan"), Some(ProbeMode::Scan));
         assert_eq!(
+            parse_mode("mode=balancer"),
+            Some(ProbeMode::Balancer)
+        );
+        assert_eq!(
             parse_mode("a=1&mode=absent&b=2"),
             Some(ProbeMode::Absent)
         );
+    }
+
+    #[test]
+    fn valid_peer_view_requires_three_healthy_peers() {
+        let peer = |name: &str, healthy: bool| host::PeerInfo {
+            name: String::from(name),
+            addr: String::from("127.0.0.1:19101"),
+            healthy,
+        };
+        let three = vec![peer("n1", true), peer("n2", true), peer("n3", true)];
+        assert_eq!(valid_peer_view(&three), Some(0));
+        let two = vec![peer("n1", true), peer("n2", true)];
+        assert_eq!(valid_peer_view(&two), None);
+        let one_down = vec![peer("n1", true), peer("n2", false), peer("n3", true)];
+        assert_eq!(valid_peer_view(&one_down), None);
+        let four = vec![
+            peer("n1", true),
+            peer("n2", true),
+            peer("n3", true),
+            peer("n4", true),
+        ];
+        assert_eq!(valid_peer_view(&four), None);
     }
 
     #[test]

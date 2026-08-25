@@ -27,8 +27,8 @@ pub use balancer::{ip_hash_pick, swrr_next};
 pub use client::{get, new_pool, ClientPool, HttpBody, HttpClient};
 pub use forward::{forward, tunnel, ForwardError, ForwardRequest};
 pub use health::{
-    evaluate_failure, healthy_indices, is_healthy, new, record_failure, record_success, register,
-    HealthRegistry,
+    active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
+    is_healthy, new, record_failure, record_probe, record_success, register, HealthRegistry,
 };
 pub use upstream::{
     from_config, is_hop_by_hop, is_websocket_upgrade, strip_hop_by_hop, Peer, Upstream,

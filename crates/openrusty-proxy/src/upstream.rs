@@ -34,6 +34,8 @@ pub struct Upstream {
     pub kind: BalancerKind,
     /// How many extra attempts are allowed after the first failure.
     pub retries: u32,
+    /// Retry the request on the next peer when the route times out.
+    pub retry_on_timeout: bool,
     /// Per-attempt TCP connect timeout.
     pub connect_timeout: Duration,
     /// The balancing targets, in configuration order.
@@ -48,6 +50,7 @@ pub fn from_config(cfg: &UpstreamConfig) -> Upstream {
         name: cfg.name.clone(),
         kind: cfg.balancer,
         retries: cfg.retries,
+        retry_on_timeout: cfg.retry_on_timeout,
         connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
         peers: cfg
             .peers
@@ -57,7 +60,7 @@ pub fn from_config(cfg: &UpstreamConfig) -> Upstream {
                 weight: p.weight,
             })
             .collect(),
-        health: cfg.health,
+        health: cfg.health.clone(),
     }
 }
 
@@ -132,6 +135,7 @@ mod tests {
             name: "llm".into(),
             balancer: BalancerKind::Swrr,
             retries: 2,
+            retry_on_timeout: true,
             connect_timeout_ms: 1500,
             peers: vec![
                 openrusty_core::config::PeerConfig {
@@ -153,10 +157,20 @@ mod tests {
         assert_eq!(up.name, "llm");
         assert_eq!(up.kind, BalancerKind::Swrr);
         assert_eq!(up.retries, 2);
+        assert!(up.retry_on_timeout);
         assert_eq!(up.connect_timeout, Duration::from_millis(1500));
         assert_eq!(up.peers.len(), 2);
         assert_eq!(up.peers[0].weight, 5);
         assert_eq!(up.peers[1].addr.to_string(), "127.0.0.1:9002");
+        assert_eq!(up.health.max_fails, HealthConfig::default().max_fails);
+    }
+
+    #[test]
+    fn retry_on_timeout_defaults_to_false() {
+        let mut cfg = up_cfg();
+        cfg.retry_on_timeout = false;
+        let up = from_config(&cfg);
+        assert!(!up.retry_on_timeout);
     }
 
     #[test]
