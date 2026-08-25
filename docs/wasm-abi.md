@@ -29,7 +29,7 @@ orr_on_phase(phase: i32, ctx: i32) -> i32
 |------|---------|
 | `0` | NGX_OK – handled, continue chain |
 | `-5` | NGX_DECLINED – pass, continue chain |
-| `-4` | NGX_DONE – stop the phase chain (`content`: short-circuit empty 204) |
+| `-4` | NGX_DONE – stop the phase chain; short-circuit with an empty 204 (from `content`: no body, no proxy attempt) |
 | `100..=599` | deny: abort the request with this HTTP status |
 | anything else | protocol error – treated per `on_failure` policy |
 
@@ -37,14 +37,27 @@ orr_on_phase(phase: i32, ctx: i32) -> i32
 
 | id | name | runs |
 |----|------|------|
-| 0 | post_read | before routing |
-| 1 | rewrite | before routing |
-| 2 | access | before routing |
-| 3 | content | before the default proxy handler |
+| 0 | post_read | after routing (route index + upstream already on the context) |
+| 1 | rewrite | after post_read |
+| 2 | access | after rewrite |
+| 3 | content | after request body buffering (WebSocket requests bypass it), before the default proxy handler |
 | 4 | balancer | before each upstream attempt (may pick the peer) |
 | 5 | header_filter | when upstream response headers arrived |
-| 6 | body_filter | once per response body chunk |
-| 7 | log | after the response is fully sent or on error |
+| 6 | body_filter | once per response body data chunk (observe-only) plus one final empty chunk (`last=true`) |
+| 7 | log | after the body stream ends (success/error/disconnect) or once for short-circuited requests |
+
+Routing happens before any plugin phase: the request path is matched against
+the configured `[[routes]]` by longest prefix (first match wins on ties), and
+the matched route index and upstream name are set on the request context
+before `post_read` runs. When no route matches, the request is answered with
+404 and no plugin phase runs at all — `log` included.
+
+`body_filter` is observe-only: each response body data chunk is pushed through
+the phase (readable via `body_chunk` / `body_is_last`) and then yielded to the
+client unchanged. After the stream ends — normally, on error, or on client
+disconnect — the phase is called one final time with an empty chunk and
+`body_is_last() == 1`. Returning `Done` or `Declined` from `body_filter` does
+not change the stream: nginx-style body rewriting is not implemented.
 
 ## Host imports (namespace `openrusty`)
 
@@ -52,6 +65,8 @@ Two-phase reads: the host writes into a guest-provided buffer.
 
 - Return `>= 0`: bytes written.
 - Return `< 0`: buffer too small; `-ret` is the required length (grow, retry).
+  Exception: `req_peer_get` returns `-2` for an out-of-range index (nothing is
+  written; not a required length).
 
 `kv_get` returns `0` for a missing key (empty values are indistinguishable
 from absent; plugins must not store empty values). Strings are raw UTF-8
@@ -67,10 +82,10 @@ req_meta(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
         "body" (raw request body bytes, capped at 16 MiB; buffered before
         the content phase, so content/balancer/header_filter/body_filter/log
         see it while post_read/rewrite/access see an empty body)
-req_peer_count() -> i32                     # healthy peers of routed upstream
+req_peer_count() -> i32                     # total peers of the routed upstream
 req_peer_get(idx: i32, out_ptr: i32, out_cap: i32) -> i32
-  writes TLV: name, addr, healthy("1"/"0")
-balancer_set_peer(idx: i32) -> i32          # 0 ok, -1 invalid/unhealthy
+  writes TLV: name, addr, healthy("1"/"0"); -2 = invalid index (nothing written)
+balancer_set_peer(idx: i32) -> i32          # 0 ok, -1 out of bounds (no health check)
 
 kv_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
   0 = not found
@@ -86,12 +101,19 @@ resp_header_set(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32) -> i32
 resp_header_del(name_ptr: i32, name_len: i32) -> i32
 
 body_chunk(out_ptr: i32, out_cap: i32) -> i32   # body_filter: current chunk
-  returns bytes written; 0 = no data (should not happen); negative = error
+  returns bytes written; 0 = no data (final empty chunk call); negative = error
 body_is_last() -> i32                           # 1 if chunk is the final one
 
 cfg_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
   # plugin settings from [plugins.settings.<name>]; 0 if unset
 ```
+
+`req_peer_count` / `req_peer_get` expose every peer of the routed upstream
+(healthy or not) with the health flag captured at request start.
+`balancer_set_peer` only bounds-checks the index; it never checks health. The
+gateway re-validates the plugin's pick against the current health registry
+before each attempt and falls back to the configured default balancer when
+the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
 
 ## Timeouts & memory
 
@@ -109,5 +131,6 @@ cfg_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
   validates it, compiles every plugin module in the background, and publishes
   a new snapshot atomically. Any failure aborts the whole reload and keeps
   the previous snapshot. In-flight requests keep their snapshot alive via
-  `Arc`. Per-plugin shared state (KV store) and upstream health survive
-  reloads (keyed by name).
+  `Arc`. Per-plugin shared state (KV store) survives reloads keyed by plugin
+  name, and upstream health survives reloads keyed by upstream name (peer
+  state is kept when the peer list shape is unchanged).

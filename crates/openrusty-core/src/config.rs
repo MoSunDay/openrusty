@@ -95,7 +95,7 @@ fn default_weight() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     #[serde(default = "default_max_fails")]
@@ -104,6 +104,24 @@ pub struct HealthConfig {
     pub fail_window_s: u64,
     #[serde(default = "default_fail_timeout_s")]
     pub fail_timeout_s: u64,
+    /// Active health check; `Some` when `[upstreams.health.active]` is present.
+    #[serde(default)]
+    pub active: Option<ActiveHealthConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveHealthConfig {
+    #[serde(default = "default_active_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_active_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_active_path")]
+    pub path: String,
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
 }
 
 fn default_max_fails() -> u32 {
@@ -115,6 +133,21 @@ fn default_fail_window_s() -> u64 {
 fn default_fail_timeout_s() -> u64 {
     10
 }
+fn default_active_interval_ms() -> u64 {
+    1000
+}
+fn default_active_timeout_ms() -> u64 {
+    1000
+}
+fn default_active_path() -> String {
+    "/".to_string()
+}
+fn default_unhealthy_threshold() -> u32 {
+    2
+}
+fn default_healthy_threshold() -> u32 {
+    2
+}
 
 impl Default for HealthConfig {
     fn default() -> Self {
@@ -122,6 +155,7 @@ impl Default for HealthConfig {
             max_fails: default_max_fails(),
             fail_window_s: default_fail_window_s(),
             fail_timeout_s: default_fail_timeout_s(),
+            active: None,
         }
     }
 }
@@ -134,6 +168,9 @@ pub struct UpstreamConfig {
     pub balancer: BalancerKind,
     #[serde(default)]
     pub retries: u32,
+    /// Retry the request on another peer when the route times out.
+    #[serde(default)]
+    pub retry_on_timeout: bool,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
     #[serde(default)]
@@ -198,6 +235,38 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             if p.weight == 0 {
                 return Err(bad(&format!(
                     "upstream {} peer #{i} has zero weight",
+                    up.name
+                )));
+            }
+        }
+        if let Some(active) = &up.health.active {
+            if active.interval_ms == 0 {
+                return Err(bad(&format!(
+                    "upstream {} health.active.interval_ms must be > 0",
+                    up.name
+                )));
+            }
+            if active.timeout_ms == 0 {
+                return Err(bad(&format!(
+                    "upstream {} health.active.timeout_ms must be > 0",
+                    up.name
+                )));
+            }
+            if active.unhealthy_threshold == 0 {
+                return Err(bad(&format!(
+                    "upstream {} health.active.unhealthy_threshold must be >= 1",
+                    up.name
+                )));
+            }
+            if active.healthy_threshold == 0 {
+                return Err(bad(&format!(
+                    "upstream {} health.active.healthy_threshold must be >= 1",
+                    up.name
+                )));
+            }
+            if !active.path.starts_with('/') {
+                return Err(bad(&format!(
+                    "upstream {} health.active.path must start with '/'",
                     up.name
                 )));
             }
@@ -270,5 +339,103 @@ upstream = "vllm"
             toml::from_str("[server]\nlisten = \"127.0.0.1:8080\"\nlog_level = \"loud\"\n")
                 .unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn parses_retry_on_timeout_and_active_health() {
+        let cfg: Config = toml::from_str(
+            &GOOD
+                .replace("name = \"vllm\"", "name = \"vllm\"\nretry_on_timeout = true")
+                .replace(
+                    "addr = \"127.0.0.1:9001\"",
+                    "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  interval_ms = 500\n  timeout_ms = 250\n  path = \"/healthz\"\n  unhealthy_threshold = 3\n  healthy_threshold = 1",
+                ),
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let up = &cfg.upstreams[0];
+        assert!(up.retry_on_timeout);
+        let active = up.health.active.as_ref().unwrap();
+        assert_eq!(active.interval_ms, 500);
+        assert_eq!(active.timeout_ms, 250);
+        assert_eq!(active.path, "/healthz");
+        assert_eq!(active.unhealthy_threshold, 3);
+        assert_eq!(active.healthy_threshold, 1);
+    }
+
+    #[test]
+    fn active_health_defaults_to_none() {
+        let cfg: Config = toml::from_str(GOOD).unwrap();
+        validate(&cfg).unwrap();
+        let up = &cfg.upstreams[0];
+        assert!(!up.retry_on_timeout);
+        assert!(up.health.active.is_none());
+    }
+
+    #[test]
+    fn rejects_zero_active_interval() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "addr = \"127.0.0.1:9001\"",
+            "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  interval_ms = 0",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("health.active.interval_ms"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_active_timeout() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "addr = \"127.0.0.1:9001\"",
+            "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  timeout_ms = 0",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("health.active.timeout_ms"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_active_thresholds() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "addr = \"127.0.0.1:9001\"",
+            "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  unhealthy_threshold = 0",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("health.active.unhealthy_threshold"),
+            "unexpected error: {err}"
+        );
+
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "addr = \"127.0.0.1:9001\"",
+            "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  healthy_threshold = 0",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("health.active.healthy_threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_active_path_without_leading_slash() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "addr = \"127.0.0.1:9001\"",
+            "addr = \"127.0.0.1:9001\"\n  [upstreams.health.active]\n  path = \"healthz\"",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("health.active.path"),
+            "unexpected error: {err}"
+        );
     }
 }

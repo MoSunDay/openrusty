@@ -2,7 +2,9 @@
 //! reloads: a KV store with TTLs plus snapshot-based scan cursors.
 
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Milliseconds since the Unix epoch (best effort; 0 on a broken clock).
@@ -42,6 +44,11 @@ pub struct HostState {
     cursors: DashMap<u32, ScanCursor>,
     next_cursor: AtomicU32,
     errors: AtomicU64,
+    /// Per-kind error counts (`openrusty_plugin_errors_total{kind=...}`),
+    /// keyed by kind label. Kind values mirror the server-side constants
+    /// in `openrusty-server/src/metrics.rs` (KIND_TRAP/KIND_TIMEOUT/
+    /// KIND_BAD_CODE): "trap", "timeout", "bad_code".
+    error_kinds: Mutex<HashMap<String, u64>>,
     /// Scan ops accumulated since the last opportunistic sweep.
     stale_ops: AtomicU32,
 }
@@ -54,6 +61,7 @@ impl HostState {
             cursors: DashMap::new(),
             next_cursor: AtomicU32::new(0),
             errors: AtomicU64::new(0),
+            error_kinds: Mutex::new(HashMap::new()),
             stale_ops: AtomicU32::new(0),
         }
     }
@@ -197,12 +205,34 @@ impl HostState {
         removed
     }
 
-    pub fn record_error(&self) {
+    /// Count one plugin error: the aggregate counter (consumed by
+    /// `/openrusty/status`) and the per-kind breakdown (consumed by the
+    /// Prometheus metrics endpoint). `kind` must match the server-side
+    /// label values in `openrusty-server/src/metrics.rs`: "trap",
+    /// "timeout", "bad_code".
+    pub fn record_error(&self, kind: &str) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+        let mut kinds = self.error_kinds.lock().unwrap();
+        *kinds.entry(kind.to_string()).or_insert(0) += 1;
     }
 
     pub fn error_count(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Per-kind error counts as `(kind, count)`, sorted by kind name.
+    pub fn error_kinds(&self) -> Vec<(String, u64)> {
+        let kinds = self.error_kinds.lock().unwrap();
+        let mut out: Vec<(String, u64)> =
+            kinds.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Number of live KV entries currently held (expired entries are
+    /// removed lazily by [`sweep`](Self::sweep)).
+    pub fn kv_len(&self) -> usize {
+        self.kv.len()
     }
 }
 
@@ -237,8 +267,13 @@ mod tests {
         assert!(is_expired(10, 11));
 
         let s = state();
-        s.kv_set(b"t", b"v".to_vec(), 1);
-        let expires_at = now_ms() + 1;
+        // Deterministic expiry: inject the deadline directly so no clock
+        // race between set and get can flip the "live" assertion.
+        s.kv_set(b"t", b"v".to_vec(), 0);
+        let expires_at = now_ms() + 10_000;
+        if let Some(mut e) = s.kv.get_mut(&b"t"[..]) {
+            e.expires_at = expires_at;
+        }
         // Live before expiry...
         assert_eq!(s.kv_get(b"t"), Some(b"v".to_vec()));
         // ...and sweep at an explicit later time removes it.
@@ -309,8 +344,30 @@ mod tests {
     fn error_counter() {
         let s = state();
         assert_eq!(s.error_count(), 0);
-        s.record_error();
-        s.record_error();
+        s.record_error("trap");
+        s.record_error("trap");
         assert_eq!(s.error_count(), 2);
+    }
+
+    #[test]
+    fn error_kinds_sorted_and_kv_len_counts_entries() {
+        let s = state();
+        s.kv_set(b"a", b"1".to_vec(), 0);
+        s.kv_set(b"b", b"2".to_vec(), 0);
+        assert_eq!(s.kv_len(), 2);
+        s.record_error("bad_code");
+        s.record_error("timeout");
+        s.record_error("trap");
+        s.record_error("trap");
+        assert_eq!(
+            s.error_kinds(),
+            vec![
+                ("bad_code".to_string(), 1),
+                ("timeout".to_string(), 1),
+                ("trap".to_string(), 2),
+            ]
+        );
+        // Aggregate counter still counts every kind.
+        assert_eq!(s.error_count(), 4);
     }
 }

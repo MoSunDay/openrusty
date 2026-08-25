@@ -1,17 +1,28 @@
-//! Passive health checking, keyed by upstream name.
+//! Health checking, keyed by upstream name: a passive plane (nginx
+//! `max_fails` / `fail_timeout` style, driven by request outcomes) and an
+//! active plane (proactive probes, lua-resty-upstream-healthcheck style,
+//! driven by [`record_probe`]).
 //!
 //! State is stored in a registry that outlives config snapshots, so peer
 //! health SURVIVES config reloads: re-registering an upstream with the same
 //! name and peer count keeps its failure counters and down state.
 //!
-//! Model per peer (nginx `max_fails` / `fail_timeout` style):
+//! Passive model per peer (nginx `max_fails` / `fail_timeout` style):
 //! - failures are counted inside a sliding window of `fail_window_s`;
 //! - a failure outside the window resets the window and the counter;
 //! - reaching `max_fails` marks the peer down for `fail_timeout_s`;
 //! - a success clears the failure counter.
+//!
+//! Active model per (upstream, addr) pair (consecutive counters):
+//! - a probe success increments `successes` and resets `fails`; a healthy
+//!   peer stays healthy, a down peer recovers once
+//!   `successes >= healthy_threshold`;
+//! - a probe failure increments `fails` and resets `successes`; the peer
+//!   becomes unhealthy once `fails >= unhealthy_threshold`;
+//! - unknown (upstream, addr) pairs are treated as healthy (fail-open).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use openrusty_core::config::HealthConfig;
@@ -31,17 +42,36 @@ pub struct PeerHealth {
     counters: Mutex<PeerCounters>,
     /// Peer is considered down while `now_ms < down_until_ms`.
     down_until_ms: AtomicU64,
+    /// Active-plane verdict for this index slot, mirrored by
+    /// [`record_probe`] so index-based call sites see it without signature
+    /// changes. Starts healthy (fail-open).
+    active_ok: AtomicBool,
+}
+
+/// Active-plane health for one (upstream, addr) pair.
+struct ActivePeer {
+    /// Current verdict; starts healthy (fail-open).
+    healthy: AtomicBool,
+    /// Consecutive failed probes.
+    fails: AtomicU32,
+    /// Consecutive successful probes.
+    successes: AtomicU32,
 }
 
 /// Registry of per-upstream peer health state. Cheaply shared via `&`.
 pub struct HealthRegistry {
     upstreams: Mutex<HashMap<String, Arc<Vec<PeerHealth>>>>,
+    /// Active-plane state keyed by (upstream name, peer addr). Entries for
+    /// peers removed from config stay behind: they are never probed and the
+    /// index-based paths never consult them, so they are harmless.
+    active: Mutex<HashMap<(String, String), Arc<ActivePeer>>>,
 }
 
 /// Create an empty registry.
 pub fn new() -> HealthRegistry {
     HealthRegistry {
         upstreams: Mutex::new(HashMap::new()),
+        active: Mutex::new(HashMap::new()),
     }
 }
 
@@ -69,6 +99,7 @@ pub fn register(h: &HealthRegistry, upstream: &str, peer_count: usize) {
         .map(|_| PeerHealth {
             counters: Mutex::new(PeerCounters::default()),
             down_until_ms: AtomicU64::new(0),
+            active_ok: AtomicBool::new(true),
         })
         .collect();
     map.insert(upstream.to_string(), Arc::new(peers));
@@ -81,10 +112,16 @@ fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<Vec<Peer
 }
 
 /// True when the peer is not currently marked down.
-/// Unknown upstreams/indices are treated as healthy (fail-open).
+/// A peer is unhealthy when EITHER plane says so: passive down-until has
+/// not expired, or the active probe verdict is unhealthy. Unknown
+/// upstreams/indices are treated as healthy (fail-open).
 pub fn is_healthy(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u64) -> bool {
     match lookup(h, upstream, idx) {
-        Some(peers) => peers[idx].down_until_ms.load(Ordering::Relaxed) <= now_ms,
+        Some(peers) => {
+            let p = &peers[idx];
+            p.down_until_ms.load(Ordering::Relaxed) <= now_ms
+                && p.active_ok.load(Ordering::Relaxed)
+        }
         None => true,
     }
 }
@@ -103,9 +140,10 @@ pub fn healthy_indices(
     };
     (0..peer_count)
         .filter(|i| {
-            peers
-                .get(*i)
-                .is_none_or(|p| p.down_until_ms.load(Ordering::Relaxed) <= now_ms)
+            peers.get(*i).is_none_or(|p| {
+                p.down_until_ms.load(Ordering::Relaxed) <= now_ms
+                    && p.active_ok.load(Ordering::Relaxed)
+            })
         })
         .collect()
 }
@@ -178,6 +216,113 @@ pub fn record_success(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u6
     counters.window_start_ms = now_ms;
 }
 
+/// Pure decision core of [`record_probe`]: apply one probe outcome to the
+/// consecutive counters and return the new `(healthy, fails, successes)`.
+///
+/// - success: `successes` grows, `fails` resets; a healthy peer stays
+///   healthy, a down one recovers once `successes >= healthy_threshold`;
+/// - failure: `fails` grows, `successes` resets; a down peer stays down,
+///   a healthy one turns unhealthy once `fails >= unhealthy_threshold`.
+pub fn evaluate_active(
+    healthy: bool,
+    fails: u32,
+    successes: u32,
+    ok: bool,
+    unhealthy_threshold: u32,
+    healthy_threshold: u32,
+) -> (bool, u32, u32) {
+    if ok {
+        let successes = successes + 1;
+        // A success never un-healths a healthy peer: the threshold only
+        // gates recovery from a down state. Without the `healthy` term a
+        // freshly-booted peer's first successful probe would silently mark
+        // it down until the threshold accumulates.
+        (healthy || successes >= healthy_threshold, 0, successes)
+    } else {
+        let fails = fails + 1;
+        // Symmetric guard: a failure never heals a down peer; only the
+        // success threshold may lift it. `fails >= threshold` un-healths.
+        (healthy && fails < unhealthy_threshold, fails, 0)
+    }
+}
+
+/// Record one active-probe outcome for peer `idx` at `addr` and mirror the
+/// resulting healthy flag into the per-index passive slot, so existing
+/// [`is_healthy`] / [`healthy_indices`] call sites pick it up without
+/// signature changes.
+///
+/// Returns the peer's active-plane healthy state after the update.
+pub fn record_probe(
+    h: &HealthRegistry,
+    upstream: &str,
+    idx: usize,
+    addr: &str,
+    ok: bool,
+    unhealthy_threshold: u32,
+    healthy_threshold: u32,
+) -> bool {
+    let key = (upstream.to_string(), addr.to_string());
+    let peer = h
+        .active
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(ActivePeer {
+                healthy: AtomicBool::new(true),
+                fails: AtomicU32::new(0),
+                successes: AtomicU32::new(0),
+            })
+        })
+        .clone();
+    let (healthy, fails, successes) = evaluate_active(
+        peer.healthy.load(Ordering::Relaxed),
+        peer.fails.load(Ordering::Relaxed),
+        peer.successes.load(Ordering::Relaxed),
+        ok,
+        unhealthy_threshold,
+        healthy_threshold,
+    );
+    peer.healthy.store(healthy, Ordering::Relaxed);
+    peer.fails.store(fails, Ordering::Relaxed);
+    peer.successes.store(successes, Ordering::Relaxed);
+    // Mirror into the per-index passive slot when the upstream is known.
+    if let Some(peers) = lookup(h, upstream, idx) {
+        peers[idx].active_ok.store(healthy, Ordering::Relaxed);
+    }
+    healthy
+}
+
+/// Active-plane verdict for one (upstream, addr) pair.
+/// Unknown pairs are treated as healthy (fail-open).
+pub fn is_active_healthy(h: &HealthRegistry, upstream: &str, addr: &str) -> bool {
+    h.active
+        .lock()
+        .unwrap()
+        .get(&(upstream.to_string(), addr.to_string()))
+        .is_none_or(|p| p.healthy.load(Ordering::Relaxed))
+}
+
+/// All (upstream, addr, healthy) triples from the active plane, sorted by
+/// (upstream, addr) for deterministic output.
+pub fn active_peers(h: &HealthRegistry) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = h
+        .active
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|((upstream, addr), p)| {
+            (
+                upstream.clone(),
+                addr.clone(),
+                p.healthy.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +332,7 @@ mod tests {
             max_fails,
             fail_window_s: window_s,
             fail_timeout_s: timeout_s,
+            active: None,
         }
     }
 
@@ -291,5 +437,125 @@ mod tests {
         register(&h, "u", 3);
         assert!(is_healthy(&h, "u", 1, 100));
         assert_eq!(healthy_indices(&h, "u", 3, 100), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn active_threshold_transitions() {
+        let h = new();
+        register(&h, "u", 1);
+        let addr = "127.0.0.1:9001";
+        // One failure is below the unhealthy threshold -> still healthy.
+        assert!(record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(is_active_healthy(&h, "u", addr));
+        assert!(is_healthy(&h, "u", 0, 0));
+        // Two consecutive failures trip the peer.
+        assert!(!record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(!is_active_healthy(&h, "u", addr));
+        assert!(!is_healthy(&h, "u", 0, 0));
+        // A single success resets the failure counter but does not recover.
+        assert!(!record_probe(&h, "u", 0, addr, true, 2, 2));
+        assert!(!is_healthy(&h, "u", 0, 0));
+        // Two consecutive successes recover the peer.
+        assert!(record_probe(&h, "u", 0, addr, true, 2, 2));
+        assert!(is_active_healthy(&h, "u", addr));
+        assert!(is_healthy(&h, "u", 0, 0));
+        assert_eq!(healthy_indices(&h, "u", 1, 0), vec![0]);
+    }
+
+    #[test]
+    fn active_success_resets_fail_counter() {
+        let h = new();
+        register(&h, "u", 1);
+        let addr = "127.0.0.1:9001";
+        // fail, success, fail: never two failures in a row, so the peer
+        // stays up throughout. The success resets the failure counter and
+        // never un-healths a healthy peer (boot-race regression guard).
+        assert!(record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(record_probe(&h, "u", 0, addr, true, 2, 2));
+        assert!(record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(is_healthy(&h, "u", 0, 0));
+        // Second consecutive failure trips it.
+        assert!(!record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(!is_healthy(&h, "u", 0, 0));
+    }
+
+    #[test]
+    fn active_unknown_pair_is_fail_open() {
+        let h = new();
+        assert!(is_active_healthy(&h, "ghost", "127.0.0.1:1"));
+        // Probing an unknown upstream updates only the addr plane; the
+        // missing per-index slot is a harmless no-op mirror.
+        assert!(record_probe(&h, "ghost", 0, "127.0.0.1:1", false, 2, 2));
+        assert!(is_healthy(&h, "ghost", 0, 0));
+        assert!(!record_probe(&h, "ghost", 0, "127.0.0.1:1", false, 2, 2));
+        assert!(!is_active_healthy(&h, "ghost", "127.0.0.1:1"));
+    }
+
+    #[test]
+    fn active_and_passive_planes_both_required() {
+        let h = new();
+        register(&h, "u", 1);
+        let addr = "127.0.0.1:9001";
+        // Passive down (max_fails=1 trips immediately) + active ok -> down.
+        let c = cfg(1, 10, 10);
+        record_failure(&h, "u", 0, &c, 1_000); // down until 11_000
+        record_probe(&h, "u", 0, addr, true, 2, 2);
+        record_probe(&h, "u", 0, addr, true, 2, 2); // active plane healthy
+        assert!(is_active_healthy(&h, "u", addr));
+        assert!(!is_healthy(&h, "u", 0, 1_000));
+        assert_eq!(healthy_indices(&h, "u", 1, 1_000), vec![]);
+        // Passive recovers when the timeout elapses; active still ok -> up.
+        assert!(is_healthy(&h, "u", 0, 11_000));
+        // Passive ok + active unhealthy (2 consecutive failures) -> down.
+        record_probe(&h, "u", 0, addr, false, 2, 2);
+        assert!(!record_probe(&h, "u", 0, addr, false, 2, 2));
+        assert!(!is_active_healthy(&h, "u", addr));
+        assert!(!is_healthy(&h, "u", 0, 11_000));
+        assert_eq!(healthy_indices(&h, "u", 1, 11_000), vec![]);
+        // Both ok again: two consecutive successes recover the peer.
+        record_probe(&h, "u", 0, addr, true, 2, 2);
+        assert!(!is_healthy(&h, "u", 0, 11_000));
+        record_probe(&h, "u", 0, addr, true, 2, 2);
+        assert!(is_healthy(&h, "u", 0, 11_000));
+        assert_eq!(healthy_indices(&h, "u", 1, 11_000), vec![0]);
+    }
+
+    #[test]
+    fn active_peers_sorted_and_deterministic() {
+        let h = new();
+        register(&h, "u", 2);
+        record_probe(&h, "u", 0, "127.0.0.1:9001", false, 2, 2);
+        record_probe(&h, "u", 0, "127.0.0.1:9001", false, 2, 2); // down
+        record_probe(&h, "u", 1, "127.0.0.1:9002", true, 2, 2);
+        record_probe(&h, "u", 1, "127.0.0.1:9002", true, 2, 2); // healthy
+        record_probe(&h, "v", 0, "127.0.0.1:9003", true, 2, 2);
+        record_probe(&h, "v", 0, "127.0.0.1:9003", true, 2, 2); // healthy
+        let peers = active_peers(&h);
+        assert_eq!(
+            peers,
+            vec![
+                ("u".to_string(), "127.0.0.1:9001".to_string(), false),
+                ("u".to_string(), "127.0.0.1:9002".to_string(), true),
+                ("v".to_string(), "127.0.0.1:9003".to_string(), true),
+            ]
+        );
+        assert_eq!(active_peers(&h), peers);
+    }
+
+    #[test]
+    fn evaluate_active_pure_semantics() {
+        // Success path: counters grow, healthy only at the threshold.
+        assert_eq!(evaluate_active(false, 0, 0, true, 2, 2), (false, 0, 1));
+        assert_eq!(evaluate_active(false, 0, 1, true, 2, 2), (true, 0, 2));
+        // A healthy (or never-seen-down) peer stays healthy on success;
+        // the first boot probe must not silently mark it down.
+        assert_eq!(evaluate_active(true, 0, 0, true, 2, 2), (true, 0, 1));
+        // A success resets the failure counter.
+        assert_eq!(evaluate_active(false, 5, 0, true, 2, 2), (false, 0, 1));
+        // Failure path: counters grow, unhealthy only at the threshold.
+        assert_eq!(evaluate_active(true, 0, 0, false, 2, 2), (true, 1, 0));
+        assert_eq!(evaluate_active(true, 1, 0, false, 2, 2), (false, 2, 0));
+        // A failure resets the success counter.
+        assert_eq!(evaluate_active(false, 0, 5, false, 2, 2), (false, 1, 0));
     }
 }

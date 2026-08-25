@@ -8,6 +8,7 @@
 
 use crate::state::{apply_runtime, AppState};
 use openrusty_core::load_config;
+use std::sync::Arc;
 
 /// Outcome of a successful reload.
 #[derive(Debug)]
@@ -20,7 +21,7 @@ pub struct ReloadReport {
 ///
 /// Any error is returned as a plain message and nothing changed: the
 /// previous plugin snapshot and runtime stay in effect.
-pub async fn reload(state: &AppState) -> Result<ReloadReport, String> {
+pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, String> {
     let path = state.config_path.clone();
     let cfg = tokio::task::spawn_blocking(move || load_config(&path))
         .await
@@ -36,6 +37,8 @@ pub async fn reload(state: &AppState) -> Result<ReloadReport, String> {
 
     // Plugins are already published; now swap the runtime to match.
     apply_runtime(state, &cfg, generation);
+    // Active probing follows the new runtime (interval, enabled set).
+    crate::active_probe::spawn(state);
 
     let plugins = state
         .registry

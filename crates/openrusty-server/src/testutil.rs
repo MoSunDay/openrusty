@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::metrics;
+
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Minimal ABI-valid plugin: declines every phase.
@@ -93,9 +95,11 @@ pub fn boot_state(dir: &TmpDir) -> Arc<AppState> {
         registry,
         health: Arc::new(proxy::new()),
         pool: Arc::new(proxy::new_pool()),
+        metrics: Arc::new(metrics::Metrics::new()),
         runtime: arc_swap::ArcSwap::from_pointee(state::empty_runtime()),
         config_path: dir.config_path(),
         started_at: std::time::Instant::now(),
+        probe_task: std::sync::Mutex::new(None),
     });
     let gen = state.registry.snapshot().generation;
     state::apply_runtime(&state, &cfg, gen);

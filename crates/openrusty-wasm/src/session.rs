@@ -109,7 +109,9 @@ impl RequestSession {
                 match self.instantiate_one(&plugin) {
                     Ok(rt) => self.rts[i] = Some(rt),
                     Err(e) => {
-                        plugin.state.record_error();
+                        // Instantiation failure is trap-like; the kind label
+                        // mirrors KIND_TRAP in openrusty-server/src/metrics.rs.
+                        plugin.state.record_error("trap");
                         tracing::warn!(plugin = %plugin.name, error = %e, "plugin instantiation failed");
                         let fallback = runner::fallback_decision(plugin.fail_policy);
                         last = fallback;

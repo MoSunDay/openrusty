@@ -159,7 +159,27 @@ impl PluginRegistry {
             .map(|p| (p.name.clone(), p.state.error_count()))
             .collect()
     }
+
+    /// Prometheus view of the current snapshot. Parallel to [`status`] but
+    /// with the kind breakdown and KV size the metrics endpoint needs.
+    pub fn metric_view(&self) -> Vec<PluginMetrics> {
+        self.snapshot()
+            .plugins
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.state.error_kinds(),
+                    p.state.kv_len(),
+                )
+            })
+            .collect()
+    }
 }
+
+/// One plugin's metrics row: `(name, per-kind error counts, live KV entry
+/// count)`, as rendered by the `/openrusty/metrics` endpoint.
+pub type PluginMetrics = (String, Vec<(String, u64)>, usize);
 
 /// Final plugin order: names listed in `order` first (in that order, if
 /// the file exists), then the remaining files alphabetically. Pure.

@@ -2,6 +2,7 @@
 //! header filtering, and hand-off to the streaming body filter.
 
 use crate::body_filter::FilteredBody;
+use crate::metrics::{RESULT_CONNECT_FAIL, RESULT_NO_PEER, RESULT_SUCCESS, RESULT_TIMEOUT};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::response::Response;
@@ -31,7 +32,8 @@ pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
 /// Longest-prefix route match (same semantics as
 /// `openrusty_core::context::match_route`, specialized for `RouteConfig`
 /// to avoid the higher-ranked lifetime bound on its closure argument).
-fn match_route(routes: &[openrusty_core::config::RouteConfig], path: &str) -> Option<usize> {
+/// `pub(crate)` so the metrics endpoint can resolve the route label.
+pub(crate) fn match_route(routes: &[openrusty_core::config::RouteConfig], path: &str) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (i, r) in routes.iter().enumerate() {
         let p = r.path_prefix.as_str();
@@ -60,6 +62,14 @@ pub fn empty_response(status: u16) -> Response {
         .status(status)
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Whether a route timeout on the current attempt may fall through to the
+/// next peer. Only allowed when the upstream opted in via
+/// `retry_on_timeout`, and never on the last attempt (`attempt` is
+/// zero-based, `attempts` is the `retries + 1` ceiling).
+fn may_retry_timeout(retry_on_timeout: bool, attempt: u32, attempts: u32) -> bool {
+    retry_on_timeout && attempt + 1 < attempts
 }
 
 /// Full request lifecycle for one proxied request.
@@ -201,6 +211,9 @@ pub async fn handle_request(
                 return text_response(s, format!("{s}\n"));
             }
             Pick::None => {
+                state
+                    .metrics
+                    .record_attempt(&up_rt.up.name, RESULT_NO_PEER);
                 finish_log(&mut session, 502);
                 return text_response(502, "502 no healthy upstream\n");
             }
@@ -224,6 +237,7 @@ pub async fn handle_request(
         match outcome {
             Some(Ok(r)) => {
                 proxy::record_success(&state.health, &up_rt.up.name, idx, now_ms());
+                state.metrics.record_attempt(&up_rt.up.name, RESULT_SUCCESS);
                 resp = Some(r);
                 break;
             }
@@ -235,6 +249,7 @@ pub async fn handle_request(
                     &up_rt.up.health,
                     now_ms(),
                 );
+                state.metrics.record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
                 if e.is_retryable() {
                     tracing::warn!(
                         upstream = %up_rt.up.name, peer = %peer.addr,
@@ -253,6 +268,14 @@ pub async fn handle_request(
                     &up_rt.up.health,
                     now_ms(),
                 );
+                state.metrics.record_attempt(&up_rt.up.name, RESULT_TIMEOUT);
+                if may_retry_timeout(up_rt.up.retry_on_timeout, attempt, attempts) {
+                    tracing::warn!(
+                        upstream = %up_rt.up.name, peer = %peer.addr,
+                        attempt, "route timeout, retrying next peer"
+                    );
+                    continue;
+                }
                 finish_log(&mut session, 502);
                 return text_response(502, "502 upstream timeout\n");
             }
@@ -328,5 +351,13 @@ mod tests {
             .unwrap();
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn retry_timeout_guard_semantics() {
+        assert!(may_retry_timeout(true, 0, 2), "first attempt may retry");
+        assert!(!may_retry_timeout(true, 1, 2), "last attempt never retries");
+        assert!(!may_retry_timeout(false, 0, 2), "opt-out retries nothing");
+        assert!(!may_retry_timeout(true, 0, 1), "no retries configured");
     }
 }

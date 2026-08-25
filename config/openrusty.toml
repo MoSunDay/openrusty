@@ -3,7 +3,7 @@
 
 [server]
 # Address the gateway listens on. HTTP/1.1 and h2c are served on the same port.
-listen = "127.0.0.1:8180"
+listen = "0.0.0.0:8180"
 # Logging verbosity: trace | debug | info | warn | error
 log_level = "info"
 
@@ -64,9 +64,9 @@ connect_timeout_ms = 2000
 path_prefix = "/v1"
 upstream = "vllm"
 # Whole-request timeout (milliseconds); 0 disables.
-timeout_ms = 120000
+timeout_ms = 3600000
 
 [[routes]]
 path_prefix = "/"
 upstream = "vllm"
-timeout_ms = 120000
+timeout_ms = 3600000
