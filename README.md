@@ -18,7 +18,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
   reload; in-flight requests finish on the old snapshot; per-plugin KV state
   and upstream health survive reloads.
 - **Gateway basics** — upstreams with smooth weighted round-robin or
-  `ip_hash`, passive health checks, failure retries on another peer,
+  `ip_hash`, passive + active health checks, failure retries on another peer,
   WebSocket pass-through, SSE streaming, request timeouts.
 - **`vllm-kv-scheduler` plugin** — vLLM-style KV-cache affinity: a task key
   extracted from the URL or the request body sticks to one peer; new tasks go to the peer with
@@ -31,7 +31,7 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
 |---|---|
 | `crates/openrusty-core` | config types, request context, phase/decision semantics |
 | `crates/openrusty-wasm` | wasmtime runtime: ABI imports, sandboxed runner, hot-reload registry |
-| `crates/openrusty-proxy` | upstreams, balancers, passive health, pooled clients, forwarding |
+| `crates/openrusty-proxy` | upstreams, balancers, passive + active health, pooled clients, forwarding |
 | `crates/openrusty-server` | the `openrusty` binary: h2c accept loop, phase pipeline, reload endpoint |
 | `crates/openrusty-sdk` | `no_std` guest SDK (imports, allocator, `dispatch!`) |
 | `crates/openrusty-macros` | `#[phase(...)]` proc macro |
@@ -78,11 +78,11 @@ the units so freshly built binaries are picked up. Logs live in journald
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
 bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
-bash scripts/integration.sh   # end-to-end drill: 67 checks, sections 1-24
+bash scripts/integration.sh   # end-to-end drill: 93 checks, sections 1-29
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports
-(18080/191xx) and walks through `scripts/integration.sh` sections 1-24:
+(18080/191xx) and walks through `scripts/integration.sh` sections 1-29:
 basic proxy, SSE, h2c, WebSocket, sticky scheduling with TTL release, hot
 reload (SIGHUP / POST, in-flight requests, KV survival, atomic rejection of
 broken plugins, reload under load with zero 5xx), passive health checks,
@@ -97,5 +97,9 @@ route count), exercise `vllm-kv-scheduler` path-segment key extraction with a
 `max_tasks_per_node` cap (capped tasks spread across peers; an over-cap task
 falls back to the default balancer), boot a second gateway instance from
 the `OPENRUSTY_CONFIG` environment variable, and verify request-body
-`cache_salt` key extraction (sticky salts, spread over peers, and
+`cache_salt` key extraction. Sections 26-29 cover the active health plane
+(probe-only peer down detection and recovery), `retry_on_timeout` semantics
+against a deterministic hanging peer, the `kv-probe` balancer phase with
+`set_peer`/peer-view and resp-header/req_meta probes, and the
+`/openrusty/metrics` Prometheus exposition shape.
 fallback to the default balancer when the field is missing).
