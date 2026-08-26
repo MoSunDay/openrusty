@@ -17,7 +17,8 @@ Commit: 08a95ba
 - 路由可设 `retry_on_timeout`（默认 `false`）：为 `true` 时，路由超时会在当前 peer 上记录一次失败并换下一个 peer 重试，仍受 upstream `retries` 上限约束。注意重放语义：对推理类 POST 请求，超时重试可能在另一个 peer 上重新执行该请求（双重计算开销），因此默认关闭。
 - 建连受 `connect_timeout_ms` 约束。
 - 可选主动健康检查：在 `[upstreams.health.active]` 配置（`interval_ms` 默认 1000、`timeout_ms` 默认 1000、`path` 默认 `/`、`unhealthy_threshold` 默认 2、`healthy_threshold` 默认 2），存在该表即启用。探测为对每个 peer 的 `path` 发起短 HTTP GET，非 2xx 计为失败；连续失败 `unhealthy_threshold` 次标记为不健康，连续成功 `healthy_threshold` 次恢复。最终 peer 健康 = 被动失败状态 ∧ 主动探测结果；`/openrusty/status` 按 upstream 报告主动探测状态。
-- h2c 与 HTTP/1.1 复用同一监听端口，无需分别配置。
+- h2c 与 HTTP/1.1 复用同一监听端口，无需分别配置；`[server] http1_only = true` 可跳过 h2c 探测仅服务 HTTP/1.1（默认 false）。
+- 建连受 `connect_timeout_ms` 约束；池内空闲 keep-alive 连接超过 `pool_idle_timeout_ms`（默认 60000）被回收。
 
 ## 关键状态与异常
 - 状态：路由匹配结果、所选 peer、重试计数。
