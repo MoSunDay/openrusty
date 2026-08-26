@@ -51,6 +51,7 @@ fn cfg(dir: &str) -> Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             log_level: "info".into(),
+            http1_only: false,
         },
         plugins: PluginsConfig {
             dir: dir.into(),

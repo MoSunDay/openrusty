@@ -143,7 +143,7 @@ async fn main() {
     }
 
     let router = app::router(state);
-    if let Err(e) = h2c::serve(cfg.server.listen, router, rx).await {
+    if let Err(e) = h2c::serve(cfg.server.listen, cfg.server.http1_only, router, rx).await {
         tracing::error!(error = %e, "listener failed");
         std::process::exit(1);
     }
