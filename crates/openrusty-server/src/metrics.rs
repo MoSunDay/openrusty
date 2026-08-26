@@ -86,6 +86,11 @@ impl Metrics {
     }
 
     /// Count one HTTP request by route and status code.
+    ///
+    /// Split counterpart of [`Metrics::record_request_timed`], which folds
+    /// both counters into one critical section; kept and exercised by unit
+    /// tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_request(&self, route: &str, code: u16) {
         let mut s = self.state.lock().unwrap();
         *s.requests.entry((route.to_string(), code)).or_insert(0) += 1;
@@ -93,8 +98,26 @@ impl Metrics {
 
     /// Record one request duration into the fixed buckets plus `_count`
     /// and `_sum`. Values beyond the last bucket only feed count/sum.
+    ///
+    /// Split counterpart of [`Metrics::record_request_timed`]; kept and
+    /// exercised by unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_duration(&self, seconds: f64) {
         let mut s = self.state.lock().unwrap();
+        s.count += 1;
+        s.sum += seconds;
+        if let Some(i) = bucket_index(seconds) {
+            for b in s.buckets.iter_mut().skip(i) {
+                *b += 1;
+            }
+        }
+    }
+
+    /// Count one HTTP request and fold its duration into the histogram under
+    /// a single critical section (request counter + `_count`/`_sum`/buckets).
+    pub fn record_request_timed(&self, route: &str, code: u16, seconds: f64) {
+        let mut s = self.state.lock().unwrap();
+        *s.requests.entry((route.to_string(), code)).or_insert(0) += 1;
         s.count += 1;
         s.sum += seconds;
         if let Some(i) = bucket_index(seconds) {
@@ -252,5 +275,43 @@ mod tests {
         assert_eq!(s.count, 1);
         assert_eq!(s.attempts.len(), 0);
         assert_eq!(s.sum, 0.5);
+    }
+
+    /// Deep equality of two snapshots: every family, buckets and scalars.
+    fn assert_snapshots_equal(a: &MetricsSnapshot, b: &MetricsSnapshot) {
+        assert_eq!(a.requests.len(), b.requests.len());
+        for (k, v) in &a.requests {
+            assert_eq!(b.requests.get(k), Some(v), "mismatch for {k:?}");
+        }
+        for (k, v) in &b.requests {
+            assert_eq!(a.requests.get(k), Some(v), "mismatch for {k:?}");
+        }
+        assert_eq!(a.buckets, b.buckets);
+        assert_eq!(a.count, b.count);
+        // Same additions in the same order must be bit-identical.
+        assert_eq!(a.sum.to_bits(), b.sum.to_bits());
+    }
+
+    #[test]
+    fn record_request_timed_matches_split_calls_exactly() {
+        let split = Metrics::new();
+        let timed = Metrics::new();
+        let samples = [(("/a", 200u16), 0.001f64), (("/b", 502), 0.3)];
+        for ((route, code), seconds) in samples {
+            split.record_request(route, code);
+            split.record_duration(seconds);
+            timed.record_request_timed(route, code, seconds);
+        }
+        // Out-of-range value only feeds _count/_sum; repeat calls accumulate.
+        split.record_request("/a", 200);
+        split.record_duration(999.0);
+        timed.record_request_timed("/a", 200, 999.0);
+
+        let a = split.snapshot();
+        let b = timed.snapshot();
+        assert_snapshots_equal(&a, &b);
+        assert_eq!(b.count, 3);
+        assert_eq!(b.buckets[0], 1); // 0.001 landed in the smallest bucket.
+        assert_eq!(*b.buckets.last().unwrap(), 2); // 0.3 and 999.0 are <= 120.
     }
 }
