@@ -34,6 +34,9 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Serve HTTP/1.1 only; `false` (default) auto-detects h2c on the same port.
+    #[serde(default)]
+    pub http1_only: bool,
 }
 
 fn default_log_level() -> String {

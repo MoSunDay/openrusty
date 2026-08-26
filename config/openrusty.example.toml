@@ -2,12 +2,16 @@
 # Copy to openrusty.toml (or pass any path via OPENRUSTY_CONFIG) and adjust.
 
 [server]
-# Address the gateway listens on. HTTP/1.1 and h2c are served on the same port.
+# Address the gateway listens on. HTTP/1.1 and h2c are served on the same port
+# unless http1_only (see below) is set.
 listen = "127.0.0.1:8180"
 # Logging verbosity: trace | debug | info | warn | error.
 # The default is warn (quiet); deployments that need the per-request access
 # log must set log_level = "info" explicitly.
 log_level = "warn"
+# Set to true to serve plain HTTP/1.1 only and skip the h2c preface sniffing
+# (each connection then runs the cheaper http/1 code path).
+# http1_only = false
 
 [plugins]
 # Directory scanned for *.wasm plugin modules (loaded in `order`, else sorted by file name).
