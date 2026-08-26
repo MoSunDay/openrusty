@@ -237,7 +237,12 @@ pub async fn handle_request(
         session.ctx().peer_index = Some(idx as u32);
 
         let peer = up_rt.up.peers[idx];
-        let client = proxy::get(&state.pool, peer.addr, up_rt.up.connect_timeout);
+        let client = proxy::get(
+            &state.pool,
+            peer.addr,
+            up_rt.up.connect_timeout,
+            up_rt.up.pool_idle_timeout,
+        );
         let fwd = proxy::ForwardRequest {
             method: method.clone(),
             path_and_query: path_and_query.clone(),

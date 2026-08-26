@@ -108,7 +108,12 @@ async fn probe_peer(
     peer: &proxy::Peer,
     active: &ActiveHealthConfig,
 ) -> bool {
-    let client = proxy::get(&state.pool, peer.addr, up.connect_timeout);
+    let client = proxy::get(
+        &state.pool,
+        peer.addr,
+        up.connect_timeout,
+        up.pool_idle_timeout,
+    );
     let req = proxy::ForwardRequest {
         method: hyper::Method::GET,
         path_and_query: active.path.clone(),

@@ -92,7 +92,12 @@ pub async fn proxy_websocket(
             return text_response(502, "502 bad request\n");
         }
     };
-    let client = proxy::get(&state.pool, peer.addr, up_rt.up.connect_timeout);
+    let client = proxy::get(
+        &state.pool,
+        peer.addr,
+        up_rt.up.connect_timeout,
+        up_rt.up.pool_idle_timeout,
+    );
     let mut out_resp = match client.request(outbound).await {
         Ok(r) => r,
         Err(e) => {
