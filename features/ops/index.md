@@ -14,7 +14,7 @@ Commit: 2bf8269
 - `/openrusty/metrics` 返回 Prometheus 文本暴露：`openrusty_requests_total`（route/code）、`openrusty_request_duration_seconds` 直方图、`openrusty_upstream_attempts_total`（upstream/result）、`openrusty_plugin_errors_total`、`openrusty_peer_healthy` gauge、`openrusty_kv_entries` gauge。
 - 重载触发见 [热重载](../hot-reload/index.md)。
 - systemd 单元：
-  - `openrusty.service` —— 网关，`WorkingDirectory=/root/openrusty`（配置引用相对插件目录 `build/plugins`），`ExecStart` 读 `config/openrusty.toml`，`Wants`/`After` 三个 echo 实例；
+  - `openrusty.service` —— 网关，`WorkingDirectory=/root/openrusty`（配置引用相对插件目录 `build/plugins`），`ExecStart` 读 `config/openrusty.toml`，`Wants`/`After` 三个 echo 实例，`LimitNOFILE=65535`；
   - `openrusty-echo@.service` —— 模板单元，`%i` 为端口/节点号，实例 `9001`/`9002`/`9003` 作为演示上游。
   - 脚本幂等：重复执行会重写单元文件并 restart 全部单元，从而加载新构建的二进制；所有单元 enabled + active，开机自启。
 - 生产上游拓扑：`config/openrusty.toml` 的 upstream `vllm` 指向 node03 llama-server 集群（`192.168.31.224:9001-9003`，一卡一实例 ×3，Qwen3.8-27B-UD-Q4_K_M，`-c 150000 --no-kv-offload`（KV cache 放系统内存，约 5.3GB/实例）、q8_0 KV、MTP 投机解码（`--spec-type draft-mtp`，约 727MiB 显存/卡）），由 node03 上的模板单元 `llama-server@<gpu>:<port>.service` 管理；路由超时 120000ms（V100 生成较慢）。本地 echo 实例仅保留演示用途，生产配置不再引用。
@@ -23,7 +23,7 @@ Commit: 2bf8269
 
 ## 关键状态与异常
 - 状态：各单元 enabled/active；`/openrusty/status` 的 `generation` 与插件错误计数。
-- 上游健康：`curl http://192.168.31.224:900x/health` 应返回 `{"status":"ok"}`；`journalctl -u openrusty` 访问日志的 `peer=` 字段可核对请求真实落点。
+- 上游健康：`curl http://192.168.31.224:900x/health` 应返回 `{"status":"ok"}`；`journalctl -u openrusty` 访问日志的 `peer=` 字段可核对请求真实落点（访问日志需 `log_level = "info"`，2026-08-26 起默认 `warn`）。
 - 异常：缺少 release 二进制或 `config/openrusty.toml` 时安装脚本直接报错退出；非 root 执行被拒绝。
 
 ## 关联逻辑模块
