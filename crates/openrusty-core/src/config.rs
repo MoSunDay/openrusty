@@ -37,7 +37,7 @@ pub struct ServerConfig {
 }
 
 fn default_log_level() -> String {
-    "info".to_string()
+    "warn".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

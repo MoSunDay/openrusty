@@ -4,8 +4,10 @@
 [server]
 # Address the gateway listens on. HTTP/1.1 and h2c are served on the same port.
 listen = "127.0.0.1:8180"
-# Logging verbosity: trace | debug | info | warn | error
-log_level = "info"
+# Logging verbosity: trace | debug | info | warn | error.
+# The default is warn (quiet); deployments that need the per-request access
+# log must set log_level = "info" explicitly.
+log_level = "warn"
 
 [plugins]
 # Directory scanned for *.wasm plugin modules (loaded in `order`, else sorted by file name).
