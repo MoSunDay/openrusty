@@ -51,9 +51,15 @@ async fn main() {
         }
     };
 
-    let filter =
-        EnvFilter::try_new(&cfg.server.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let filter = EnvFilter::try_new(&cfg.server.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Non-blocking writer: log calls hand formatted output to a dedicated
+    // thread; the guard must outlive every log call, so main holds it and the
+    // buffer is flushed when it drops at shutdown.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(log_writer)
+        .init();
     tracing::info!(config = %config_path.display(), "starting openrusty");
 
     // Compile all plugins before serving; a broken module is fatal at boot.

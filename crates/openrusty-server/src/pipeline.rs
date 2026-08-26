@@ -24,9 +24,8 @@ pub(crate) use crate::pipeline_peer::{pick_peer, Pick};
 /// Run the log phase exactly once for a short-circuited request.
 pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
     session.run_phase(Phase::Log);
-    let path = session.ctx().path.clone();
     let attempts = session.ctx().attempts;
-    tracing::info!(status, path = %path, attempts, "request finished");
+    tracing::info!(status, path = %session.ctx().path, attempts, "request finished");
 }
 
 /// Longest-prefix route match (same semantics as
