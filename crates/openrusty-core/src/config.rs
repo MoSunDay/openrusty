@@ -176,6 +176,9 @@ pub struct UpstreamConfig {
     pub retry_on_timeout: bool,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// Idle keep-alive connections are closed after this long (milliseconds).
+    #[serde(default = "default_pool_idle_timeout_ms")]
+    pub pool_idle_timeout_ms: u64,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
     #[serde(default)]
@@ -184,6 +187,10 @@ pub struct UpstreamConfig {
 
 fn default_connect_timeout_ms() -> u64 {
     2000
+}
+
+fn default_pool_idle_timeout_ms() -> u64 {
+    60_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

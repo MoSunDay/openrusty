@@ -267,7 +267,12 @@ mod tests {
     async fn forwards_request_with_header_policy() {
         let addr = spawn_echo_server().await;
         let pool = crate::client::new_pool();
-        let client = crate::client::get(&pool, addr, std::time::Duration::from_secs(2));
+        let client = crate::client::get(
+            &pool,
+            addr,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
+        );
         let peer = Peer { addr, weight: 1 };
 
         let resp = forward(&client, &peer, &sample_request()).await.unwrap();
@@ -288,7 +293,12 @@ mod tests {
         // Port 1 on loopback: nothing listens, connect is refused fast.
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let pool = crate::client::new_pool();
-        let client = crate::client::get(&pool, addr, std::time::Duration::from_millis(500));
+        let client = crate::client::get(
+            &pool,
+            addr,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(30),
+        );
         let peer = Peer { addr, weight: 1 };
 
         let err = forward(&client, &peer, &sample_request())

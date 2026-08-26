@@ -65,6 +65,17 @@ pub fn apply_runtime(state: &AppState, cfg: &Config, generation: u64) {
     for uc in &cfg.upstreams {
         let up = proxy::from_config(uc);
         proxy::register(&state.health, &up.name, up.peers.len());
+        for p in &up.peers {
+            // Pre-create the pooled client so the request path never pays
+            // client construction (and connects through a warm keep-alive
+            // pool). Must run before `up` moves into `UpstreamRt`.
+            proxy::get(
+                &state.pool,
+                p.addr,
+                up.connect_timeout,
+                up.pool_idle_timeout,
+            );
+        }
         let swrr = Mutex::new(vec![0i64; up.peers.len()]);
         upstreams.insert(up.name.clone(), Arc::new(UpstreamRt { up, swrr }));
     }

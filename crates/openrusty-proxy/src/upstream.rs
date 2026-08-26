@@ -38,6 +38,9 @@ pub struct Upstream {
     pub retry_on_timeout: bool,
     /// Per-attempt TCP connect timeout.
     pub connect_timeout: Duration,
+    /// Idle keep-alive connections in the pooled clients are closed after
+    /// this long.
+    pub pool_idle_timeout: Duration,
     /// The balancing targets, in configuration order.
     pub peers: Vec<Peer>,
     /// Passive health-check thresholds.
@@ -52,6 +55,7 @@ pub fn from_config(cfg: &UpstreamConfig) -> Upstream {
         retries: cfg.retries,
         retry_on_timeout: cfg.retry_on_timeout,
         connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
+        pool_idle_timeout: Duration::from_millis(cfg.pool_idle_timeout_ms),
         peers: cfg
             .peers
             .iter()
@@ -137,6 +141,7 @@ mod tests {
             retries: 2,
             retry_on_timeout: true,
             connect_timeout_ms: 1500,
+            pool_idle_timeout_ms: 30_000,
             peers: vec![
                 openrusty_core::config::PeerConfig {
                     addr: "127.0.0.1:9001".parse().unwrap(),
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(up.retries, 2);
         assert!(up.retry_on_timeout);
         assert_eq!(up.connect_timeout, Duration::from_millis(1500));
+        assert_eq!(up.pool_idle_timeout, Duration::from_millis(30_000));
         assert_eq!(up.peers.len(), 2);
         assert_eq!(up.peers[0].weight, 5);
         assert_eq!(up.peers[1].addr.to_string(), "127.0.0.1:9002");
