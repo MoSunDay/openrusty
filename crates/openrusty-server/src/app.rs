@@ -30,7 +30,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Proxy fallback; ConnectInfo is inserted per request by `h2c::serve`.
 /// Every request that reaches this handler is counted in the Prometheus
-/// request counter and duration histogram (management routes such as
+/// request counter and duration histogram under one critical section;
+/// `handle_request` performs the single route match and returns its index
+/// from the request's own pinned snapshot (management routes such as
 /// `/openrusty/metrics` are matched first and bypass the fallback).
 async fn fallback(
     State(state): State<Arc<AppState>>,
@@ -38,18 +40,20 @@ async fn fallback(
     req: axum::extract::Request,
 ) -> Response {
     let start = std::time::Instant::now();
-    let path = req.uri().path().to_string();
-    let resp = handle_request(state.clone(), remote, req).await;
-    let status = resp.status().as_u16();
+    let (resp, route_idx) = handle_request(state.clone(), remote, req).await;
     let duration = start.elapsed().as_secs_f64();
 
+    // The route index comes from the request's own pinned snapshot; a
+    // concurrent reload can only ever swap in a same-shaped route list, so
+    // `.get` merely guards a (theoretically stale) index.
     let rt = state.runtime.load();
-    let route = crate::pipeline::match_route(&rt.routes, &path)
+    let route = route_idx
         .and_then(|i| rt.routes.get(i))
-        .map(|r| r.path_prefix.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    state.metrics.record_request(&route, status);
-    state.metrics.record_duration(duration);
+        .map(|r| r.path_prefix.as_str())
+        .unwrap_or("unknown");
+    state
+        .metrics
+        .record_request_timed(route, resp.status().as_u16(), duration);
     resp
 }
 

@@ -72,11 +72,17 @@ fn may_retry_timeout(retry_on_timeout: bool, attempt: u32, attempts: u32) -> boo
 }
 
 /// Full request lifecycle for one proxied request.
+///
+/// Returns the response plus the matched route index: the index comes from
+/// the request's own pinned runtime snapshot, so callers can label metrics
+/// without re-matching the route. The index is `None` only when no route
+/// matched (the 404 path); every routed response, including the
+/// unknown-upstream 502, carries `Some(index)`.
 pub async fn handle_request(
     state: Arc<AppState>,
     remote: SocketAddr,
     req: axum::extract::Request,
-) -> Response {
+) -> (Response, Option<usize>) {
     // 1. Pin the plugin snapshot and the runtime for the whole request.
     let snap = state.registry.snapshot();
     let rt = state.runtime.load_full();
@@ -108,11 +114,14 @@ pub async fn handle_request(
 
     // 3. Route match (longest prefix wins; first wins on ties).
     let Some(route_idx) = match_route(&rt.routes, &path) else {
-        return text_response(404, "404 not found\n");
+        return (text_response(404, "404 not found\n"), None);
     };
     let route = rt.routes[route_idx].clone();
     let Some(up_rt) = rt.upstreams.get(&route.upstream).cloned() else {
-        return text_response(502, "502 unknown upstream\n");
+        return (
+            text_response(502, "502 unknown upstream\n"),
+            Some(route_idx),
+        );
     };
 
     let ctx = ReqCtx {
@@ -150,11 +159,11 @@ pub async fn handle_request(
         match session.run_phase(phase) {
             Decision::Deny(s) => {
                 finish_log(&mut session, s);
-                return text_response(s, format!("{s}\n"));
+                return (text_response(s, format!("{s}\n")), Some(route_idx));
             }
             Decision::Done => {
                 finish_log(&mut session, 204);
-                return empty_response(204);
+                return (empty_response(204), Some(route_idx));
             }
             _ => {}
         }
@@ -162,7 +171,11 @@ pub async fn handle_request(
 
     // 7. WebSocket branch, before the body is touched.
     if proxy::is_websocket_upgrade(&method_str, &headers) {
-        return crate::ws::proxy_websocket(state, session, up_rt, req).await;
+        // WebSocket upgrades are routed responses too.
+        return (
+            crate::ws::proxy_websocket(state, session, up_rt, req).await,
+            Some(route_idx),
+        );
     }
 
     // 8. Buffer the request body.
@@ -170,7 +183,10 @@ pub async fn handle_request(
         Ok(b) => b,
         Err(_) => {
             finish_log(&mut session, 413);
-            return text_response(413, "413 payload too large\n");
+            return (
+                text_response(413, "413 payload too large\n"),
+                Some(route_idx),
+            );
         }
     };
     // Expose the buffered body to plugins from the content phase onward
@@ -181,11 +197,11 @@ pub async fn handle_request(
     match session.run_phase(Phase::Content) {
         Decision::Deny(s) => {
             finish_log(&mut session, s);
-            return text_response(s, format!("{s}\n"));
+            return (text_response(s, format!("{s}\n")), Some(route_idx));
         }
         Decision::Done => {
             finish_log(&mut session, 204);
-            return empty_response(204);
+            return (empty_response(204), Some(route_idx));
         }
         _ => {}
     }
@@ -207,14 +223,15 @@ pub async fn handle_request(
             Pick::Peer(i) => i,
             Pick::Deny(s) => {
                 finish_log(&mut session, s);
-                return text_response(s, format!("{s}\n"));
+                return (text_response(s, format!("{s}\n")), Some(route_idx));
             }
             Pick::None => {
-                state
-                    .metrics
-                    .record_attempt(&up_rt.up.name, RESULT_NO_PEER);
+                state.metrics.record_attempt(&up_rt.up.name, RESULT_NO_PEER);
                 finish_log(&mut session, 502);
-                return text_response(502, "502 no healthy upstream\n");
+                return (
+                    text_response(502, "502 no healthy upstream\n"),
+                    Some(route_idx),
+                );
             }
         };
         session.ctx().peer_index = Some(idx as u32);
@@ -241,14 +258,10 @@ pub async fn handle_request(
                 break;
             }
             Some(Err(e)) => {
-                proxy::record_failure(
-                    &state.health,
-                    &up_rt.up.name,
-                    idx,
-                    &up_rt.up.health,
-                    now,
-                );
-                state.metrics.record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
+                proxy::record_failure(&state.health, &up_rt.up.name, idx, &up_rt.up.health, now);
+                state
+                    .metrics
+                    .record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
                 if e.is_retryable() {
                     tracing::warn!(
                         upstream = %up_rt.up.name, peer = %peer.addr,
@@ -257,16 +270,13 @@ pub async fn handle_request(
                     continue;
                 }
                 finish_log(&mut session, 502);
-                return text_response(502, format!("502 upstream error: {e}\n"));
+                return (
+                    text_response(502, format!("502 upstream error: {e}\n")),
+                    Some(route_idx),
+                );
             }
             None => {
-                proxy::record_failure(
-                    &state.health,
-                    &up_rt.up.name,
-                    idx,
-                    &up_rt.up.health,
-                    now,
-                );
+                proxy::record_failure(&state.health, &up_rt.up.name, idx, &up_rt.up.health, now);
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_TIMEOUT);
                 if may_retry_timeout(up_rt.up.retry_on_timeout, attempt, attempts) {
                     tracing::warn!(
@@ -276,13 +286,19 @@ pub async fn handle_request(
                     continue;
                 }
                 finish_log(&mut session, 502);
-                return text_response(502, "502 upstream timeout\n");
+                return (
+                    text_response(502, "502 upstream timeout\n"),
+                    Some(route_idx),
+                );
             }
         }
     }
     let Some(resp) = resp else {
         finish_log(&mut session, 502);
-        return text_response(502, "502 no upstream responded\n");
+        return (
+            text_response(502, "502 no upstream responded\n"),
+            Some(route_idx),
+        );
     };
 
     // 11. Header filter phase.
@@ -300,7 +316,7 @@ pub async fn handle_request(
     session.set_resp_headers(seeded);
     if let Decision::Deny(s) = session.run_phase(Phase::HeaderFilter) {
         finish_log(&mut session, s);
-        return text_response(s, format!("{s}\n"));
+        return (text_response(s, format!("{s}\n")), Some(route_idx));
     }
     let final_headers = session.resp_headers().to_vec();
 
@@ -325,7 +341,8 @@ pub async fn handle_request(
     }
     builder
         .body(Body::new(filtered))
-        .unwrap_or_else(|_| text_response(500, "500 bad response\n"))
+        .map(|r| (r, Some(route_idx)))
+        .unwrap_or_else(|_| (text_response(500, "500 bad response\n"), Some(route_idx)))
 }
 
 #[cfg(test)]
