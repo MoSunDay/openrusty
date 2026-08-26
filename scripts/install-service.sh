@@ -75,6 +75,7 @@ Type=simple
 WorkingDirectory=$REPO_DIR
 ExecStart=$GATEWAY_BIN $CONFIG
 Restart=on-failure
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
