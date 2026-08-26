@@ -235,7 +235,7 @@ pub async fn handle_request(
         };
         match outcome {
             Some(Ok(r)) => {
-                proxy::record_success(&state.health, &up_rt.up.name, idx, now_ms());
+                proxy::record_success(&state.health, &up_rt.up.name, idx, now);
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_SUCCESS);
                 resp = Some(r);
                 break;
@@ -246,7 +246,7 @@ pub async fn handle_request(
                     &up_rt.up.name,
                     idx,
                     &up_rt.up.health,
-                    now_ms(),
+                    now,
                 );
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
                 if e.is_retryable() {
@@ -265,7 +265,7 @@ pub async fn handle_request(
                     &up_rt.up.name,
                     idx,
                     &up_rt.up.health,
-                    now_ms(),
+                    now,
                 );
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_TIMEOUT);
                 if may_retry_timeout(up_rt.up.retry_on_timeout, attempt, attempts) {
