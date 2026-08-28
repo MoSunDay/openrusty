@@ -32,7 +32,10 @@ pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
 /// `openrusty_core::context::match_route`, specialized for `RouteConfig`
 /// to avoid the higher-ranked lifetime bound on its closure argument).
 /// `pub(crate)` so the metrics endpoint can resolve the route label.
-pub(crate) fn match_route(routes: &[openrusty_core::config::RouteConfig], path: &str) -> Option<usize> {
+pub(crate) fn match_route(
+    routes: &[openrusty_core::config::RouteConfig],
+    path: &str,
+) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (i, r) in routes.iter().enumerate() {
         let p = r.path_prefix.as_str();
@@ -71,18 +74,24 @@ fn may_retry_timeout(retry_on_timeout: bool, attempt: u32, attempts: u32) -> boo
     retry_on_timeout && attempt + 1 < attempts
 }
 
+/// Route-level timeout for one attempt, `None` when unbounded.
+fn route_timeout(timeout_ms: u64) -> Option<Duration> {
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+}
+
 /// Full request lifecycle for one proxied request.
 ///
-/// Returns the response plus the matched route index: the index comes from
-/// the request's own pinned runtime snapshot, so callers can label metrics
-/// without re-matching the route. The index is `None` only when no route
-/// matched (the 404 path); every routed response, including the
-/// unknown-upstream 502, carries `Some(index)`.
+/// Returns the response plus the route label for the request metrics: the
+/// label is the path prefix from the request's own pinned runtime snapshot,
+/// so a reload that swaps the route table mid-request cannot misattribute
+/// the record. The label is `None` only when no route matched (the 404
+/// path); every routed response, including the unknown-upstream 502, carries
+/// `Some(label)`.
 pub async fn handle_request(
     state: Arc<AppState>,
     remote: SocketAddr,
     req: axum::extract::Request,
-) -> (Response, Option<usize>) {
+) -> (Response, Option<String>) {
     // 1. Pin the plugin snapshot and the runtime for the whole request.
     let snap = state.registry.snapshot();
     let rt = state.runtime.load_full();
@@ -117,10 +126,13 @@ pub async fn handle_request(
         return (text_response(404, "404 not found\n"), None);
     };
     let route = rt.routes[route_idx].clone();
+    // Metrics label pinned at routing time (item: label must come from the
+    // snapshot the request is served with, not from a later registry read).
+    let route_label = route.path_prefix.clone();
     let Some(up_rt) = rt.upstreams.get(&route.upstream).cloned() else {
         return (
             text_response(502, "502 unknown upstream\n"),
-            Some(route_idx),
+            Some(route_label),
         );
     };
 
@@ -135,9 +147,12 @@ pub async fn handle_request(
         upstream: Some(up_rt.up.name.clone()),
         peer_index: None,
         attempts: 0,
+        tried: Vec::new(),
     };
 
     // 4. Peer views with current health.
+    // (`now` is only the routing-time view; health records below re-read
+    // the clock so windows reflect when an outcome actually happened.)
     let now = now_ms();
     let peer_views: Vec<PeerView> = up_rt
         .up
@@ -159,11 +174,11 @@ pub async fn handle_request(
         match session.run_phase(phase) {
             Decision::Deny(s) => {
                 finish_log(&mut session, s);
-                return (text_response(s, format!("{s}\n")), Some(route_idx));
+                return (text_response(s, format!("{s}\n")), Some(route_label));
             }
             Decision::Done => {
                 finish_log(&mut session, 204);
-                return (empty_response(204), Some(route_idx));
+                return (empty_response(204), Some(route_label));
             }
             _ => {}
         }
@@ -173,8 +188,9 @@ pub async fn handle_request(
     if proxy::is_websocket_upgrade(&method_str, &headers) {
         // WebSocket upgrades are routed responses too.
         return (
-            crate::ws::proxy_websocket(state, session, up_rt, req).await,
-            Some(route_idx),
+            crate::ws::proxy_websocket(state, session, up_rt, req, route_timeout(route.timeout_ms))
+                .await,
+            Some(route_label),
         );
     }
 
@@ -185,7 +201,7 @@ pub async fn handle_request(
             finish_log(&mut session, 413);
             return (
                 text_response(413, "413 payload too large\n"),
-                Some(route_idx),
+                Some(route_label),
             );
         }
     };
@@ -197,22 +213,18 @@ pub async fn handle_request(
     match session.run_phase(Phase::Content) {
         Decision::Deny(s) => {
             finish_log(&mut session, s);
-            return (text_response(s, format!("{s}\n")), Some(route_idx));
+            return (text_response(s, format!("{s}\n")), Some(route_label));
         }
         Decision::Done => {
             finish_log(&mut session, 204);
-            return (empty_response(204), Some(route_idx));
+            return (empty_response(204), Some(route_label));
         }
         _ => {}
     }
 
     // 10. Proxy attempts with retries.
     let attempts = up_rt.up.retries + 1;
-    let timeout = if route.timeout_ms > 0 {
-        Some(Duration::from_millis(route.timeout_ms))
-    } else {
-        None
-    };
+    let timeout = route_timeout(route.timeout_ms);
     let client_ip = remote.ip().to_string();
 
     let mut resp: Option<hyper::Response<Incoming>> = None;
@@ -223,14 +235,16 @@ pub async fn handle_request(
             Pick::Peer(i) => i,
             Pick::Deny(s) => {
                 finish_log(&mut session, s);
-                return (text_response(s, format!("{s}\n")), Some(route_idx));
+                return (text_response(s, format!("{s}\n")), Some(route_label));
             }
             Pick::None => {
+                // No candidate: either nothing is healthy or every peer was
+                // already tried. Either way the retry loop must stop here.
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_NO_PEER);
                 finish_log(&mut session, 502);
                 return (
                     text_response(502, "502 no healthy upstream\n"),
-                    Some(route_idx),
+                    Some(route_label),
                 );
             }
         };
@@ -257,17 +271,29 @@ pub async fn handle_request(
         };
         match outcome {
             Some(Ok(r)) => {
-                proxy::record_success(&state.health, &up_rt.up.name, idx, now);
+                // Fresh clock at the record point: `now` above was taken
+                // before the (possibly slow) attempt, and passive health
+                // windows must be judged against when the outcome happened.
+                proxy::record_success(&state.health, &up_rt.up.name, idx, now_ms());
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_SUCCESS);
                 resp = Some(r);
                 break;
             }
             Some(Err(e)) => {
-                proxy::record_failure(&state.health, &up_rt.up.name, idx, &up_rt.up.health, now);
+                proxy::record_failure(
+                    &state.health,
+                    &up_rt.up.name,
+                    idx,
+                    &up_rt.up.health,
+                    now_ms(),
+                );
                 state
                     .metrics
                     .record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
-                if e.is_retryable() {
+                let kind = proxy::failure_kind(&e);
+                if proxy::may_retry(&method, kind) {
+                    // Never revisit a peer this request already tried.
+                    session.ctx().mark_tried(peer.addr);
                     tracing::warn!(
                         upstream = %up_rt.up.name, peer = %peer.addr,
                         attempt, error = %e, "retryable upstream failure"
@@ -277,13 +303,24 @@ pub async fn handle_request(
                 finish_log(&mut session, 502);
                 return (
                     text_response(502, format!("502 upstream error: {e}\n")),
-                    Some(route_idx),
+                    Some(route_label),
                 );
             }
             None => {
-                proxy::record_failure(&state.health, &up_rt.up.name, idx, &up_rt.up.health, now);
+                proxy::record_failure(
+                    &state.health,
+                    &up_rt.up.name,
+                    idx,
+                    &up_rt.up.health,
+                    now_ms(),
+                );
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_TIMEOUT);
-                if may_retry_timeout(up_rt.up.retry_on_timeout, attempt, attempts) {
+                // A timed-out attempt may have delivered the request, so a
+                // replay is only allowed for idempotent methods.
+                if proxy::may_retry(&method, proxy::FailureKind::Timeout)
+                    && may_retry_timeout(up_rt.up.retry_on_timeout, attempt, attempts)
+                {
+                    session.ctx().mark_tried(peer.addr);
                     tracing::warn!(
                         upstream = %up_rt.up.name, peer = %peer.addr,
                         attempt, "route timeout, retrying next peer"
@@ -293,7 +330,7 @@ pub async fn handle_request(
                 finish_log(&mut session, 502);
                 return (
                     text_response(502, "502 upstream timeout\n"),
-                    Some(route_idx),
+                    Some(route_label),
                 );
             }
         }
@@ -302,7 +339,7 @@ pub async fn handle_request(
         finish_log(&mut session, 502);
         return (
             text_response(502, "502 no upstream responded\n"),
-            Some(route_idx),
+            Some(route_label),
         );
     };
 
@@ -321,7 +358,7 @@ pub async fn handle_request(
     session.set_resp_headers(seeded);
     if let Decision::Deny(s) = session.run_phase(Phase::HeaderFilter) {
         finish_log(&mut session, s);
-        return (text_response(s, format!("{s}\n")), Some(route_idx));
+        return (text_response(s, format!("{s}\n")), Some(route_label));
     }
     let final_headers = session.resp_headers().to_vec();
 
@@ -346,8 +383,8 @@ pub async fn handle_request(
     }
     builder
         .body(Body::new(filtered))
-        .map(|r| (r, Some(route_idx)))
-        .unwrap_or_else(|_| (text_response(500, "500 bad response\n"), Some(route_idx)))
+        .map(|r| (r, Some(route_label.clone())))
+        .unwrap_or_else(|_| (text_response(500, "500 bad response\n"), Some(route_label)))
 }
 
 #[cfg(test)]
@@ -358,11 +395,11 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn unmatched_route_is_404() {
+    async fn unmatched_route_is_404_without_label() {
         let dir = TmpDir::new("pipe");
         dir.write_config(&dir.prefix_only_config());
         let state = boot_state(&dir);
-        let svc = crate::app::router(state).into_service::<axum::body::Body>();
+        let svc = crate::app::router(state.clone()).into_service::<axum::body::Body>();
         let req = hyper::Request::builder()
             .uri("/definitely/not/routed")
             .extension(ConnectInfo::<SocketAddr>(
@@ -372,6 +409,18 @@ mod tests {
             .unwrap();
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 404);
+
+        // At the handle_request level the 404 is exactly the None-label
+        // branch: the fallback then records it under "unknown" instead of
+        // inventing a route name.
+        let req = hyper::Request::builder()
+            .uri("/definitely/not/routed")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (resp, label) =
+            handle_request(state, "127.0.0.1:40000".parse().unwrap(), req).await;
+        assert_eq!(resp.status(), 404);
+        assert_eq!(label, None);
     }
 
     #[test]
@@ -380,5 +429,82 @@ mod tests {
         assert!(!may_retry_timeout(true, 1, 2), "last attempt never retries");
         assert!(!may_retry_timeout(false, 0, 2), "opt-out retries nothing");
         assert!(!may_retry_timeout(true, 0, 1), "no retries configured");
+    }
+
+    #[tokio::test]
+    async fn route_label_is_pinned_from_the_serving_snapshot() {
+        let dir = TmpDir::new("pipe-label");
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        let remote: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        // Metrics attribution happens in the router fallback, label values
+        // are directly visible on handle_request's return: exercise both.
+        let router = crate::app::router(state.clone()).into_service::<axum::body::Body>();
+        let via_router = |path: &'static str| {
+            let svc = router.clone();
+            async move {
+                svc.oneshot(
+                    hyper::Request::builder()
+                        .uri(path)
+                        .extension(ConnectInfo::<SocketAddr>(remote))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let via_handle = |path: &'static str| {
+            let state = state.clone();
+            async move {
+                handle_request(
+                    state,
+                    remote,
+                    hyper::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+            }
+        };
+
+        // Served while "/" is the matched prefix: the label must come from
+        // THIS request's snapshot.
+        let (_resp, label) = via_handle("/x").await;
+        assert_eq!(label.as_deref(), Some("/"));
+        via_router("/x").await;
+
+        // Swap the runtime: the same path no longer matches, a new prefix
+        // appears. A label re-read after the swap would misattribute the
+        // requests above (and the ones below).
+        dir.write_config(&dir.standard_config().replace(
+            "path_prefix = \"/\"",
+            "path_prefix = \"/v2\"",
+        ));
+        let cfg = openrusty_core::load_config(&dir.config_path()).unwrap();
+        let gen = state.registry.snapshot().generation + 1;
+        crate::state::apply_runtime(&state, &cfg, gen);
+
+        // Old path now 404s (recorded as "unknown", not as some stale or
+        // current route name).
+        let (resp, label) = via_handle("/x").await;
+        assert_eq!(resp.status(), 404);
+        assert_eq!(label, None);
+
+        // New path matches under its own prefix label.
+        let (_resp, label) = via_handle("/v2/x").await;
+        assert_eq!(label.as_deref(), Some("/v2"));
+        via_router("/x").await; // 404
+        via_router("/v2/x").await;
+
+        // Metrics attribution used each request's pinned label: the first
+        // request stays under "/", the 404s land on "unknown", the new
+        // prefix on "/v2" -- nothing moved after the fact.
+        let snap = state.metrics.snapshot();
+        let routes: Vec<&str> = snap.requests.keys().map(|(r, _)| r.as_str()).collect();
+        assert!(routes.contains(&"/"), "missing '/' label: {routes:?}");
+        assert!(routes.contains(&"unknown"), "missing 404 label: {routes:?}");
+        assert!(routes.contains(&"/v2"), "missing '/v2' label: {routes:?}");
     }
 }

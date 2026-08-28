@@ -4,6 +4,7 @@
 //! written (>= 0) or the negated required length (< 0).
 
 use crate::abi;
+use crate::epoch::ticks_for;
 use crate::host_state::{self, HostState};
 use crate::instance::{new_host_data, HeaderEdit, HostData};
 use crate::linker_kv;
@@ -12,8 +13,14 @@ use crate::mem;
 use openrusty_core::ReqCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use wasmtime::{Caller, Engine, Linker, Module, Store, StoreLimitsBuilder};
+use wasmtime::{Caller, Engine, Linker, Module, Store, StoreLimitsBuilder, Trap};
+
+/// Epoch budget for the validation probe instantiation: a module whose
+/// start section loops forever must fail validation instead of hanging
+/// the reload.
+const PROBE_INSTANTIATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ABI validation failure.
 #[derive(Debug, Error)]
@@ -180,16 +187,42 @@ pub fn build_linker(engine: &Engine) -> Result<Linker<HostData>, wasmtime::Error
 /// Requires `orr_on_phase: (i32,i32) -> i32` and `orr_alloc: i32 -> i32`;
 /// records whether `orr_dealloc` is present. Unknown/extra imports fail
 /// instantiation naturally.
+///
+/// The probe instantiation is bounded by [`PROBE_INSTANTIATE_TIMEOUT`];
+/// the epoch must be advancing (engine ticker running) for that budget to
+/// fire.
 pub fn validate_module(
     engine: &Engine,
     linker: &Linker<HostData>,
     module: &Module,
 ) -> Result<AbiInfo, AbiError> {
+    validate_module_with_budget(engine, linker, module, PROBE_INSTANTIATE_TIMEOUT)
+}
+
+/// [`validate_module`] with an explicit instantiation epoch budget (used
+/// by tests to keep the timeout path fast).
+pub fn validate_module_with_budget(
+    engine: &Engine,
+    linker: &Linker<HostData>,
+    module: &Module,
+    budget: Duration,
+) -> Result<AbiInfo, AbiError> {
     let mut store = Store::new(engine, probe_host_data());
     store.limiter(|d| &mut d.limits);
+    store.epoch_deadline_trap();
+    // The probe instantiation is bounded by an epoch budget so a module
+    // with a non-terminating start section fails validation (with a
+    // timeout-flavoured error) instead of hanging the reload forever.
+    store.set_epoch_deadline(ticks_for(budget));
     let inst = linker
         .instantiate(&mut store, module)
-        .map_err(|e| AbiError::Instantiate(e.to_string()))?;
+        .map_err(|e| match e.downcast_ref::<Trap>() {
+            Some(&Trap::Interrupt) => AbiError::Instantiate(format!(
+                "instantiation timed out after {}ms (non-terminating start section?)",
+                budget.as_millis()
+            )),
+            _ => AbiError::Instantiate(e.to_string()),
+        })?;
     inst.get_typed_func::<(i32, i32), i32>(&mut store, abi::EXPORT_ON_PHASE)
         .map_err(|e| AbiError::BadExport(format!("{}: {e}", abi::EXPORT_ON_PHASE)))?;
     inst.get_typed_func::<i32, i32>(&mut store, abi::EXPORT_ALLOC)
@@ -212,6 +245,7 @@ fn probe_host_data() -> HostData {
         upstream: None,
         peer_index: None,
         attempts: 0,
+        tried: Vec::new(),
     };
     let mut d = new_host_data(
         ctx,
@@ -226,6 +260,7 @@ fn probe_host_data() -> HostData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const GOOD: &str = r#"
 (module
@@ -272,5 +307,40 @@ mod tests {
             validate_module(&engine, &linker, &module),
             Err(AbiError::Instantiate(_))
         ));
+    }
+
+    /// Regression: a module whose start section loops forever must fail
+    /// validation within the probe's epoch budget instead of hanging the
+    /// reload forever.
+    #[test]
+    fn rejects_non_terminating_start_section() {
+        let src = r#"(module
+            (start $s)
+            (func $s (loop $l (br $l)))
+            (func (export "orr_on_phase") (param i32 i32) (result i32) i32.const 0)
+            (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
+            (memory (export "memory") 1))"#;
+        // The probe budget needs an epoch-interrupted engine AND its
+        // ticker (the real registry engine is built exactly that way).
+        let ticker = crate::registry::new_engine().unwrap();
+        let engine = ticker.engine();
+        let linker = build_linker(engine).unwrap();
+        let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
+        let started = Instant::now();
+        let outcome = validate_module_with_budget(engine, &linker, &module, Duration::from_millis(250));
+        match outcome {
+            Err(AbiError::Instantiate(detail)) => {
+                assert!(
+                    detail.contains("timed out"),
+                    "expected a timeout-flavoured error, got: {detail}"
+                );
+            }
+            other => panic!("expected an instantiation error, got: {other:?}"),
+        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(2),
+            "validation must fail within its budget, took {:?}",
+            started.elapsed()
+        );
     }
 }

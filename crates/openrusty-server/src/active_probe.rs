@@ -16,7 +16,7 @@
 //! [`spawn`] cancels and replaces the task whenever the config changes
 //! (probing at the smallest configured `interval_ms`).
 
-use crate::state::AppState;
+use crate::state::{AppState, UpstreamRt};
 use openrusty_core::config::ActiveHealthConfig;
 use openrusty_proxy as proxy;
 use std::collections::HashMap;
@@ -53,44 +53,62 @@ pub fn spawn(state: &Arc<AppState>) {
         return;
     };
     let st = Arc::clone(state);
-    let handle = tokio::spawn(async move {
-        run(st, Duration::from_millis(interval_ms)).await
-    });
+    let handle = tokio::spawn(async move { run(st, Duration::from_millis(interval_ms)).await });
     *state.probe_task.lock().unwrap() = Some(handle);
 }
 
-/// Probe loop: sleep, re-read the runtime snapshot, probe every enabled
-/// peer, log verdict transitions. Runs until aborted by [`spawn`] (reload)
-/// or process shutdown.
+/// Probe loop: sleep, sweep every enabled peer, log verdict transitions.
+/// Runs until aborted by [`spawn`] (reload) or process shutdown.
 async fn run(state: Arc<AppState>, interval: Duration) {
     // Previous verdict per (upstream, addr); only real changes are logged.
     let mut prev: HashMap<(String, String), bool> = HashMap::new();
     loop {
         tokio::time::sleep(interval).await;
-        let rt = state.runtime.load();
-        for up in rt.upstreams.values() {
-            let Some(active) = up.up.health.active.clone() else {
-                continue;
-            };
-            for (idx, peer) in up.up.peers.iter().enumerate() {
-                let healthy = probe_peer(&state, &up.up, idx, peer, &active).await;
-                let key = (up.up.name.clone(), peer.addr.to_string());
-                match transition(prev.get(&key), healthy) {
-                    Some(true) => tracing::info!(
-                        upstream = %up.up.name,
-                        peer = %peer.addr,
-                        "active health check: peer healthy again"
-                    ),
-                    Some(false) => tracing::warn!(
-                        upstream = %up.up.name,
-                        peer = %peer.addr,
-                        "active health check: peer marked unhealthy"
-                    ),
-                    None => {}
-                }
-                prev.insert(key, healthy);
-            }
+        probe_tick(&state, &mut prev).await;
+    }
+}
+
+/// One sweep across every enabled upstream. All peers are probed
+/// concurrently ([`futures::future::join_all`]): a slow or hanging peer
+/// must not delay the verdicts (or the tick cadence) of the others, which
+/// is exactly what happened when the sweep was a plain sequential loop.
+///
+/// Verdicts are fed through [`transition`] against `prev`, so only real
+/// flips produce a log line.
+async fn probe_tick(state: &AppState, prev: &mut HashMap<(String, String), bool>) {
+    let rt = state.runtime.load();
+    let mut jobs: Vec<(&UpstreamRt, usize, &proxy::Peer, ActiveHealthConfig)> = Vec::new();
+    for up in rt.upstreams.values() {
+        let Some(active) = up.up.health.active.clone() else {
+            continue;
+        };
+        for (idx, peer) in up.up.peers.iter().enumerate() {
+            jobs.push((up, idx, peer, active.clone()));
         }
+    }
+    let results = futures::future::join_all(jobs.into_iter().map(
+        |(up, idx, peer, active)| async move {
+            let healthy = probe_peer(state, &up.up, idx, peer, &active).await;
+            (up.up.name.clone(), peer.addr.to_string(), healthy)
+        },
+    ))
+    .await;
+    for (name, peer, healthy) in results {
+        let key = (name, peer);
+        match transition(prev.get(&key), healthy) {
+            Some(true) => tracing::info!(
+                upstream = %key.0,
+                peer = %key.1,
+                "active health check: peer healthy again"
+            ),
+            Some(false) => tracing::warn!(
+                upstream = %key.0,
+                peer = %key.1,
+                "active health check: peer marked unhealthy"
+            ),
+            None => {}
+        }
+        prev.insert(key, healthy);
     }
 }
 
@@ -167,6 +185,48 @@ fn transition(prev: Option<&bool>, new: bool) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{boot_state, TmpDir};
+    use std::time::Instant;
+    use tokio::io::AsyncWriteExt;
+
+    /// Upstream section of the test config for one slow-but-healthy peer.
+    fn upstream_block(name: &str, addr: &std::net::SocketAddr) -> String {
+        format!(
+            r#"
+[[upstreams]]
+name = "{name}"
+  [[upstreams.peers]]
+  addr = "{addr}"
+  [upstreams.health.active]
+  interval_ms = 60000
+  timeout_ms = 5000
+  path = "/health"
+"#
+        )
+    }
+
+    /// A peer that answers every connection with a 200 after `delay`: slow
+    /// enough that sequential probing of two of these would be visible.
+    async fn spawn_slow_peer(delay: Duration) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Not reading the request head: the response is legal
+                    // regardless, and we only care about the timing.
+                    tokio::time::sleep(delay).await;
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
 
     #[test]
     fn transition_logs_only_real_changes() {
@@ -179,5 +239,40 @@ mod tests {
         // Only actual flips produce a log line.
         assert_eq!(transition(Some(&true), false), Some(false));
         assert_eq!(transition(Some(&false), true), Some(true));
+    }
+
+    #[tokio::test]
+    async fn probe_tick_probes_peers_concurrently() {
+        // Two slow peers in two upstreams. Sequential sweeping needs
+        // >= 2 * 300ms = 600ms; a concurrent sweep must land far below
+        // that (probes themselves take ~300ms).
+        let slow = Duration::from_millis(300);
+        let a = spawn_slow_peer(slow).await;
+        let b = spawn_slow_peer(slow).await;
+
+        let dir = TmpDir::new("probe-parallel");
+        let config = format!(
+            "[server]\nlisten = \"127.0.0.1:18080\"\n\n[plugins]\ndir = \"{}\"\n{}{}",
+            dir.plugins_dir().display(),
+            upstream_block("a", &a),
+            upstream_block("b", &b),
+        );
+        dir.write_config(&config);
+        let state = boot_state(&dir);
+
+        let mut prev: HashMap<(String, String), bool> = HashMap::new();
+        let started = Instant::now();
+        probe_tick(&state, &mut prev).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(prev.len(), 2, "both peers must have been probed");
+        assert!(
+            prev.values().all(|ok| *ok),
+            "both slow peers answered 200: {prev:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "peers were probed sequentially ({elapsed:?}); join_all must overlap them"
+        );
     }
 }

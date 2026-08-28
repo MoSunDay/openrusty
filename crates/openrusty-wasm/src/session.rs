@@ -9,7 +9,7 @@ use bytes::Bytes;
 use openrusty_core::phase::{Decision, Phase};
 use openrusty_core::ReqCtx;
 use std::sync::Arc;
-use wasmtime::{Engine, Linker};
+use wasmtime::{Engine, Linker, Trap};
 
 /// One request flowing through the plugin chain.
 pub struct RequestSession {
@@ -109,9 +109,16 @@ impl RequestSession {
                 match self.instantiate_one(&plugin) {
                     Ok(rt) => self.rts[i] = Some(rt),
                     Err(e) => {
-                        // Instantiation failure is trap-like; the kind label
-                        // mirrors KIND_TRAP in openrusty-server/src/metrics.rs.
-                        plugin.state.record_error("trap");
+                        // An epoch trap means the instantiation budget ran
+                        // out (kind label mirrors KIND_TIMEOUT in
+                        // openrusty-server/src/metrics.rs); everything else
+                        // is trap-like (KIND_TRAP).
+                        let kind = if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
+                            "timeout"
+                        } else {
+                            "trap"
+                        };
+                        plugin.state.record_error(kind);
                         tracing::warn!(plugin = %plugin.name, error = %e, "plugin instantiation failed");
                         let fallback = runner::fallback_decision(plugin.fail_policy);
                         last = fallback;
@@ -132,8 +139,7 @@ impl RequestSession {
             hd.body_chunk = self.body_chunk.clone();
             hd.body_last = self.body_last;
 
-            let decision =
-                runner::run_phase(rt, &self.engine, plugin.timeout, plugin.fail_policy, phase);
+            let decision = runner::run_phase(rt, plugin.timeout, plugin.fail_policy, phase);
 
             // Pull mutated state back out.
             let hd = rt.host_data();
@@ -257,6 +263,7 @@ mod tests {
             upstream: Some("vllm".into()),
             peer_index: None,
             attempts: 0,
+            tried: Vec::new(),
         }
     }
 

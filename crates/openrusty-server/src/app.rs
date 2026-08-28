@@ -31,8 +31,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Proxy fallback; ConnectInfo is inserted per request by `h2c::serve`.
 /// Every request that reaches this handler is counted in the Prometheus
 /// request counter and duration histogram under one critical section;
-/// `handle_request` performs the single route match and returns its index
-/// from the request's own pinned snapshot (management routes such as
+/// `handle_request` performs the single route match and returns the route
+/// label from the request's own pinned snapshot (management routes such as
 /// `/openrusty/metrics` are matched first and bypass the fallback).
 async fn fallback(
     State(state): State<Arc<AppState>>,
@@ -40,17 +40,15 @@ async fn fallback(
     req: axum::extract::Request,
 ) -> Response {
     let start = std::time::Instant::now();
-    let (resp, route_idx) = handle_request(state.clone(), remote, req).await;
+    let (resp, pinned_label) = handle_request(state.clone(), remote, req).await;
     let duration = start.elapsed().as_secs_f64();
 
-    // The route index comes from the request's own pinned snapshot; a
-    // concurrent reload can only ever swap in a same-shaped route list, so
-    // `.get` merely guards a (theoretically stale) index.
-    let rt = state.runtime.load();
-    let route = route_idx
-        .and_then(|i| rt.routes.get(i))
-        .map(|r| r.path_prefix.as_str())
-        .unwrap_or("unknown");
+    // The label was captured at routing time from the snapshot the request
+    // was served with. It must NOT be re-resolved here: a concurrent reload
+    // may have swapped the route table, and re-reading the current registry
+    // would misattribute the record (404s under a renamed prefix, labels of
+    // routes the request never matched).
+    let route = pinned_label.as_deref().unwrap_or("unknown");
     state
         .metrics
         .record_request_timed(route, resp.status().as_u16(), duration);
@@ -151,7 +149,14 @@ async fn reload_endpoint(
             "plugins": report.plugins,
         }))
         .into_response(),
-        Err(e) => (
+        // A reload is already running (SIGHUP or another POST): conflict,
+        // not failure. The caller can retry once the generation settles.
+        Err(reload::ReloadError::InFlight) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "reload already in progress" })),
+        )
+            .into_response(),
+        Err(reload::ReloadError::Failed(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
         )
@@ -234,6 +239,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_while_another_reload_holds_the_gate_is_conflict() {
+        let dir = TmpDir::new("reload409");
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        // An in-flight reload holds the async gate for the whole config +
+        // plugin + apply window; a second requester must get the conflict
+        // answer immediately instead of queueing behind it.
+        let _held = state.reload_gate.lock().await;
+        let resp = svc
+            .oneshot(request("POST", "/openrusty/reload", "127.0.0.1:40005"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body = body_string(resp).await;
+        assert!(body.contains("reload already in progress"), "body: {body}");
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_exposes_counters_and_gauges() {
         let dir = TmpDir::new("metrics");
         // Use a port that is certainly closed: grab an ephemeral port and
@@ -245,9 +270,7 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let peer_addr = format!("127.0.0.1:{free_port}");
-        let config = dir
-            .standard_config()
-            .replace("127.0.0.1:9001", &peer_addr);
+        let config = dir.standard_config().replace("127.0.0.1:9001", &peer_addr);
         dir.write_config(&config);
         let state = boot_state(&dir);
         let svc = router(state.clone()).into_service::<axum::body::Body>();
@@ -268,7 +291,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "text/plain; version=0.0.4"
         );
         let body = body_string(resp).await;
@@ -283,7 +310,10 @@ mod tests {
             body.contains("openrusty_request_duration_seconds_bucket{le=\"0.005\"}"),
             "body: {body}"
         );
-        assert!(body.contains("openrusty_request_duration_seconds_sum "), "body: {body}");
+        assert!(
+            body.contains("openrusty_request_duration_seconds_sum "),
+            "body: {body}"
+        );
         assert!(
             body.contains("openrusty_request_duration_seconds_count 1"),
             "body: {body}"
@@ -302,8 +332,14 @@ mod tests {
             )),
             "body: {body}"
         );
-        assert!(body.contains("# HELP openrusty_kv_entries "), "body: {body}");
-        assert!(body.contains("# TYPE openrusty_kv_entries gauge"), "body: {body}");
+        assert!(
+            body.contains("# HELP openrusty_kv_entries "),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("# TYPE openrusty_kv_entries gauge"),
+            "body: {body}"
+        );
         // TYPE lines for every family.
         for ty in [
             "# TYPE openrusty_requests_total counter",

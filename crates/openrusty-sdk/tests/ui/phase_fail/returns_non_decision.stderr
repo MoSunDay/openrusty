@@ -1,0 +1,5 @@
+error: #[phase] handler must return Decision (openrusty_sdk::Decision)
+ --> tests/ui/phase_fail/returns_non_decision.rs:5:17
+  |
+5 | fn on_rewrite() -> i32 {
+  |                 ^^^^^^

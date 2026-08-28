@@ -10,9 +10,9 @@ Commit: 08a95ba
 
 ## 关键设计
 - 均衡：`swrr` 为平滑加权轮询（`swrr_next` 维护 current weight）；`ip_hash` 按客户端 IP 在健康集合中取模固定（`ip_hash_pick`）。
-- 被动健康：`max_fails` 次失败落在 `fail_window_s` 窗口内即标记 down；`fail_timeout_s` 后自动恢复试探；`record_success` 复位失败计数。`HealthRegistry` 按 (upstream 名, peer 下标) 键控，热重载时按名保留、不重置。
+- 被动健康：`max_fails` 次失败落在 `fail_window_s` 窗口内即标记 down（`max_fails=0` 关闭被动记账，nginx 语义）；`fail_timeout_s` 后自动恢复试探；`record_success` 复位失败计数。状态按地址归属：热重载时 `register` 按 peer 地址 remap 既有被动/主动状态，新地址从零开始。
 - 主动健康：`record_probe` 记录探测结果，`evaluate_active` 纯函数按 `unhealthy_threshold`/`healthy_threshold` 判定状态迁移；阈值只门控翻转（成功不把健康 peer 标脏、失败不治愈脏 peer）。探测任务本身在 `openrusty-server`（`active_probe.rs`）。
-- 重试语义：仅连接级失败可重试（`is_retryable`），换一个健康 peer 重来，上限为 `upstreams.retries`；响应已开始后不重试。
+- 重试语义：幂等方法按 `is_retryable` 重试，非幂等方法仅连接级（`Connect`）失败可重试（nginx 对齐）；每次失败把 peer 地址记入 `ReqCtx::tried`，后续重试与插件 pin 都不会再选已试 peer；上限为 `upstreams.retries`；响应已开始后不重试。
 - 连接：`ClientPool` 按 peer 地址池化 HTTP 客户端，建连受 `connect_timeout_ms` 约束。
 - 流式：普通转发逐块搬运响应体；WebSocket 升级后 `tunnel` 双向透传字节流。
 

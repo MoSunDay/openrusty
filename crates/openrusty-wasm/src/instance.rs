@@ -92,6 +92,7 @@ mod tests {
             upstream: None,
             peer_index: None,
             attempts: 0,
+            tried: Vec::new(),
         }
     }
 

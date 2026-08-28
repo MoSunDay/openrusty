@@ -9,6 +9,7 @@ use openrusty_core::config::{Config, RouteConfig};
 use openrusty_proxy as proxy;
 use openrusty_wasm::PluginRegistry;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -43,6 +44,10 @@ pub struct AppState {
     pub started_at: std::time::Instant,
     /// Handle of the active-probe task; cancelled and replaced on reload.
     pub probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Reload gate: SIGHUP and the POST /openrusty/reload endpoint share
+    /// this async mutex, so only one reload runs at a time. A second
+    /// requester gets the in-flight (conflict) answer instead of queueing.
+    pub reload_gate: tokio::sync::Mutex<()>,
 }
 
 /// Empty runtime used before the first [`apply_runtime`] call.
@@ -56,15 +61,21 @@ pub fn empty_runtime() -> RuntimeSnapshot {
 
 /// Rebuild the runtime snapshot from `cfg` and publish it atomically.
 ///
-/// Upstreams are re-derived from config; health slots are refreshed via
-/// `health::register`, which keeps existing peer state when the peer list
-/// shape is unchanged. Called only after the plugin registry published a
-/// new snapshot, so config and plugins never disagree.
+/// Upstreams are re-derived from config. Passive health slots are refreshed
+/// via `health::register`, which remaps peer state by ADDRESS: a peer whose
+/// address existed before keeps its counters/down state whatever its new
+/// index, new addresses start fresh, removed addresses are dropped. The
+/// pooled-client cache is pruned to the configured addresses so clients of
+/// removed peers cannot linger. Called only after the plugin registry
+/// published a new snapshot, so config and plugins never disagree.
 pub fn apply_runtime(state: &AppState, cfg: &Config, generation: u64) {
     let mut upstreams = HashMap::new();
+    let mut live_addrs: Vec<SocketAddr> = Vec::new();
     for uc in &cfg.upstreams {
         let up = proxy::from_config(uc);
-        proxy::register(&state.health, &up.name, up.peers.len());
+        let peer_addrs: Vec<SocketAddr> = up.peers.iter().map(|p| p.addr).collect();
+        proxy::register(&state.health, &up.name, &peer_addrs);
+        live_addrs.extend(peer_addrs.iter().copied());
         for p in &up.peers {
             // Pre-create the pooled client so the request path never pays
             // client construction (and connects through a warm keep-alive
@@ -79,6 +90,8 @@ pub fn apply_runtime(state: &AppState, cfg: &Config, generation: u64) {
         let swrr = Mutex::new(vec![0i64; up.peers.len()]);
         upstreams.insert(up.name.clone(), Arc::new(UpstreamRt { up, swrr }));
     }
+    // Drop pooled clients for addresses that left the configuration.
+    proxy::evict_except(&state.pool, &live_addrs);
     let snap = RuntimeSnapshot {
         generation,
         routes: cfg.routes.clone(),

@@ -53,6 +53,57 @@ impl ForwardError {
     }
 }
 
+/// Failure classes the retry gate reasons about. The distinction that
+/// matters is whether the request (possibly partially) reached the peer:
+/// replaying such a request can duplicate side effects (nginx:
+/// `proxy_next_upstream non_idempotent` semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The connection never came up: nothing was sent.
+    Connect,
+    /// The connection was up, so the request may have been (partially) sent.
+    Sent,
+    /// The peer answered, but the response was unusable.
+    Response,
+    /// The route timeout fired while the attempt was in flight; the
+    /// request may have been sent and may even be processed right now.
+    Timeout,
+}
+
+/// Classify a transport failure for the retry gate.
+pub fn failure_kind(err: &ForwardError) -> FailureKind {
+    match err {
+        ForwardError::Connect(_) => FailureKind::Connect,
+        ForwardError::Send(_) => FailureKind::Sent,
+        ForwardError::Response(_) => FailureKind::Response,
+    }
+}
+
+/// True when replaying `method` on another peer cannot cause side effects
+/// beyond the peer's own response (RFC 9110 9.2.2). Everything not on the
+/// safe list is treated as non-idempotent.
+pub fn is_idempotent(method: &hyper::Method) -> bool {
+    matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+}
+
+/// nginx-style retry gate for one failed attempt.
+///
+/// Idempotent requests may be replayed after any failure that produced no
+/// usable response (connect/send failures and route timeouts; a decoded
+/// response is never replayed). Non-idempotent requests may only be
+/// replayed when the connection never came up (`Connect`): every other
+/// failure class implies the peer saw (part of) the request.
+pub fn may_retry(method: &hyper::Method, kind: FailureKind) -> bool {
+    if is_idempotent(method) {
+        matches!(
+            kind,
+            FailureKind::Connect | FailureKind::Sent | FailureKind::Timeout
+        )
+    } else {
+        matches!(kind, FailureKind::Connect)
+    }
+}
+
 /// Flatten an error chain into one message for logs/telemetry.
 fn describe(mut err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
@@ -79,7 +130,10 @@ fn classify(err: hyper_util::client::legacy::Error) -> ForwardError {
 }
 
 /// Merge any incoming `X-Forwarded-For` values with the direct client IP.
-fn merge_xff(headers: &[(String, String)], client_ip: &str) -> String {
+///
+/// Shared with the WebSocket handshake builder so both paths append (never
+/// overwrite) the client hop.
+pub fn merge_xff(headers: &[(String, String)], client_ip: &str) -> String {
     let mut parts: Vec<&str> = headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("x-forwarded-for"))
@@ -173,6 +227,63 @@ mod tests {
         assert!(ForwardError::Connect("x".into()).is_retryable());
         assert!(ForwardError::Send("x".into()).is_retryable());
         assert!(!ForwardError::Response("x".into()).is_retryable());
+    }
+
+    #[test]
+    fn idempotent_methods_are_the_safe_list() {
+        for m in ["GET", "HEAD", "OPTIONS", "TRACE"] {
+            assert!(is_idempotent(&hyper::Method::from_bytes(m.as_bytes()).unwrap()), "{m}");
+        }
+        for m in ["POST", "PUT", "PATCH", "DELETE", "FOO"] {
+            assert!(
+                !is_idempotent(&hyper::Method::from_bytes(m.as_bytes()).unwrap()),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_gate_method_by_error_matrix() {
+        let kinds = [
+            (FailureKind::Connect, "connect"),
+            (FailureKind::Sent, "sent"),
+            (FailureKind::Response, "response"),
+            (FailureKind::Timeout, "timeout"),
+        ];
+        let idempotent = ["GET", "HEAD", "OPTIONS", "TRACE"];
+        let mutating = ["POST", "PUT", "PATCH", "DELETE", "PROPFIND"];
+        for (kind, kname) in kinds {
+            for m in idempotent {
+                let method = hyper::Method::from_bytes(m.as_bytes()).unwrap();
+                let allowed = may_retry(&method, kind);
+                let expected = !matches!(kind, FailureKind::Response);
+                assert_eq!(allowed, expected, "{m} x {kname}");
+            }
+            for m in mutating {
+                let method = hyper::Method::from_bytes(m.as_bytes()).unwrap();
+                assert_eq!(
+                    may_retry(&method, kind),
+                    matches!(kind, FailureKind::Connect),
+                    "{m} x {kname}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failure_kind_maps_error_variants() {
+        assert_eq!(
+            failure_kind(&ForwardError::Connect("x".into())),
+            FailureKind::Connect
+        );
+        assert_eq!(
+            failure_kind(&ForwardError::Send("x".into())),
+            FailureKind::Sent
+        );
+        assert_eq!(
+            failure_kind(&ForwardError::Response("x".into())),
+            FailureKind::Response
+        );
     }
 
     #[test]

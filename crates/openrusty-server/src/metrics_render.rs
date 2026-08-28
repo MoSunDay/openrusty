@@ -210,8 +210,7 @@ mod tests {
         assert!(out
             .contains("openrusty_upstream_attempts_total{upstream=\"vllm\",result=\"timeout\"} 1"));
         // Snapshot counter (1) + live registry view (2) merge into 3.
-        assert!(out
-            .contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
+        assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8000\"} 1"));
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8001\"} 0"));
         assert!(out.contains("openrusty_kv_entries{plugin=\"sched\"} 3"));
@@ -280,9 +279,7 @@ mod tests {
         ];
         let out = render(&snap, &[], &[], &live);
         // Same key: snapshot 1 + live 2 = 3; live-only key passes through.
-        assert!(out
-            .contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
-        assert!(out
-            .contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"timeout\"} 3"));
+        assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
+        assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"timeout\"} 3"));
     }
 }

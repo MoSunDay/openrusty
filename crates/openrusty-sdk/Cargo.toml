@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 openrusty-macros = { workspace = true }
+
+[dev-dependencies]
+# Compile-fail tests for `#[phase]` signature validation (tests/phase.rs).
+trybuild = "1.0"

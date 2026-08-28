@@ -82,6 +82,12 @@ pub mod abi {
     pub const OK: i32 = 0;
     pub const DECLINED: i32 = -5;
     pub const DONE: i32 = -4;
+    /// Reserved invalid code (nginx `NGX_ERROR`): never a legal
+    /// `orr_on_phase` result. [`Decision::to_abi`] emits it for out-of-range
+    /// `Deny` statuses; [`Decision::from_abi`] rejects it, so the host
+    /// classifies the call as a bad code and applies the plugin failure
+    /// policy.
+    pub const ERROR: i32 = -1;
 }
 
 impl Decision {
@@ -96,12 +102,21 @@ impl Decision {
         }
     }
 
+    /// Encode as the `orr_on_phase` i32 return value.
+    ///
+    /// A `Deny(status)` outside `100..=599` has no wire representation, so it
+    /// encodes as [`abi::ERROR`] instead of the raw status. [`Decision::from_abi`]
+    /// rejects that code, which makes the host treat the invocation as a bad
+    /// code (`ErrorKind::BadCode`) and apply the plugin failure policy --
+    /// rather than silently decoding `Deny(0)` as `Decision::Ok` (auth
+    /// bypass) or `Deny(700)` as a valid HTTP status.
     pub fn to_abi(self) -> i32 {
         match self {
             Decision::Ok => abi::OK,
             Decision::Declined => abi::DECLINED,
             Decision::Done => abi::DONE,
-            Decision::Deny(status) => status as i32,
+            Decision::Deny(status) if (100..=599).contains(&status) => status as i32,
+            Decision::Deny(_) => abi::ERROR,
         }
     }
 
@@ -121,10 +136,30 @@ mod tests {
             Decision::Ok,
             Decision::Declined,
             Decision::Done,
+            Decision::Deny(100),
             Decision::Deny(403),
+            Decision::Deny(418),
             Decision::Deny(503),
+            Decision::Deny(599),
         ] {
             assert_eq!(Decision::from_abi(d.to_abi()), Some(d));
+        }
+    }
+
+    #[test]
+    fn out_of_range_deny_encodes_fail_policy_code() {
+        for status in [0u16, 1, 70, 99, 600, 700, u16::MAX] {
+            let code = Decision::Deny(status).to_abi();
+            // Never OK, never a decodable HTTP status.
+            assert_ne!(code, abi::OK, "Deny({status}) encoded as OK");
+            assert_eq!(code, abi::ERROR, "unexpected encoding for Deny({status})");
+            assert!(
+                !(100..=599).contains(&code),
+                "Deny({status}) encoded as valid status {code}"
+            );
+            // The host must classify this as a bad code (fail policy), not a
+            // decision.
+            assert_eq!(Decision::from_abi(code), None, "code {code} decoded");
         }
     }
 

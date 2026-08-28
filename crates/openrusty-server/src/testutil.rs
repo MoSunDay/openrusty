@@ -100,6 +100,7 @@ pub fn boot_state(dir: &TmpDir) -> Arc<AppState> {
         config_path: dir.config_path(),
         started_at: std::time::Instant::now(),
         probe_task: std::sync::Mutex::new(None),
+        reload_gate: tokio::sync::Mutex::new(()),
     });
     let gen = state.registry.snapshot().generation;
     state::apply_runtime(&state, &cfg, gen);

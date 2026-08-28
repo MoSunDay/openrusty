@@ -16,13 +16,26 @@ pub enum Decision {
 }
 
 impl Decision {
+    /// Reserved invalid return code for out-of-range `Deny` statuses. Mirrors
+    /// `openrusty_core::phase::abi::ERROR` (the SDK cannot depend on core);
+    /// the host's `Decision::from_abi` rejects it, so the plugin failure
+    /// policy applies.
+    const BAD_CODE: i32 = -1;
+
     /// Encode as the `orr_on_phase` i32 return value.
+    ///
+    /// A `Deny(status)` outside `100..=599` has no wire representation, so it
+    /// encodes as [`Decision::BAD_CODE`] instead of the raw status. The host
+    /// rejects that code and applies the plugin failure policy rather than
+    /// silently decoding `Deny(0)` as `Decision::Ok` (auth bypass) or
+    /// `Deny(700)` as a valid HTTP status.
     pub fn to_abi(self) -> i32 {
         match self {
             Decision::Ok => 0,
             Decision::Declined => -5,
             Decision::Done => -4,
-            Decision::Deny(status) => status as i32,
+            Decision::Deny(status) if (100..=599).contains(&status) => status as i32,
+            Decision::Deny(_) => Self::BAD_CODE,
         }
     }
 }
@@ -81,7 +94,24 @@ mod tests {
         assert_eq!(Decision::Ok.to_abi(), 0);
         assert_eq!(Decision::Declined.to_abi(), -5);
         assert_eq!(Decision::Done.to_abi(), -4);
+        assert_eq!(Decision::Deny(100).to_abi(), 100);
         assert_eq!(Decision::Deny(403).to_abi(), 403);
+        assert_eq!(Decision::Deny(599).to_abi(), 599);
         assert_eq!(Decision::Deny(503).to_abi(), 503);
+    }
+
+    #[test]
+    fn out_of_range_deny_encodes_bad_code() {
+        for status in [0u16, 1, 70, 99, 600, 700, u16::MAX] {
+            let code = Decision::Deny(status).to_abi();
+            // Never OK, never a decodable HTTP status: the host classifies
+            // this as a bad code and applies the plugin failure policy.
+            assert_ne!(code, 0, "Deny({status}) encoded as OK");
+            assert_eq!(code, Decision::BAD_CODE);
+            assert!(
+                !(100..=599).contains(&code),
+                "Deny({status}) encoded as valid status {code}"
+            );
+        }
     }
 }

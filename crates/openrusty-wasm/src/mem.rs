@@ -16,12 +16,20 @@ pub fn memory_of(caller: &mut Caller<'_, HostData>) -> Option<Memory> {
 
 /// Read `len` bytes at `ptr` from guest memory; `None` on any invalid
 /// access (negative pointer/length, missing memory, out of bounds).
+///
+/// The length is bounds-checked against the guest memory's live size
+/// BEFORE any allocation, so a hostile length cannot make the host
+/// allocate an arbitrary amount of memory.
 pub fn read_guest(caller: &mut Caller<'_, HostData>, ptr: i32, len: i32) -> Option<Vec<u8>> {
     if ptr < 0 || len < 0 {
         return None;
     }
     let mem = memory_of(caller)?;
-    let mut buf = vec![0u8; len as usize];
+    let len = len as usize;
+    if len > mem.data_size(&*caller) {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
     mem.read(&*caller, ptr as usize, &mut buf).ok()?;
     Some(buf)
 }
@@ -102,7 +110,62 @@ mod tests {
             upstream: None,
             peer_index: None,
             attempts: 0,
+            tried: Vec::new(),
         }
+    }
+
+    /// Exercises `read_guest` through the real `kv_set`/`kv_get` imports:
+    /// a hostile (oversized) length must be refused cleanly, and a length
+    /// exactly equal to the live memory size must be accepted.
+    const BOUNDS_PROBE: &str = r#"
+(module
+  (import "openrusty" "kv_set" (func $set (param i32 i32 i32 i32 i64) (result i32)))
+  (import "openrusty" "kv_get" (func $get (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 8) "\01")
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    ;; i32::MAX length: refused (-1), not an OOM/trap.
+    (if (i32.ne (call $set (i32.const 0) (i32.const 0x7fffffff)
+                           (i32.const 8) (i32.const 1) (i64.const 0))
+                (i32.const -1))
+        (then unreachable))
+    ;; One byte past the live size (131072): refused.
+    (if (i32.ne (call $set (i32.const 0) (i32.const 131073)
+                           (i32.const 8) (i32.const 1) (i64.const 0))
+                (i32.const -1))
+        (then unreachable))
+    ;; Exactly the live size: in bounds, accepted (0).
+    (if (i32.ne (call $set (i32.const 0) (i32.const 131072)
+                           (i32.const 8) (i32.const 1) (i64.const 0))
+                (i32.const 0))
+        (then unreachable))
+    ;; The full-size key was really stored: read it back (1 byte payload).
+    (if (i32.ne (call $get (i32.const 0) (i32.const 131072)
+                           (i32.const 16) (i32.const 16))
+                (i32.const 1))
+        (then unreachable))
+    i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+
+    #[test]
+    fn read_guest_bounds_checks_length_before_allocating() {
+        let engine = Engine::default();
+        let linker: Linker<HostData> = build_linker(&engine).unwrap();
+        let module = Module::new(&engine, wat::parse_str(BOUNDS_PROBE).unwrap()).unwrap();
+        let host = new_host_data(
+            ctx(),
+            Vec::new(),
+            Arc::new(HostState::new("t".into())),
+            Arc::new(HashMap::new()),
+        );
+        let mut store = Store::new(&engine, host);
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let f = inst
+            .get_typed_func::<(i32, i32), i32>(&mut store, "orr_on_phase")
+            .unwrap();
+        assert_eq!(f.call(&mut store, (0, 0)).unwrap(), 0);
+        assert_eq!(store.data().state.kv_len(), 1);
     }
 
     #[test]
