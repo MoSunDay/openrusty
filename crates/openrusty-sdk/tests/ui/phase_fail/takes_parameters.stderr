@@ -1,0 +1,5 @@
+error: #[phase] handler must take no parameters; phases are invoked as `fn() -> Decision`
+ --> tests/ui/phase_fail/takes_parameters.rs:7:14
+  |
+7 | fn on_access(_req: u32) -> Decision {
+  |              ^^^^^^^^^

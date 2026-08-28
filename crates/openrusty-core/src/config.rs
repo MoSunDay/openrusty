@@ -101,6 +101,8 @@ fn default_weight() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
+    /// Passive failures allowed inside `fail_window_s` before the peer is
+    /// marked down; `0` disables passive accounting (nginx semantics).
     #[serde(default = "default_max_fails")]
     pub max_fails: u32,
     #[serde(default = "default_fail_window_s")]
@@ -226,6 +228,17 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     if cfg.plugins.max_memory_mb == 0 {
         return Err(bad("plugins.max_memory_mb must be > 0"));
     }
+    // The plugin registry (openrusty-wasm) trusts `order` to name each plugin
+    // at most once; a duplicate would make execution order ambiguous.
+    let mut seen_order = std::collections::HashSet::new();
+    for name in &cfg.plugins.order {
+        if !seen_order.insert(name.as_str()) {
+            return Err(bad(&format!(
+                "plugins.order lists plugin {} more than once",
+                name
+            )));
+        }
+    }
 
     if cfg.upstreams.is_empty() && !cfg.routes.is_empty() {
         return Err(bad("routes defined but no upstreams"));
@@ -334,6 +347,30 @@ upstream = "vllm"
     }
 
     #[test]
+    fn rejects_duplicate_plugin_order() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "dir = \"build/plugins\"",
+            "dir = \"build/plugins\"\norder = [\"auth\", \"router\", \"auth\"]",
+        ))
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("plugins.order") && err.to_string().contains("auth"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_unique_plugin_order() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "dir = \"build/plugins\"",
+            "dir = \"build/plugins\"\norder = [\"auth\", \"router\"]",
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
     fn rejects_zero_weight() {
         let cfg: Config = toml::from_str(&GOOD.replace(
             "addr = \"127.0.0.1:9001\"",
@@ -419,7 +456,8 @@ upstream = "vllm"
         .unwrap();
         let err = validate(&cfg).unwrap_err();
         assert!(
-            err.to_string().contains("health.active.unhealthy_threshold"),
+            err.to_string()
+                .contains("health.active.unhealthy_threshold"),
             "unexpected error: {err}"
         );
 

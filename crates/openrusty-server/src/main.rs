@@ -51,7 +51,8 @@ async fn main() {
         }
     };
 
-    let filter = EnvFilter::try_new(&cfg.server.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter =
+        EnvFilter::try_new(&cfg.server.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
     // Non-blocking writer: log calls hand formatted output to a dedicated
     // thread; the guard must outlive every log call, so main holds it and the
     // buffer is flushed when it drops at shutdown.
@@ -80,6 +81,7 @@ async fn main() {
         config_path,
         started_at: std::time::Instant::now(),
         probe_task: std::sync::Mutex::new(None),
+        reload_gate: tokio::sync::Mutex::new(()),
     });
     let gen = state.registry.snapshot().generation;
     state::apply_runtime(&state, &cfg, gen);

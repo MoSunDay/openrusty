@@ -62,6 +62,7 @@ connect_timeout_ms = 2000
 
   [upstreams.health]
   # Passive health check: mark a peer down after `max_fails` failures
+  # inside the window; `max_fails = 0` disables passive accounting
   # within `fail_window_s`; the peer recovers after `fail_timeout_s`.
   max_fails = 3
   fail_window_s = 10

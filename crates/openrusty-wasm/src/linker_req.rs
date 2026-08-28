@@ -125,6 +125,7 @@ mod tests {
             upstream: Some("vllm".into()),
             peer_index: None,
             attempts: 0,
+            tried: Vec::new(),
         }
     }
 

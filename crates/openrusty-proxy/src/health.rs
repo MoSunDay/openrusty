@@ -4,13 +4,15 @@
 //! driven by [`record_probe`]).
 //!
 //! State is stored in a registry that outlives config snapshots, so peer
-//! health SURVIVES config reloads: re-registering an upstream with the same
-//! name and peer count keeps its failure counters and down state.
+//! health SURVIVES config reloads: re-registering an upstream remaps the
+//! per-peer counters and down state by ADDRESS, so peers keep their history
+//! across reordering, additions and removals.
 //!
 //! Passive model per peer (nginx `max_fails` / `fail_timeout` style):
 //! - failures are counted inside a sliding window of `fail_window_s`;
 //! - a failure outside the window resets the window and the counter;
-//! - reaching `max_fails` marks the peer down for `fail_timeout_s`;
+//! - reaching `max_fails` marks the peer down for `fail_timeout_s`
+//!   (`max_fails=0` disables passive accounting, as in nginx);
 //! - a success clears the failure counter.
 //!
 //! Active model per (upstream, addr) pair (consecutive counters):
@@ -22,13 +24,14 @@
 //! - unknown (upstream, addr) pairs are treated as healthy (fail-open).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use openrusty_core::config::HealthConfig;
 
 /// Mutable failure accounting for one peer.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PeerCounters {
     /// Consecutive failures inside the current window.
     fails: u32,
@@ -38,6 +41,7 @@ struct PeerCounters {
 
 /// Per-peer health state. Interior mutability: the registry hands out
 /// shared references that outlive individual requests.
+#[derive(Debug)]
 pub struct PeerHealth {
     counters: Mutex<PeerCounters>,
     /// Peer is considered down while `now_ms < down_until_ms`.
@@ -46,6 +50,25 @@ pub struct PeerHealth {
     /// [`record_probe`] so index-based call sites see it without signature
     /// changes. Starts healthy (fail-open).
     active_ok: AtomicBool,
+}
+
+impl Clone for PeerHealth {
+    fn clone(&self) -> Self {
+        PeerHealth {
+            counters: Mutex::new(self.counters.lock().unwrap().clone()),
+            down_until_ms: AtomicU64::new(self.down_until_ms.load(Ordering::Relaxed)),
+            active_ok: AtomicBool::new(self.active_ok.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// One registered upstream: the peer addresses of the snapshot this slot
+/// block was built from plus the matching passive slots. Addresses are
+/// stored so a reload can remap state by ADDRESS (see [`register`]).
+#[derive(Debug)]
+struct PeerSlots {
+    addrs: Vec<SocketAddr>,
+    peers: Vec<PeerHealth>,
 }
 
 /// Active-plane health for one (upstream, addr) pair.
@@ -60,7 +83,7 @@ struct ActivePeer {
 
 /// Registry of per-upstream peer health state. Cheaply shared via `&`.
 pub struct HealthRegistry {
-    upstreams: Mutex<HashMap<String, Arc<Vec<PeerHealth>>>>,
+    upstreams: Mutex<HashMap<String, Arc<PeerSlots>>>,
     /// Active-plane state keyed by (upstream name, peer addr). Entries for
     /// peers removed from config stay behind: they are never probed and the
     /// index-based paths never consult them, so they are harmless.
@@ -81,34 +104,62 @@ impl Default for HealthRegistry {
     }
 }
 
-/// Register (or refresh) an upstream's health slots.
+/// Register (or refresh) an upstream's passive health slots.
 ///
-/// If the upstream already exists with exactly `peer_count` peers, existing
-/// state is KEPT so reloads do not resurrect or re-punish peers. Otherwise
-/// (new upstream or peer list shape changed) state is replaced with fresh,
-/// healthy per-peer slots.
-pub fn register(h: &HealthRegistry, upstream: &str, peer_count: usize) {
+/// State is remapped by ADDRESS, not by index: a peer whose address existed
+/// in the previous list inherits its failure counters and `down_until`
+/// (passive plane) whatever its new position, so a reload neither re-punishes
+/// a healthy address nor resurrects a downed one by shuffling order.
+/// Brand-new addresses start fresh (healthy); removed addresses are dropped.
+/// The active-plane verdict (keyed by address already) is backfilled into
+/// the per-index slot so [`is_healthy`] keeps seeing it. An unknown
+/// upstream registers fresh, healthy slots.
+pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
     let mut map = h.upstreams.lock().unwrap();
-    if map
-        .get(upstream)
-        .is_some_and(|peers| peers.len() == peer_count)
-    {
-        return;
-    }
-    let peers = (0..peer_count)
-        .map(|_| PeerHealth {
-            counters: Mutex::new(PeerCounters::default()),
-            down_until_ms: AtomicU64::new(0),
-            active_ok: AtomicBool::new(true),
+    // Value-copy the previous per-address state; slots are behind an `Arc`
+    // shared with in-flight requests, so they cannot be moved out.
+    let previous: HashMap<SocketAddr, PeerHealth> = match map.get(upstream) {
+        Some(slots) => slots
+            .addrs
+            .iter()
+            .zip(slots.peers.iter())
+            .map(|(addr, peer)| (*addr, peer.clone()))
+            .collect(),
+        None => HashMap::new(),
+    };
+    let active = h.active.lock().unwrap();
+    let peers = addrs
+        .iter()
+        .map(|addr| {
+            let peer = previous.get(addr).cloned().unwrap_or(PeerHealth {
+                counters: Mutex::new(PeerCounters::default()),
+                down_until_ms: AtomicU64::new(0),
+                active_ok: AtomicBool::new(true),
+            });
+            // Backfill the active-plane judgment for this address; unknown
+            // addresses are healthy (fail-open), matching `record_probe`.
+            let verdict = match active.get(&(upstream.to_string(), addr.to_string())) {
+                Some(p) => p.healthy.load(Ordering::Relaxed),
+                None => true,
+            };
+            peer.active_ok.store(verdict, Ordering::Relaxed);
+            peer
         })
         .collect();
-    map.insert(upstream.to_string(), Arc::new(peers));
+    drop(active);
+    map.insert(
+        upstream.to_string(),
+        Arc::new(PeerSlots {
+            addrs: addrs.to_vec(),
+            peers,
+        }),
+    );
 }
 
 /// Shared handle to one registered peer, if present.
-fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<Vec<PeerHealth>>> {
+fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<PeerSlots>> {
     let map = h.upstreams.lock().unwrap();
-    map.get(upstream).filter(|peers| idx < peers.len()).cloned()
+    map.get(upstream).filter(|slots| idx < slots.peers.len()).cloned()
 }
 
 /// True when the peer is not currently marked down.
@@ -117,10 +168,9 @@ fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<Vec<Peer
 /// upstreams/indices are treated as healthy (fail-open).
 pub fn is_healthy(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u64) -> bool {
     match lookup(h, upstream, idx) {
-        Some(peers) => {
-            let p = &peers[idx];
-            p.down_until_ms.load(Ordering::Relaxed) <= now_ms
-                && p.active_ok.load(Ordering::Relaxed)
+        Some(slots) => {
+            let p = &slots.peers[idx];
+            p.down_until_ms.load(Ordering::Relaxed) <= now_ms && p.active_ok.load(Ordering::Relaxed)
         }
         None => true,
     }
@@ -135,12 +185,12 @@ pub fn healthy_indices(
     now_ms: u64,
 ) -> Vec<usize> {
     let map = h.upstreams.lock().unwrap();
-    let Some(peers) = map.get(upstream) else {
+    let Some(slots) = map.get(upstream) else {
         return (0..peer_count).collect();
     };
     (0..peer_count)
         .filter(|i| {
-            peers.get(*i).is_none_or(|p| {
+            slots.peers.get(*i).is_none_or(|p| {
                 p.down_until_ms.load(Ordering::Relaxed) <= now_ms
                     && p.active_ok.load(Ordering::Relaxed)
             })
@@ -161,6 +211,11 @@ pub fn evaluate_failure(
     now_ms: u64,
     cfg: &HealthConfig,
 ) -> Option<u64> {
+    // nginx semantics: `max_fails=0` disables passive accounting entirely;
+    // without this guard `fails_after >= 0` would trip on the first failure.
+    if cfg.max_fails == 0 {
+        return None;
+    }
     let window_ms = cfg.fail_window_s.saturating_mul(1000);
     if now_ms.saturating_sub(window_start) > window_ms {
         // Stale window: signal the caller to reset; do not trip the peer.
@@ -177,7 +232,8 @@ pub fn evaluate_failure(
 ///
 /// Applies the windowed counter; when `max_fails` is reached inside the
 /// window the peer is marked down for `fail_timeout_s` and the counter is
-/// reset (the next failure starts a fresh accounting).
+/// reset (the next failure starts a fresh accounting). `max_fails=0`
+/// disables passive accounting: failures are not counted at all.
 pub fn record_failure(
     h: &HealthRegistry,
     upstream: &str,
@@ -185,10 +241,13 @@ pub fn record_failure(
     cfg: &HealthConfig,
     now_ms: u64,
 ) {
+    if cfg.max_fails == 0 {
+        return;
+    }
     let Some(peers) = lookup(h, upstream, idx) else {
         return;
     };
-    let peer = &peers[idx];
+    let peer = &peers.peers[idx];
     let mut counters = peer.counters.lock().unwrap();
     let window_ms = cfg.fail_window_s.saturating_mul(1000);
     if now_ms.saturating_sub(counters.window_start_ms) > window_ms {
@@ -211,7 +270,7 @@ pub fn record_success(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u6
     let Some(peers) = lookup(h, upstream, idx) else {
         return;
     };
-    let mut counters = peers[idx].counters.lock().unwrap();
+    let mut counters = peers.peers[idx].counters.lock().unwrap();
     counters.fails = 0;
     counters.window_start_ms = now_ms;
 }
@@ -287,8 +346,8 @@ pub fn record_probe(
     peer.fails.store(fails, Ordering::Relaxed);
     peer.successes.store(successes, Ordering::Relaxed);
     // Mirror into the per-index passive slot when the upstream is known.
-    if let Some(peers) = lookup(h, upstream, idx) {
-        peers[idx].active_ok.store(healthy, Ordering::Relaxed);
+    if let Some(slots) = lookup(h, upstream, idx) {
+        slots.peers[idx].active_ok.store(healthy, Ordering::Relaxed);
     }
     healthy
 }
@@ -327,6 +386,19 @@ pub fn active_peers(h: &HealthRegistry) -> Vec<(String, String, bool)> {
 mod tests {
     use super::*;
 
+    /// Parse one address literal (test helper).
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// `n` distinct loopback addresses, 127.0.0.1:9001.. (test helper for
+    /// the old index-count shape of [`register`]).
+    fn addrs_helper(n: usize) -> Vec<SocketAddr> {
+        (0..n)
+            .map(|i| addr(&format!("127.0.0.1:{}", 9001 + i)))
+            .collect()
+    }
+
     fn cfg(max_fails: u32, window_s: u64, timeout_s: u64) -> HealthConfig {
         HealthConfig {
             max_fails,
@@ -349,9 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn max_fails_zero_disables_passive_accounting() {
+        // nginx semantics: `max_fails=0` turns passive accounting off; the
+        // peer must never be marked down by request failures.
+        let c = cfg(0, 10, 30);
+        assert_eq!(evaluate_failure(1, 0, 1_000, &c), None);
+        assert_eq!(evaluate_failure(u32::MAX, 0, 1_000, &c), None);
+
+        let h = HealthRegistry::default();
+        register(&h, "u", &addrs_helper(1));
+        for _ in 0..10 {
+            record_failure(&h, "u", 0, &c, 1_000);
+        }
+        assert!(
+            is_healthy(&h, "u", 0, 2_000),
+            "max_fails=0 must never trip the peer down"
+        );
+    }
+
+    #[test]
     fn healthy_by_default() {
         let h = new();
-        register(&h, "u", 3);
+        register(&h, "u", &addrs_helper(3));
         for i in 0..3 {
             assert!(is_healthy(&h, "u", i, 0));
         }
@@ -371,7 +462,7 @@ mod tests {
     #[test]
     fn single_failure_below_threshold_stays_up() {
         let h = new();
-        register(&h, "u", 2);
+        register(&h, "u", &addrs_helper(2));
         let c = cfg(3, 10, 10);
         record_failure(&h, "u", 0, &c, 1_000);
         assert!(is_healthy(&h, "u", 0, 1_000));
@@ -381,7 +472,7 @@ mod tests {
     #[test]
     fn max_fails_within_window_trips_down_then_expires() {
         let h = new();
-        register(&h, "u", 2);
+        register(&h, "u", &addrs_helper(2));
         let c = cfg(3, 10, 10);
         record_failure(&h, "u", 1, &c, 1_000);
         record_failure(&h, "u", 1, &c, 2_000);
@@ -398,7 +489,7 @@ mod tests {
     #[test]
     fn stale_window_resets_counts() {
         let h = new();
-        register(&h, "u", 1);
+        register(&h, "u", &addrs_helper(1));
         let c = cfg(2, 1, 60); // 1s window
         record_failure(&h, "u", 0, &c, 0);
         // Second failure arrives after the window expired: counter resets,
@@ -413,7 +504,7 @@ mod tests {
     #[test]
     fn success_clears_fail_counter() {
         let h = new();
-        register(&h, "u", 1);
+        register(&h, "u", &addrs_helper(1));
         let c = cfg(3, 10, 10);
         record_failure(&h, "u", 0, &c, 1_000);
         record_failure(&h, "u", 0, &c, 1_500);
@@ -426,23 +517,61 @@ mod tests {
     #[test]
     fn register_keeps_state_when_shape_matches() {
         let h = new();
-        register(&h, "u", 2);
+        register(&h, "u", &addrs_helper(2));
         let c = cfg(1, 10, 60);
         record_failure(&h, "u", 1, &c, 100);
         assert!(!is_healthy(&h, "u", 1, 100));
-        // Reload with the same peer count: down state survives.
-        register(&h, "u", 2);
+        // Reload with the same addresses (same order): down state survives.
+        register(&h, "u", &addrs_helper(2));
         assert!(!is_healthy(&h, "u", 1, 100));
-        // Reload with a different peer count: fresh state.
-        register(&h, "u", 3);
-        assert!(is_healthy(&h, "u", 1, 100));
-        assert_eq!(healthy_indices(&h, "u", 3, 100), vec![0, 1, 2]);
+        // Reload with a brand-new address list: the replaced peer starts
+        // fresh while its neighbors keep their state by address.
+        register(&h, "u", &addrs_helper(3));
+        assert!(is_healthy(&h, "u", 2, 100));
+        assert!(!is_healthy(&h, "u", 1, 100));
+        assert_eq!(healthy_indices(&h, "u", 3, 100), vec![0, 2]);
+    }
+
+    #[test]
+    fn register_remaps_passive_state_by_address() {
+        let h = new();
+        let a = addr("127.0.0.1:9001");
+        let b = addr("127.0.0.1:9002");
+        let c = addr("127.0.0.1:9003");
+        register(&h, "u", &[a, b]);
+        let cfg = cfg(1, 10, 60); // one failure is enough to trip the peer
+        record_failure(&h, "u", 0, &cfg, 100);
+        assert!(!is_healthy(&h, "u", 0, 100));
+        // Reordered peer list: `a` keeps its down state at the new index,
+        // `b` is untouched, `c` is brand new and starts healthy.
+        register(&h, "u", &[b, a, c]);
+        assert!(is_healthy(&h, "u", 0, 100), "b must stay healthy");
+        assert!(!is_healthy(&h, "u", 1, 100), "a must still be down");
+        assert!(is_healthy(&h, "u", 2, 100), "c must start clean");
+        // The down marking still expires normally at the new index.
+        assert!(is_healthy(&h, "u", 1, 100 + 60_000));
+    }
+
+    #[test]
+    fn register_backfills_active_verdict_by_address() {
+        let h = new();
+        let a = addr("127.0.0.1:9001");
+        let b = addr("127.0.0.1:9002");
+        register(&h, "u", &[a, b]);
+        // Probe `a` down (active plane); the verdict mirrors into index 0.
+        assert!(!record_probe(&h, "u", 0, "127.0.0.1:9001", false, 1, 1));
+        assert!(!is_healthy(&h, "u", 0, 0));
+        // Re-register with `a` moved to index 1: the active judgment for
+        // the ADDRESS must follow it, and `b` stays healthy.
+        register(&h, "u", &[b, a]);
+        assert!(is_healthy(&h, "u", 0, 0));
+        assert!(!is_healthy(&h, "u", 1, 0));
     }
 
     #[test]
     fn active_threshold_transitions() {
         let h = new();
-        register(&h, "u", 1);
+        register(&h, "u", &addrs_helper(1));
         let addr = "127.0.0.1:9001";
         // One failure is below the unhealthy threshold -> still healthy.
         assert!(record_probe(&h, "u", 0, addr, false, 2, 2));
@@ -465,7 +594,7 @@ mod tests {
     #[test]
     fn active_success_resets_fail_counter() {
         let h = new();
-        register(&h, "u", 1);
+        register(&h, "u", &addrs_helper(1));
         let addr = "127.0.0.1:9001";
         // fail, success, fail: never two failures in a row, so the peer
         // stays up throughout. The success resets the failure counter and
@@ -494,7 +623,7 @@ mod tests {
     #[test]
     fn active_and_passive_planes_both_required() {
         let h = new();
-        register(&h, "u", 1);
+        register(&h, "u", &addrs_helper(1));
         let addr = "127.0.0.1:9001";
         // Passive down (max_fails=1 trips immediately) + active ok -> down.
         let c = cfg(1, 10, 10);
@@ -523,7 +652,7 @@ mod tests {
     #[test]
     fn active_peers_sorted_and_deterministic() {
         let h = new();
-        register(&h, "u", 2);
+        register(&h, "u", &addrs_helper(2));
         record_probe(&h, "u", 0, "127.0.0.1:9001", false, 2, 2);
         record_probe(&h, "u", 0, "127.0.0.1:9001", false, 2, 2); // down
         record_probe(&h, "u", 1, "127.0.0.1:9002", true, 2, 2);

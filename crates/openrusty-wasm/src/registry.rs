@@ -5,11 +5,12 @@
 //! whole reload and keeps the previous snapshot. Per-plugin shared state
 //! (KV, error counters) is carried over by plugin name.
 
+use crate::epoch::EpochTicker;
 use crate::host_state::HostState;
 use crate::instance::HostData;
 use crate::linker::build_linker;
 use crate::registry_validate::{discover, load_plugins};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use openrusty_core::config::{Config, FailPolicy};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +38,11 @@ pub struct PluginSnapshot {
     pub plugins: Vec<Arc<LoadedPlugin>>,
 }
 
+/// How many times a reload rebuilds + retries its publish before giving up
+/// with [`ReloadError::Conflict`] (each retry observes the latest snapshot,
+/// so the winner's work is never repeated more than necessary).
+const RELOAD_ATTEMPTS: usize = 3;
+
 /// Reload failure; the previous snapshot is untouched in every case.
 #[derive(Debug, Error)]
 pub enum ReloadError {
@@ -46,17 +52,23 @@ pub enum ReloadError {
     Compile { plugin: String, detail: String },
     #[error("abi validation failed for plugin {plugin}: {detail}")]
     Abi { plugin: String, detail: String },
+    /// The publish race against a concurrent reload was lost repeatedly;
+    /// the current snapshot is untouched and the caller may simply retry.
+    #[error("reload conflict: concurrent reload kept publishing first")]
+    Conflict,
 }
 
-/// Engine with epoch interruption (required for phase timeouts).
-pub fn new_engine() -> Result<Engine, wasmtime::Error> {
+/// Engine with epoch interruption (required for phase timeouts) plus its
+/// epoch ticker. Dropping the ticker stops and joins the bump thread, so
+/// an engine built here never leaks it.
+pub fn new_engine() -> Result<EpochTicker, wasmtime::Error> {
     let mut cfg = wasmtime::Config::new();
     cfg.epoch_interruption(true);
-    Engine::new(&cfg)
+    Ok(EpochTicker::new(Engine::new(&cfg)?))
 }
 
 pub struct PluginRegistry {
-    engine: Engine,
+    ticker: EpochTicker,
     linker: Linker<HostData>,
     swap: ArcSwap<PluginSnapshot>,
 }
@@ -66,10 +78,11 @@ impl PluginRegistry {
     /// A missing or empty directory is not fatal: an empty snapshot
     /// (generation 0) is published and a warning is logged.
     pub fn bootstrap(cfg: &Config) -> Result<Arc<Self>, ReloadError> {
-        let engine = new_engine().map_err(|e| ReloadError::Abi {
+        let ticker = new_engine().map_err(|e| ReloadError::Abi {
             plugin: "engine".into(),
             detail: e.to_string(),
         })?;
+        let engine = ticker.engine().clone();
         let linker = build_linker(&engine).map_err(|e| ReloadError::Abi {
             plugin: "linker".into(),
             detail: e.to_string(),
@@ -100,14 +113,14 @@ impl PluginRegistry {
             }
         };
         Ok(Arc::new(PluginRegistry {
-            engine,
+            ticker,
             linker,
             swap: ArcSwap::from_pointee(snap),
         }))
     }
 
     pub fn engine(&self) -> &Engine {
-        &self.engine
+        self.ticker.engine()
     }
 
     pub fn linker(&self) -> &Linker<HostData> {
@@ -122,33 +135,48 @@ impl PluginRegistry {
     /// request path, and atomically publish a new snapshot. Any failure
     /// returns Err and leaves the current snapshot untouched. Returns the
     /// new generation number.
+    ///
+    /// Concurrent reloads are safe: the snapshot is built from the
+    /// generation observed at build start and published with a
+    /// compare-and-swap on that exact snapshot. If another reload won the
+    /// race meanwhile, the whole build is redone against the fresh
+    /// snapshot (bounded by [`RELOAD_ATTEMPTS`], then `Conflict`).
     pub async fn reload(&self, cfg: &Config) -> Result<u64, ReloadError> {
-        let prev = self.swap.load_full();
-        let engine = self.engine.clone();
-        let linker = self.linker.clone();
-        let cfg = cfg.clone();
-        let work = move || -> Result<PluginSnapshot, ReloadError> {
-            let dir = PathBuf::from(&cfg.plugins.dir);
-            let names = discover(&dir)?;
-            let ordered = order_plugins(&names, &cfg.plugins.order);
-            let plugins = load_plugins(&engine, &linker, &cfg, &dir, &ordered, Some(&prev))?;
-            Ok(PluginSnapshot {
-                generation: prev.generation + 1,
-                plugins,
-            })
-        };
-        // Compile off the async worker; fall back to inline when there is
-        // no tokio runtime (e.g. sync callers in tests).
-        let snap = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::spawn_blocking(work)
-                .await
-                .map_err(|e| ReloadError::Io(e.to_string()))??
-        } else {
-            work()?
-        };
-        let generation = snap.generation;
-        self.swap.store(Arc::new(snap));
-        Ok(generation)
+        for _ in 0..RELOAD_ATTEMPTS {
+            let current = self.swap.load_full();
+            let engine = self.ticker.engine().clone();
+            let linker = self.linker.clone();
+            let cfg = cfg.clone();
+            let build_from = Arc::clone(&current);
+            let work = move || -> Result<PluginSnapshot, ReloadError> {
+                let dir = PathBuf::from(&cfg.plugins.dir);
+                let names = discover(&dir)?;
+                let ordered = order_plugins(&names, &cfg.plugins.order);
+                let plugins = load_plugins(&engine, &linker, &cfg, &dir, &ordered, Some(&build_from))?;
+                Ok(PluginSnapshot {
+                    generation: build_from.generation + 1,
+                    plugins,
+                })
+            };
+            // Compile off the async worker; fall back to inline when there
+            // is no tokio runtime (e.g. sync callers in tests).
+            let snap = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::spawn_blocking(work)
+                    .await
+                    .map_err(|e| ReloadError::Io(e.to_string()))??
+            } else {
+                work()?
+            };
+            let generation = snap.generation;
+            // Publish only if nobody else reloaded in the meantime; the
+            // returned guard holds the previous snapshot either way.
+            let published = self.swap.compare_and_swap(&current, Arc::new(snap));
+            if Arc::ptr_eq(&Guard::into_inner(published), &current) {
+                return Ok(generation);
+            }
+            tracing::debug!("reload lost the publish race; rebuilding");
+        }
+        Err(ReloadError::Conflict)
     }
 
     /// `(plugin name, error_count)` for the current snapshot.
@@ -166,13 +194,7 @@ impl PluginRegistry {
         self.snapshot()
             .plugins
             .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    p.state.error_kinds(),
-                    p.state.kv_len(),
-                )
-            })
+            .map(|p| (p.name.clone(), p.state.error_kinds(), p.state.kv_len()))
             .collect()
     }
 }
@@ -334,6 +356,56 @@ mod tests {
         let snap = reg.snapshot();
         let names: Vec<&str> = snap.plugins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["a", "c"]);
+    }
+
+    /// Regression: concurrent reloads must publish one generation per
+    /// success (never a stale last-writer-wins generation), and the final
+    /// snapshot must be internally consistent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reloads_publish_one_generation_each() {
+        let dir = TmpDir::new("registry-race");
+        dir.write("a.wasm", OK_WAT.as_bytes());
+        dir.write("b.wasm", OK_WAT.as_bytes());
+        let reg = PluginRegistry::bootstrap(&test_cfg(dir.0.to_str().unwrap(), &[])).unwrap();
+        assert_eq!(reg.snapshot().generation, 1);
+
+        const N: usize = 8;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            // Different configs (per-reload plugin orders) so each reload
+            // really builds its own snapshot.
+            let order: Vec<&str> = if i % 2 == 0 {
+                vec!["b", "a"]
+            } else {
+                vec!["a", "b"]
+            };
+            let cfg = test_cfg(dir.0.to_str().unwrap(), &order);
+            let reg = Arc::clone(&reg);
+            handles.push(tokio::spawn(async move { reg.reload(&cfg).await }));
+        }
+
+        // JoinHandle::await yields Result<Result<u64, ReloadError>>; only
+        // the inner Ok counts as a published generation.
+        let mut succeeded = 0u64;
+        for h in handles {
+            if matches!(h.await, Ok(Ok(_))) {
+                succeeded += 1;
+            }
+        }
+        assert!(
+            succeeded >= 1,
+            "at least one concurrent reload must win the publish race"
+        );
+
+        let snap = reg.snapshot();
+        assert_eq!(
+            snap.generation,
+            1 + succeeded,
+            "every successful reload must advance the generation by exactly one"
+        );
+        assert_eq!(snap.plugins.len(), 2);
+        let names: Vec<&str> = snap.plugins.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b"));
     }
 
     #[tokio::test]

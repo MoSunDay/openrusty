@@ -24,8 +24,11 @@ pub mod health;
 pub mod upstream;
 
 pub use balancer::{ip_hash_pick, swrr_next};
-pub use client::{get, new_pool, ClientPool, HttpBody, HttpClient};
-pub use forward::{forward, tunnel, ForwardError, ForwardRequest};
+pub use client::{evict_except, get, new_pool, ClientPool, HttpBody, HttpClient};
+pub use forward::{
+    failure_kind, forward, is_idempotent, may_retry, merge_xff, tunnel, FailureKind, ForwardError,
+    ForwardRequest,
+};
 pub use health::{
     active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
     is_healthy, new, record_failure, record_probe, record_success, register, HealthRegistry,

@@ -1,0 +1,13 @@
+error: #[phase] handler must take no parameters; phases are invoked as `fn() -> Decision`
+ --> tests/ui/phase_fail/bad_signature.rs:5:15
+  |
+5 | fn on_content(_req: u32) {}
+  |               ^^^^^^^^^
+
+error: #[phase] handler must return Decision (openrusty_sdk::Decision)
+ --> tests/ui/phase_fail/bad_signature.rs:4:1
+  |
+4 | #[openrusty_sdk::phase(content)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `openrusty_sdk::phase` (in Nightly builds, run with -Z macro-backtrace for more info)

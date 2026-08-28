@@ -47,8 +47,15 @@ pub(crate) fn link(linker: &mut Linker<HostData>) -> Result<(), wasmtime::Error>
             let Some(val) = mem::read_guest(&mut caller, val_ptr, val_len) else {
                 return -1;
             };
-            caller.data().state.kv_set(&key, val, ttl_ms);
-            0
+            // 0 on success; -1 when the write is refused by the per-plugin
+            // KV quotas (value over 64 KiB, or live total over 1 MiB) - the
+            // same failure marker as an unreadable pointer. A refused set
+            // leaves the store untouched.
+            if caller.data().state.kv_set(&key, val, ttl_ms) {
+                0
+            } else {
+                -1
+            }
         },
     )?;
 
@@ -68,9 +75,10 @@ pub(crate) fn link(linker: &mut Linker<HostData>) -> Result<(), wasmtime::Error>
         abi::KV_SCAN_BEGIN,
         |mut caller: Caller<'_, HostData>, prefix_ptr: i32, prefix_len: i32| -> i32 {
             let Some(prefix) = mem::read_guest(&mut caller, prefix_ptr, prefix_len) else {
-                return -1;
+                return -1; // invalid cursor: unreadable prefix
             };
-            caller.data().state.scan_begin(&prefix) as i32
+            // -1 also means the per-plugin cursor cap is full.
+            caller.data().state.scan_begin(&prefix)
         },
     )?;
 

@@ -17,27 +17,53 @@ pub struct ReloadReport {
     pub plugins: Vec<String>,
 }
 
+/// Why a reload did not run to completion.
+#[derive(Debug)]
+pub enum ReloadError {
+    /// Another reload is already running: SIGHUP and the HTTP endpoint
+    /// share one gate, so concurrent requests are rejected, not queued.
+    InFlight,
+    /// The reload itself failed; the previous runtime stays in effect.
+    Failed(String),
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReloadError::InFlight => f.write_str("reload already in progress"),
+            ReloadError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Run one full reload cycle against `state.config_path`.
 ///
-/// Any error is returned as a plain message and nothing changed: the
-/// previous plugin snapshot and runtime stay in effect.
-pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, String> {
+/// Reloads are serialized: whoever gets the gate first runs the whole cycle
+/// (config + plugins + runtime swap + probe task swap) inside it, so a
+/// reload can never race another one, and the probe task handle is taken,
+/// aborted and replaced in the same critical section as the snapshot swap.
+/// A second requester gets [`ReloadError::InFlight`].
+///
+/// Any [`ReloadError::Failed`] means nothing changed: the previous plugin
+/// snapshot and runtime stay in effect.
+pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> {
+    let _gate = state.reload_gate.try_lock().map_err(|_| ReloadError::InFlight)?;
     let path = state.config_path.clone();
     let cfg = tokio::task::spawn_blocking(move || load_config(&path))
         .await
-        .map_err(|e| format!("reload task failed: {e}"))?
-        .map_err(|e| format!("config: {e}"))?;
+        .map_err(|e| ReloadError::Failed(format!("reload task failed: {e}")))?
+        .map_err(|e| ReloadError::Failed(format!("config: {e}")))?;
 
     // Compiles off the request path; Err leaves the old snapshot in place.
     let generation = state
         .registry
         .reload(&cfg)
         .await
-        .map_err(|e| format!("plugins: {e}"))?;
+        .map_err(|e| ReloadError::Failed(format!("plugins: {e}")))?;
 
-    // Plugins are already published; now swap the runtime to match.
+    // Plugins are already published; now swap the runtime to match, then
+    // re-arm active probing -- both inside the reload gate.
     apply_runtime(state, &cfg, generation);
-    // Active probing follows the new runtime (interval, enabled set).
     crate::active_probe::spawn(state);
 
     let plugins = state
@@ -87,7 +113,8 @@ mod tests {
         // Corrupt the module; the whole reload must fail atomically.
         dir.write_plugin("p.wasm", b"garbage");
         let err = reload(&state).await.unwrap_err();
-        assert!(err.contains("plugins"), "got: {err}");
+        assert!(err.to_string().contains("plugins"), "got: {err}");
+        assert!(matches!(err, ReloadError::Failed(_)));
         assert_eq!(state.runtime.load().generation, 2);
         assert_eq!(state.registry.snapshot().generation, 2);
         assert_eq!(state.registry.snapshot().plugins.len(), 1);
@@ -107,7 +134,30 @@ mod tests {
             .replace("upstream = \"u\"", "upstream = \"ghost\"");
         dir.write_config(&bad);
         let err = reload(&state).await.unwrap_err();
-        assert!(err.contains("config"), "got: {err}");
+        assert!(err.to_string().contains("config"), "got: {err}");
+        assert!(matches!(err, ReloadError::Failed(_)));
         assert_eq!(state.runtime.load().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn second_reload_while_one_is_running_is_rejected() {
+        let dir = TmpDir::new("reload-inflight");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+
+        // Hold the gate exactly like an in-flight reload would.
+        let _held = state.reload_gate.try_lock().unwrap();
+        let err = reload(&state).await.unwrap_err();
+        assert!(matches!(err, ReloadError::InFlight), "got: {err:?}");
+        assert_eq!(err.to_string(), "reload already in progress");
+        // Nothing happened: the boot generation is untouched.
+        assert_eq!(state.runtime.load().generation, 1);
+        assert_eq!(state.registry.snapshot().generation, 1);
+
+        // Once the gate is released the reload works again.
+        drop(_held);
+        let report = reload(&state).await.unwrap();
+        assert_eq!(report.generation, 2);
     }
 }

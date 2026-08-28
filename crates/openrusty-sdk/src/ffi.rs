@@ -147,28 +147,42 @@ pub unsafe fn cfg_get(_kp: i32, _kl: i32, _op: i32, _oc: i32) -> i32 {
     0
 }
 
+/// Upper bound for a single host read: the guest's scratch arena is
+/// [`crate::alloc_heap::HEAP_SIZE`] (1 MiB), so a host requirement above
+/// it can never be satisfied -- growing that far would exhaust the arena
+/// and trap the guest. A real guest also shares the arena with its own
+/// state, so the cap is an upper bound, not a target.
+const MAX_READ_LEN: usize = crate::alloc_heap::HEAP_SIZE;
+
 /// Two-phase read convention (docs/wasm-abi.md): `ret >= 0` means `ret`
 /// bytes were written into the provided buffer; `ret < 0` means the buffer
 /// was too small and `-ret` is the required capacity.
 ///
 /// Starts with a 256-byte buffer and retries at most 3 times total.
+/// Read limit: requirements above the 1 MiB guest scratch arena
+/// ([`MAX_READ_LEN`]) fail cleanly with `None` instead of growing into an
+/// arena OOM trap. The same defensive `None` covers a misbehaving host:
+/// a demand with no growth, or `i32::MIN` whose negation would overflow
+/// `i32` (sizes are negated in `i64` first, so it cannot panic).
 /// Returns `None` if the host never succeeds or reports an unreasonable
 /// size. Pure with respect to the closure, which keeps it testable.
 ///
 /// # Safety
 /// `read` must treat its arguments as (out_ptr, out_cap) of a valid buffer.
-pub unsafe fn read_two_phase(read: impl Fn(i32, i32) -> i32) -> Option<Vec<u8>> {
-    const MAX_LEN: usize = 16 * 1024 * 1024;
-    let mut buf = alloc::vec![0u8; 256];
+pub unsafe fn read_two_phase(mut read: impl FnMut(i32, i32) -> i32) -> Option<Vec<u8>> {
+    const START_LEN: usize = 256;
+    let mut buf = alloc::vec![0u8; START_LEN];
     for _attempt in 0..3 {
         let ret = read(buf.as_mut_ptr() as i32, buf.len() as i32);
         if ret >= 0 {
             buf.truncate(ret as usize);
             return Some(buf);
         }
-        let need = (-ret) as usize;
-        // Guard against hosts reporting no growth or absurd sizes.
-        if need <= buf.len() || need > MAX_LEN {
+        // Negate in i64: `ret == i32::MIN` must not overflow a plain `-ret`.
+        let need = (-(ret as i64)) as usize;
+        // Guard against hosts reporting no growth, or more than the guest
+        // scratch arena (see MAX_READ_LEN) can ever hold.
+        if need <= buf.len() || need > MAX_READ_LEN {
             return None;
         }
         buf.resize(need, 0);
@@ -227,5 +241,78 @@ mod tests {
         };
         assert!(buf.is_none());
         assert!(calls.get() <= 3);
+    }
+
+    #[test]
+    fn two_phase_satisfies_demand_up_to_arena_size() {
+        let calls = Cell::new(0);
+        let seen_cap = Cell::new(0i32);
+        let buf = unsafe {
+            read_two_phase(|_out, cap| {
+                calls.set(calls.get() + 1);
+                seen_cap.set(cap);
+                if cap < crate::alloc_heap::HEAP_SIZE as i32 {
+                    -(crate::alloc_heap::HEAP_SIZE as i32)
+                } else {
+                    crate::alloc_heap::HEAP_SIZE as i32
+                }
+            })
+        };
+        assert_eq!(calls.get(), 2);
+        assert_eq!(seen_cap.get(), crate::alloc_heap::HEAP_SIZE as i32);
+        assert_eq!(buf.map(|b| b.len()), Some(crate::alloc_heap::HEAP_SIZE));
+    }
+
+    #[test]
+    fn two_phase_refuses_demand_beyond_arena() {
+        let calls = Cell::new(0);
+        let buf = unsafe {
+            read_two_phase(|_out, _cap| {
+                calls.set(calls.get() + 1);
+                -(crate::alloc_heap::HEAP_SIZE as i64 + 1) as i32
+            })
+        };
+        // Clean refusal: no retry, no 1 MiB+ allocation, no arena OOM trap.
+        assert!(buf.is_none());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn two_phase_growth_never_exceeds_arena_cap() {
+        let calls = Cell::new(0);
+        let max_cap = Cell::new(0i32);
+        let buf = unsafe {
+            read_two_phase(|_out, cap| {
+                calls.set(calls.get() + 1);
+                if cap > max_cap.get() {
+                    max_cap.set(cap);
+                }
+                // Escalating demands, the second one past the arena cap.
+                if cap < 4096 {
+                    -4096
+                } else {
+                    -(crate::alloc_heap::HEAP_SIZE as i64 + 7) as i32
+                }
+            })
+        };
+        assert!(buf.is_none());
+        assert_eq!(calls.get(), 2);
+        assert!(max_cap.get() <= crate::alloc_heap::HEAP_SIZE as i32);
+    }
+
+    #[test]
+    fn two_phase_survives_i32_min_demand() {
+        // Hostile host: `-(i32::MIN)` overflows i32, so the negation must go
+        // through i64 and land in the "unreasonable size" bucket instead of
+        // panicking (debug) or wrapping (release).
+        let calls = Cell::new(0);
+        let buf = unsafe {
+            read_two_phase(|_out, _cap| {
+                calls.set(calls.get() + 1);
+                i32::MIN
+            })
+        };
+        assert!(buf.is_none());
+        assert_eq!(calls.get(), 1);
     }
 }

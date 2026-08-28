@@ -33,6 +33,12 @@ orr_on_phase(phase: i32, ctx: i32) -> i32
 | `100..=599` | deny: abort the request with this HTTP status |
 | anything else | protocol error – treated per `on_failure` policy |
 
+Denying with a status outside `100..=599` has no wire representation: such a
+`Deny` must be returned as `-1` (NGX_ERROR). SDKs encode an out-of-range
+`Deny` as `-1` automatically. The host treats `-1` (like any code outside
+the table) as a bad code and applies the plugin `on_failure` policy; it is
+never decoded as `Deny(0)` or an HTTP status.
+
 ## Phases
 
 | id | name | runs |
@@ -67,6 +73,10 @@ Two-phase reads: the host writes into a guest-provided buffer.
 - Return `< 0`: buffer too small; `-ret` is the required length (grow, retry).
   Exception: `req_peer_get` returns `-2` for an out-of-range index (nothing is
   written; not a required length).
+- Guest-side cap: one read can never exceed the SDK's 1 MiB scratch arena
+  (`HEAP_SIZE`). A host requirement above the cap fails cleanly (the SDK
+  wrapper returns `None`) instead of growing the buffer into an arena
+  exhaustion trap.
 
 `kv_get` returns `0` for a missing key (empty values are indistinguishable
 from absent; plugins must not store empty values). Strings are raw UTF-8
@@ -90,11 +100,23 @@ balancer_set_peer(idx: i32) -> i32          # 0 ok, -1 out of bounds (no health 
 kv_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
   0 = not found
 kv_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32, ttl_ms: i64) -> i32
+  0 = stored; -1 = refused (value over 64 KiB, or the plugin's live KV total
+  of key+value bytes would exceed 1 MiB, or an unreadable pointer); a refused
+  set leaves the store unchanged
 kv_del(key_ptr: i32, key_len: i32) -> i32
-kv_scan_begin(prefix_ptr: i32, prefix_len: i32) -> i32   # cursor id >= 0
+kv_scan_begin(prefix_ptr: i32, prefix_len: i32) -> i32
+  cursor id >= 0; -1 = no cursor (unreadable prefix, or the per-plugin
+  cursor cap of 64 live cursors is full)
 kv_scan_next(cursor: i32, out_ptr: i32, out_cap: i32) -> i32
-  writes one TLV pair (key, value); 0 = exhausted; negative = invalid cursor
+  writes one TLV pair (key, value); 0 = exhausted;
+  -1 = cursor invalid/expired (dead: stop iterating; do not end it again);
+  any other negative value = -(required capacity): grow the buffer and
+  retry the same element; the cursor stays valid (the host consumes the
+  entry only once the guest actually received it)
 kv_scan_end(cursor: i32)
+
+kv_scan cursors are snapshot-based; a cursor idle for more than 60 s is
+reclaimed automatically, so a guest that abandons a scan cannot leak it.
 
 resp_header_get(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32) -> i32
 resp_header_set(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32) -> i32
@@ -117,8 +139,14 @@ the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
 
 ## Timeouts & memory
 
-- Each phase call runs under wasmtime epoch interruption; a watchdog bumps the
-  engine epoch after `plugins.timeout_ms`. Traps never crash the host.
+- Each phase call runs under wasmtime epoch interruption, driven by an
+  engine-scoped epoch ticker: one background thread per engine bumps the
+  engine epoch every 10 ms, and every call sets its own relative epoch
+  deadline at start (`plugins.timeout_ms`), so a call is never cut short by
+  a stale watchdog from an earlier one. Traps never crash the host.
+- Module instantiation is bounded the same way: a 5-second epoch deadline,
+  so a non-terminating start section fails loading with an
+  instantiation-timeout error instead of hanging the gateway.
 - `StoreLimits` caps instance memory at `plugins.max_memory_mb`; growing past
   it traps and is handled by the failure policy.
 - `on_failure = fail_open` (default): trap/timeout -> decision Declined, the
@@ -134,3 +162,7 @@ the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
   `Arc`. Per-plugin shared state (KV store) survives reloads keyed by plugin
   name, and upstream health survives reloads keyed by upstream name (peer
   state is kept when the peer list shape is unchanged).
+- Concurrent reloads publish via compare-and-swap: every success advances
+  the snapshot generation by exactly one. A reload that loses the publish
+  race rebuilds against the fresh snapshot (3 attempts) and then fails with
+  a conflict error, leaving the previous snapshot untouched.

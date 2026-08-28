@@ -78,6 +78,7 @@ fn ctx() -> ReqCtx {
         upstream: Some("vllm".into()),
         peer_index: None,
         attempts: 0,
+        tried: Vec::new(),
     }
 }
 
@@ -144,9 +145,7 @@ fn body_is_pushed_to_late_instantiated_plugins() {
     // First run with no body: the instance is created here.
     assert_eq!(sess.run_phase(Phase::Balancer), Decision::Declined);
     // Second run seeds the body: the live instance must see it now.
-    sess.set_req_body(bytes::Bytes::from_static(
-        br#"{"cache_salt":"late:s1"}"#,
-    ));
+    sess.set_req_body(bytes::Bytes::from_static(br#"{"cache_salt":"late:s1"}"#));
     sess.run_phase(Phase::Balancer);
     assert!(
         sess.ctx().peer_index.is_some(),

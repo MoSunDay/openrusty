@@ -67,6 +67,19 @@ pub fn get(
     client
 }
 
+/// Evict the pooled clients of addresses that are no longer configured.
+///
+/// Called by the reload path (`apply_runtime`): a client left behind for a
+/// removed peer would keep its keep-alive connections (and file
+/// descriptors) alive until the idle timer fires, and an address reuse by
+/// another process would otherwise silently reuse the stale client.
+pub fn evict_except(pool: &ClientPool, keep: &[SocketAddr]) {
+    pool.clients
+        .lock()
+        .unwrap()
+        .retain(|addr, _| keep.contains(addr));
+}
+
 /// Build one HTTP/1 client with a bounded connect and a bounded keep-alive
 /// pool drained by its own background timer.
 fn build(connect_timeout: Duration, pool_idle_timeout: Duration) -> HttpClient {
@@ -97,5 +110,34 @@ mod tests {
         let _ = get(&pool, b, connect_timeout, idle_timeout);
         // Two cached entries after touching two addresses.
         assert_eq!(pool.clients.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn evict_drops_removed_addrs_keeps_live_and_allows_new() {
+        let pool = new_pool();
+        let a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let ct = Duration::from_millis(250);
+        let it = Duration::from_secs(30);
+        let _ = get(&pool, a, ct, it);
+        let _ = get(&pool, b, ct, it);
+        assert_eq!(pool.clients.lock().unwrap().len(), 2);
+
+        // Apply the new address set {a, c}: `b` is gone, `a` survives.
+        evict_except(&pool, &[a, c]);
+        {
+            let clients = pool.clients.lock().unwrap();
+            assert!(!clients.contains_key(&b), "removed addr must be evicted");
+            assert!(clients.contains_key(&a), "kept addr must survive");
+            assert_eq!(clients.len(), 1);
+        }
+        // The kept address still hands out its pooled client.
+        let _ = get(&pool, a, ct, it);
+        // The new address works like any first `get`.
+        let _c_client = get(&pool, c, ct, it);
+        assert_eq!(pool.clients.lock().unwrap().len(), 2);
+        evict_except(&pool, &[]);
+        assert!(pool.clients.lock().unwrap().is_empty());
     }
 }

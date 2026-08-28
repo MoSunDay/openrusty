@@ -1,14 +1,22 @@
 //! Execute one phase in one plugin instance under timeout + failure policy.
 //!
-//! Timeouts use wasmtime epoch interruption: a watchdog task bumps the
-//! engine epoch after `timeout`, and the store traps at its deadline.
+//! Timeouts use wasmtime epoch interruption: an engine-scoped ticker
+//! ([`crate::epoch`]) bumps the engine epoch every `TICK_MS`, and every
+//! call sets its own store deadline (`set_epoch_deadline`) covering
+//! exactly its own timeout window.
 
 use crate::abi;
+use crate::epoch::ticks_for;
 use crate::instance::HostData;
 use openrusty_core::config::FailPolicy;
 use openrusty_core::phase::{Decision, Phase};
 use std::time::Duration;
 use wasmtime::{Engine, Linker, Memory, Module, Store, StoreLimitsBuilder, Trap, TypedFunc};
+
+/// Epoch budget for instantiating a module (the phase-call timeout does not
+/// exist yet at that point). A module whose start section loops forever
+/// must fail the instantiation instead of hanging it.
+const INSTANTIATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One instantiated plugin, ready to run phases for one request.
 pub struct PluginRt {
@@ -39,12 +47,35 @@ impl PluginRt {
 }
 
 /// Instantiate `module` for one request with a per-store memory ceiling.
+///
+/// Instantiation is bounded by [`INSTANTIATE_TIMEOUT`] (the epoch must be
+/// advancing for the budget to fire): a `(start (loop (br 0)))` module
+/// fails with an epoch trap instead of hanging the caller.
 pub fn instantiate(
     engine: &Engine,
     linker: &Linker<HostData>,
     module: &Module,
     host_data: HostData,
     memory_limit_mb: u32,
+) -> Result<PluginRt, wasmtime::Error> {
+    instantiate_with_budget(
+        engine,
+        linker,
+        module,
+        host_data,
+        memory_limit_mb,
+        INSTANTIATE_TIMEOUT,
+    )
+}
+
+/// [`instantiate`] with an explicit instantiation epoch budget.
+pub fn instantiate_with_budget(
+    engine: &Engine,
+    linker: &Linker<HostData>,
+    module: &Module,
+    host_data: HostData,
+    memory_limit_mb: u32,
+    budget: Duration,
 ) -> Result<PluginRt, wasmtime::Error> {
     let mut host_data = host_data;
     host_data.limits = StoreLimitsBuilder::new()
@@ -54,7 +85,7 @@ pub fn instantiate(
     let mut store = Store::new(engine, host_data);
     store.limiter(|d| &mut d.limits);
     store.epoch_deadline_trap();
-    store.set_epoch_deadline(1);
+    store.set_epoch_deadline(ticks_for(budget));
     let inst = linker.instantiate(&mut store, module)?;
     let on_phase = inst.get_typed_func::<(i32, i32), i32>(&mut store, abi::EXPORT_ON_PHASE)?;
     let alloc = inst.get_typed_func::<i32, i32>(&mut store, abi::EXPORT_ALLOC)?;
@@ -97,14 +128,8 @@ pub fn fallback_decision(policy: FailPolicy) -> Decision {
 
 /// Run one phase and map any failure through `policy`. Errors are logged
 /// and counted on the plugin's shared state.
-pub fn run_phase(
-    rt: &mut PluginRt,
-    engine: &Engine,
-    timeout: Duration,
-    policy: FailPolicy,
-    phase: Phase,
-) -> Decision {
-    match run_phase_outcome(rt, engine, timeout, phase) {
+pub fn run_phase(rt: &mut PluginRt, timeout: Duration, policy: FailPolicy, phase: Phase) -> Decision {
+    match run_phase_outcome(rt, timeout, phase) {
         PhaseOutcome::Decision(d) => d,
         PhaseOutcome::Error { plugin, kind } => {
             let fallback = fallback_decision(policy);
@@ -122,19 +147,12 @@ pub fn run_phase(
 
 /// Run one phase, distinguishing decisions from error kinds. Every error
 /// path records an error on the plugin's shared state.
-pub fn run_phase_outcome(
-    rt: &mut PluginRt,
-    engine: &Engine,
-    timeout: Duration,
-    phase: Phase,
-) -> PhaseOutcome {
+pub fn run_phase_outcome(rt: &mut PluginRt, timeout: Duration, phase: Phase) -> PhaseOutcome {
     let plugin = rt.store.data().state.name().to_string();
-    // Rebase the deadline: also shields this call from a watchdog bump that
-    // a previous (already returned) call's watchdog may still fire. A bump
-    // arriving from an unrelated stale watchdog during THIS call can still
-    // trap it early; that collateral risk is accepted in v1.
-    rt.store.set_epoch_deadline(1);
-    arm_watchdog(engine, timeout);
+    // The deadline is computed at call start against the engine-scoped
+    // ticker: it covers exactly this call's window, so no stale timer from
+    // a previous (or concurrent) call can shorten it.
+    rt.store.set_epoch_deadline(ticks_for(timeout));
     let result = rt.on_phase.call(&mut rt.store, (phase as i32, 0));
     match result {
         Ok(code) => match Decision::from_abi(code) {
@@ -165,31 +183,14 @@ pub fn run_phase_outcome(
     }
 }
 
-/// Spawn a watchdog that bumps the engine epoch after `timeout`. Runs only
-/// inside a tokio runtime; without one (e.g. plain unit tests) the call
-/// proceeds without a watchdog.
-///
-/// The watchdog cannot be cancelled once spawned: if the wasm call returns
-/// first, the bump may still fire later. Each call rebases its deadline
-/// before running, so a stale bump at worst shortens the NEXT call by one
-/// epoch increment worth of work (documented collateral in run_phase_outcome).
-fn arm_watchdog(engine: &Engine, timeout: Duration) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let engine = engine.clone();
-    handle.spawn(async move {
-        tokio::time::sleep(timeout).await;
-        engine.increment_epoch();
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch::{EpochTicker, TICK_MS};
     use crate::host_state::HostState;
     use crate::instance::new_host_data;
     use crate::linker::build_linker;
+    use crate::registry::new_engine;
     use openrusty_core::ReqCtx;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -237,10 +238,45 @@ mod tests {
   (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
 "#;
 
-    fn engine() -> Engine {
-        let mut cfg = wasmtime::Config::new();
-        cfg.epoch_interruption(true);
-        Engine::new(&cfg).unwrap()
+    /// Busy loop gated on the host clock: runs for a deterministic ~600ms
+    /// wall window regardless of machine speed, so it always overlaps the
+    /// slow session's 300ms timeout and still finishes far inside its own
+    /// multi-second budget.
+    const BUSY_MOD: &str = r#"
+(module
+  (import "openrusty" "host_now_ms" (func $now (result i64)))
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (local $deadline i64)
+    (local.set $deadline (i64.add (call $now) (i64.const 600)))
+    (loop $l (br_if $l (i64.lt_s (call $now) (local.get $deadline))))
+    i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
+  (memory (export "memory") 1))
+"#;
+
+    fn test_ticker() -> EpochTicker {
+        new_engine().unwrap()
+    }
+
+    /// One instance on `engine`, ready for a phase run.
+    fn rt_on(engine: &Engine, src: &str, mem_mb: u32) -> PluginRt {
+        let linker = build_linker(engine).unwrap();
+        let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
+        let host = new_host_data(
+            ctx(),
+            Vec::new(),
+            Arc::new(HostState::new("t".into())),
+            Arc::new(HashMap::new()),
+        );
+        instantiate(engine, &linker, &module, host, mem_mb).unwrap()
+    }
+
+    /// A ticker plus one instance on its engine. The ticker MUST stay
+    /// alive while the instance is used (it owns the epoch bumps).
+    fn setup(src: &str, mem_mb: u32) -> (EpochTicker, PluginRt) {
+        let ticker = test_ticker();
+        let rt = rt_on(ticker.engine(), src, mem_mb);
+        (ticker, rt)
     }
 
     fn ctx() -> ReqCtx {
@@ -255,32 +291,18 @@ mod tests {
             upstream: None,
             peer_index: None,
             attempts: 0,
+            tried: Vec::new(),
         }
-    }
-
-    fn setup(src: &str, mem_mb: u32) -> (Engine, PluginRt) {
-        let engine = engine();
-        let linker = build_linker(&engine).unwrap();
-        let module = Module::new(&engine, wat::parse_str(src).unwrap()).unwrap();
-        let host = new_host_data(
-            ctx(),
-            Vec::new(),
-            Arc::new(HostState::new("t".into())),
-            Arc::new(HashMap::new()),
-        );
-        let rt = instantiate(&engine, &linker, &module, host, mem_mb).unwrap();
-        (engine, rt)
     }
 
     const CALM: Duration = Duration::from_secs(60);
 
-    #[tokio::test]
-    async fn ok_module_returns_ok() {
-        let (engine, mut rt) = setup(OK_MOD, 16);
+    #[test]
+    fn ok_module_returns_ok() {
+        let (_ticker, mut rt) = setup(OK_MOD, 16);
         assert_eq!(
             run_phase(
                 &mut rt,
-                &engine,
                 CALM,
                 FailPolicy::FailOpen,
                 Phase::PostRead
@@ -290,35 +312,34 @@ mod tests {
         assert_eq!(rt.host_data().state.error_count(), 0);
     }
 
-    #[tokio::test]
-    async fn done_and_deny_codes() {
-        let (engine, mut rt) = setup(&ret_mod(-4), 16);
+    #[test]
+    fn done_and_deny_codes() {
+        let (_ticker, mut rt) = setup(&ret_mod(-4), 16);
         assert_eq!(
-            run_phase(&mut rt, &engine, CALM, FailPolicy::FailOpen, Phase::Content),
+            run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::Content),
             Decision::Done
         );
-        let (engine, mut rt) = setup(&ret_mod(403), 16);
+        let (_ticker, mut rt) = setup(&ret_mod(403), 16);
         assert_eq!(
-            run_phase(&mut rt, &engine, CALM, FailPolicy::FailOpen, Phase::Access),
+            run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::Access),
             Decision::Deny(403)
         );
     }
 
-    #[tokio::test]
-    async fn trap_uses_failure_policy() {
+    #[test]
+    fn trap_uses_failure_policy() {
         // fail_open -> Declined
-        let (engine, mut rt) = setup(TRAP_MOD, 16);
+        let (_ticker, mut rt) = setup(TRAP_MOD, 16);
         assert_eq!(
-            run_phase(&mut rt, &engine, CALM, FailPolicy::FailOpen, Phase::Access),
+            run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::Access),
             Decision::Declined
         );
         assert_eq!(rt.host_data().state.error_count(), 1);
         // fail_closed -> Deny(503)
-        let (engine, mut rt) = setup(TRAP_MOD, 16);
+        let (_ticker, mut rt) = setup(TRAP_MOD, 16);
         assert_eq!(
             run_phase(
                 &mut rt,
-                &engine,
                 CALM,
                 FailPolicy::FailClosed,
                 Phase::Access
@@ -328,10 +349,10 @@ mod tests {
         assert_eq!(rt.host_data().state.error_count(), 1);
     }
 
-    #[tokio::test]
-    async fn bad_code_is_protocol_error() {
-        let (engine, mut rt) = setup(&ret_mod(-2), 16);
-        let outcome = run_phase_outcome(&mut rt, &engine, CALM, Phase::Access);
+    #[test]
+    fn bad_code_is_protocol_error() {
+        let (_ticker, mut rt) = setup(&ret_mod(-2), 16);
+        let outcome = run_phase_outcome(&mut rt, CALM, Phase::Access);
         assert_eq!(
             outcome,
             PhaseOutcome::Error {
@@ -342,13 +363,12 @@ mod tests {
         assert_eq!(rt.host_data().state.error_count(), 1);
     }
 
-    // The watchdog needs a worker thread to fire while the wasm call
-    // blocks, so this test runs on a multi-thread runtime (like the real
-    // server does).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn infinite_loop_times_out() {
-        let (engine, mut rt) = setup(LOOP_MOD, 16);
-        let outcome = run_phase_outcome(&mut rt, &engine, Duration::from_millis(30), Phase::Access);
+    // The engine-scoped ticker bumps the epoch from its own thread, so the
+    // deadline fires even while the wasm call blocks this thread.
+    #[test]
+    fn infinite_loop_times_out() {
+        let (_ticker, mut rt) = setup(LOOP_MOD, 16);
+        let outcome = run_phase_outcome(&mut rt, Duration::from_millis(200), Phase::Access);
         assert_eq!(
             outcome,
             PhaseOutcome::Error {
@@ -359,12 +379,11 @@ mod tests {
         assert_eq!(rt.host_data().state.error_count(), 1);
 
         // Policy mapping on a fresh instance.
-        let (engine, mut rt) = setup(LOOP_MOD, 16);
+        let (_ticker, mut rt) = setup(LOOP_MOD, 16);
         assert_eq!(
             run_phase(
                 &mut rt,
-                &engine,
-                Duration::from_millis(30),
+                Duration::from_millis(200),
                 FailPolicy::FailClosed,
                 Phase::Access
             ),
@@ -373,15 +392,102 @@ mod tests {
         assert_eq!(rt.host_data().state.error_count(), 1);
     }
 
-    #[tokio::test]
-    async fn memory_limit_traps_grow() {
-        // 1 MiB ceiling; the guest grows one page at a time until the
-        // limiter refuses, which traps (trap_on_grow_failure).
-        let (engine, mut rt) = setup(GROW_MOD, 1);
+    /// Regression: a call that consumed (nearly) its whole timeout window
+    /// must not leave the next call with a shortened deadline. Under the
+    /// old spawn-and-forget watchdog the first call's stale bump trapped
+    /// the follow-up call almost immediately.
+    #[test]
+    fn stale_bump_does_not_shorten_the_next_call() {
+        let (_ticker, mut rt) = setup(LOOP_MOD, 16);
+        
+
+        let first_started = std::time::Instant::now();
         assert_eq!(
             run_phase(
                 &mut rt,
-                &engine,
+                Duration::from_millis(300),
+                FailPolicy::FailClosed,
+                Phase::Access
+            ),
+            Decision::Deny(503)
+        );
+        // The deadline is tick-quantized against the ticker thread's own
+        // 10ms grid (not the call's start), so a full window can complete
+        // up to one tick early in wall time; anything below
+        // `300ms - TICK_MS` would mean the trap fired before its budget.
+        assert!(
+            first_started.elapsed() >= Duration::from_millis(300 - TICK_MS),
+            "first call must consume its own window (minus tick slack), took {:?}",
+            first_started.elapsed()
+        );
+
+        // Immediately following call: must survive well past the previous
+        // call's 300ms window. Threshold is half the budget so scheduler
+        // jitter under parallel `cargo test` load cannot false-fail, while a
+        // stale bump (trap ~300ms in) still fails the assertion.
+        let second_started = std::time::Instant::now();
+        assert_eq!(
+            run_phase(
+                &mut rt,
+                Duration::from_millis(900),
+                FailPolicy::FailClosed,
+                Phase::Access
+            ),
+            Decision::Deny(503)
+        );
+        let second = second_started.elapsed();
+        assert!(
+            second >= Duration::from_millis(450),
+            "a stale bump from the previous call trapped this call early: {second:?}"
+        );
+    }
+
+    /// Regression: on one shared engine, one session timing out must leave
+    /// a concurrent session untouched; the sibling keeps running through
+    /// the slow call's timeout and completes on its own budget.
+    #[test]
+    fn concurrent_timeout_leaves_sibling_session_intact() {
+        let ticker = test_ticker();
+        let engine = ticker.engine().clone();
+        let mut slow = rt_on(&engine, LOOP_MOD, 16);
+        let mut fast = rt_on(&engine, BUSY_MOD, 16);
+
+        let fast = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let decision = run_phase(
+                &mut fast,
+                Duration::from_secs(10),
+                FailPolicy::FailClosed,
+                Phase::Access,
+            );
+            (decision, started.elapsed())
+        });
+        // Slow session times out while the busy one is still running.
+        assert_eq!(
+            run_phase(
+                &mut slow,
+                Duration::from_millis(300),
+                FailPolicy::FailClosed,
+                Phase::Access
+            ),
+            Decision::Deny(503)
+        );
+        let (decision, elapsed) = fast.join().unwrap();
+        assert_eq!(decision, Decision::Ok, "sibling session must succeed");
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "sibling must run its own full window (past the slow call's 300ms timeout), took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn memory_limit_traps_grow() {
+        // 1 MiB ceiling; the guest grows one page at a time until the
+        // limiter refuses, which traps (trap_on_grow_failure).
+        let (_ticker, mut rt) = setup(GROW_MOD, 1);
+        assert_eq!(
+            run_phase(
+                &mut rt,
                 CALM,
                 FailPolicy::FailOpen,
                 Phase::BodyFilter
@@ -389,5 +495,43 @@ mod tests {
             Decision::Declined
         );
         assert_eq!(rt.host_data().state.error_count(), 1);
+    }
+
+    /// A module whose start section loops forever must fail instantiation
+    /// with an epoch trap instead of hanging the caller forever.
+    #[test]
+    fn instantiation_of_infinite_start_module_times_out() {
+        const START_LOOP: &str = r#"
+(module
+  (start $s)
+  (func $s (loop $l (br $l)))
+  (func (export "orr_on_phase") (param i32 i32) (result i32) i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
+  (memory (export "memory") 1))
+"#;
+        let ticker = test_ticker();
+        let engine = ticker.engine();
+        let linker = build_linker(engine).unwrap();
+        let module = Module::new(engine, wat::parse_str(START_LOOP).unwrap()).unwrap();
+        let host = new_host_data(
+            ctx(),
+            Vec::new(),
+            Arc::new(HostState::new("t".into())),
+            Arc::new(HashMap::new()),
+        );
+        let started = std::time::Instant::now();
+        let err = match instantiate_with_budget(engine, &linker, &module, host, 16, Duration::from_millis(250)) {
+            Ok(_) => panic!("infinite start section must fail instantiation"),
+            Err(err) => err,
+        };
+        assert!(
+            err.downcast_ref::<Trap>() == Some(&Trap::Interrupt),
+            "expected an epoch trap, got: {err}"
+        );
+        assert!(
+            started.elapsed() <= Duration::from_secs(2),
+            "instantiation must fail within its epoch budget, took {:?}",
+            started.elapsed()
+        );
     }
 }
