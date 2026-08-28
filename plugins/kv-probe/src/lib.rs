@@ -15,7 +15,13 @@
 //! - `probe:marker`    -> marker observed by header_filter (TTL = 10s)
 //! - `probe:post_read` -> request path recorded by post_read (TTL = 10s)
 //! - `probe:rewrite`   -> request path recorded by rewrite (TTL = 10s)
-//! - `probe:body_seen` -> body_filter accumulator "<bytes>:<0|1>" (10s)
+//! - `probe:body_seen:<path><?query>`
+//!                     -> per-request body_filter accumulator
+//!                        "<bytes>:<0|1>" (TTL = 10s). The key carries the
+//!                        request identity so concurrent or repeated
+//!                        requests never alias each other's byte counts.
+//! - `probe:ws_auth`   -> Authorization header of the last /ws handshake
+//! - `probe:ws_cookie` -> Cookie header of the last /ws handshake
 //! - `probe:log_ran`   -> "1" once the log phase marked (TTL = 10s)
 //! - `probe:scan:a|b`  -> transient keys for the `scan` mode
 //!
@@ -29,6 +35,8 @@
 //! - `bodycheck`    : body_filter accumulator ended "<n>:1", n > 0
 //! - `logcheck`     : the log phase marker is present
 //! - `scan`         : kv_scan("probe:scan:") sees both scan keys
+//! - `wsheaders`    : the last /ws handshake carried the expected
+//!                    Authorization and Cookie headers
 //!
 //! Flags: `pset`/`pdel` (marker), `phdr` (header echo), `rwdeny` (rewrite
 //! denies 418), `accdeny` (access denies 403), `bmark` (body_filter
@@ -51,11 +59,18 @@ const MARKER_KEY: &str = "probe:marker";
 const MARKER_VAL: &[u8] = b"mk";
 const POST_READ_KEY: &str = "probe:post_read";
 const REWRITE_KEY: &str = "probe:rewrite";
-const BODY_SEEN_KEY: &str = "probe:body_seen";
+const BODY_SEEN_PREFIX: &str = "probe:body_seen:";
 const LOG_RAN_KEY: &str = "probe:log_ran";
 const SCAN_PREFIX: &str = "probe:scan:";
 const SCAN_A_KEY: &str = "probe:scan:a";
 const SCAN_B_KEY: &str = "probe:scan:b";
+const WS_HANDSHAKE_PATH: &str = "/ws";
+const WS_AUTH_KEY: &str = "probe:ws_auth";
+const WS_COOKIE_KEY: &str = "probe:ws_cookie";
+// Dummy values the integration drill sends on its WebSocket handshake;
+// they are fixtures, not credentials.
+const WS_AUTH_EXPECT: &str = "Bearer ws-probe-token";
+const WS_COOKIE_EXPECT: &str = "session=ws-probe-cookie";
 const PROBE_TTL_MS: i64 = 10_000;
 const SHORT_TTL_MS: i64 = 1_500;
 const RESP_HEADER: &str = "x-kv-probe";
@@ -84,15 +99,35 @@ enum ProbeMode {
     /// Balancer phase: assert the 3-peer healthy view and pin the
     /// request to the first healthy peer.
     Balancer,
+    /// The last /ws handshake must have carried the expected
+    /// Authorization and Cookie headers.
+    WsHeaders,
 }
 
-/// Post-read phase: record the request path for cross-phase checks.
+/// Post-read phase: record the request path for cross-phase checks and,
+/// on a `/ws` handshake, the end-to-end auth headers the client sent.
 #[openrusty_sdk::phase(post_read)]
 fn on_post_read() -> Decision {
     if let Some(path) = host::req_meta("path") {
         host::kv_set(POST_READ_KEY, &path, PROBE_TTL_MS);
     }
+    record_ws_handshake_headers();
     Decision::Declined
+}
+
+/// Record the Authorization/Cookie headers of a `/ws` handshake request
+/// so a later `mode=wsheaders` probe can assert they survived the
+/// gateway's WebSocket path.
+fn record_ws_handshake_headers() {
+    if host::req_meta_str("path").as_deref() != Some(WS_HANDSHAKE_PATH) {
+        return;
+    }
+    if let Some(auth) = host::req_meta_str("header:authorization") {
+        host::kv_set(WS_AUTH_KEY, auth.as_bytes(), PROBE_TTL_MS);
+    }
+    if let Some(cookie) = host::req_meta_str("header:cookie") {
+        host::kv_set(WS_COOKIE_KEY, cookie.as_bytes(), PROBE_TTL_MS);
+    }
 }
 
 /// Rewrite phase: record the request path; `rwdeny` aborts with 418.
@@ -192,6 +227,7 @@ fn on_content() -> Decision {
         Some(ProbeMode::BodyCheck) => body_check(),
         Some(ProbeMode::LogCheck) => present(LOG_RAN_KEY, b"1"),
         Some(ProbeMode::Scan) => scan(),
+        Some(ProbeMode::WsHeaders) => ws_headers(),
         Some(ProbeMode::Balancer) => Decision::Declined,
         None => Decision::Deny(400),
     }
@@ -234,8 +270,9 @@ fn on_header_filter() -> Decision {
 }
 
 /// Body filter phase: with `bmark`, accumulate upstream body bytes and
-/// the final-chunk flag into `probe:body_seen` ("<bytes>:<0|1>").
-/// Observe-only; every chunk is passed through unchanged.
+/// the final-chunk flag into the per-request key
+/// `probe:body_seen:<path><?query>` ("<bytes>:<0|1>"). Observe-only;
+/// every chunk is passed through unchanged.
 #[openrusty_sdk::phase(body_filter)]
 fn on_body_filter() -> Decision {
     let query = host::req_meta_str("query").unwrap_or_default();
@@ -243,13 +280,14 @@ fn on_body_filter() -> Decision {
         return Decision::Declined;
     }
     let (chunk, last) = host::body_chunk();
-    let current = host::kv_get(BODY_SEEN_KEY)
+    let key = body_seen_key();
+    let current = host::kv_get(&key)
         .map(|raw| String::from_utf8_lossy(&raw).into_owned())
         .unwrap_or_default();
     let (seen, _) = parse_body_seen(&current).unwrap_or((0, false));
     let marker =
         alloc::format!("{}:{}", seen + chunk.len() as u64, u8::from(last));
-    host::kv_set(BODY_SEEN_KEY, marker.as_bytes(), PROBE_TTL_MS);
+    host::kv_set(&key, marker.as_bytes(), PROBE_TTL_MS);
     Decision::Declined
 }
 
@@ -317,15 +355,57 @@ fn equals_path(key: &str) -> Decision {
     }
 }
 
-/// Done when the body_filter accumulator ended "<n>:1" with n > 0.
+/// Done when at least one completed request's per-request body_filter
+/// accumulator holds "<n>:1" with n > 0. The bookkeeping keys live under
+/// the `probe:body_seen:` prefix, one per request, so this scans them
+/// instead of reading a single (aliasing) global key.
 fn body_check() -> Decision {
-    let raw = host::kv_get(BODY_SEEN_KEY)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
-    match parse_body_seen(&raw) {
-        Some((total, true)) if total > 0 => Decision::Done,
-        _ => Decision::Deny(409),
+    let mut saw_full_body = false;
+    for (_, value) in host::kv_scan(BODY_SEEN_PREFIX) {
+        let raw = String::from_utf8_lossy(&value).into_owned();
+        if let Some((total, true)) = parse_body_seen(&raw) {
+            if total > 0 {
+                saw_full_body = true;
+            }
+        }
     }
+    if saw_full_body {
+        Decision::Done
+    } else {
+        Decision::Deny(409)
+    }
+}
+
+/// Done when the last `/ws` handshake carried the expected
+/// Authorization and Cookie headers.
+fn ws_headers() -> Decision {
+    let auth_ok =
+        host::kv_get(WS_AUTH_KEY).as_deref() == Some(WS_AUTH_EXPECT.as_bytes());
+    let cookie_ok = host::kv_get(WS_COOKIE_KEY).as_deref()
+        == Some(WS_COOKIE_EXPECT.as_bytes());
+    if auth_ok && cookie_ok {
+        Decision::Done
+    } else {
+        Decision::Deny(409)
+    }
+}
+
+/// Per-request body_filter bookkeeping key: `<prefix><path>`, plus
+/// `?<query>` when the request has one. Pure, so tests pin the layout.
+fn body_seen_key_for(path: &str, query: &str) -> String {
+    if query.is_empty() {
+        alloc::format!("{}{}", BODY_SEEN_PREFIX, path)
+    } else {
+        alloc::format!("{}{}?{}", BODY_SEEN_PREFIX, path, query)
+    }
+}
+
+/// The calling request's body_filter bookkeeping key.
+fn body_seen_key() -> String {
+    body_seen_key_for(
+        &host::req_meta_str("path").unwrap_or_default(),
+        &host::req_meta_str("query").unwrap_or_default(),
+    )
 }
 
 /// Plant two transient keys, require `kv_scan` over the prefix to see
@@ -361,6 +441,7 @@ fn parse_mode(query: &str) -> Option<ProbeMode> {
         "bodycheck" => Some(ProbeMode::BodyCheck),
         "logcheck" => Some(ProbeMode::LogCheck),
         "scan" => Some(ProbeMode::Scan),
+        "wsheaders" => Some(ProbeMode::WsHeaders),
         "balancer" => Some(ProbeMode::Balancer),
         _ => None,
     }
@@ -422,6 +503,10 @@ mod tests {
         assert_eq!(parse_mode("mode=logcheck"), Some(ProbeMode::LogCheck));
         assert_eq!(parse_mode("mode=scan"), Some(ProbeMode::Scan));
         assert_eq!(
+            parse_mode("mode=wsheaders"),
+            Some(ProbeMode::WsHeaders)
+        );
+        assert_eq!(
             parse_mode("mode=balancer"),
             Some(ProbeMode::Balancer)
         );
@@ -460,6 +545,29 @@ mod tests {
         assert_eq!(parse_mode("mode"), None);
         assert_eq!(parse_mode("other=setgetdel"), None);
         assert_eq!(parse_mode(""), None);
+    }
+
+    #[test]
+    fn parse_mode_accepts_wsheaders() {
+        assert_eq!(parse_mode("mode=wsheaders"), Some(ProbeMode::WsHeaders));
+        assert_eq!(
+            parse_mode("a=1&mode=wsheaders&b=2"),
+            Some(ProbeMode::WsHeaders)
+        );
+    }
+
+    #[test]
+    fn body_seen_key_is_derived_per_request() {
+        assert_eq!(
+            body_seen_key_for("/echo", "bmark=1"),
+            "probe:body_seen:/echo?bmark=1"
+        );
+        assert_eq!(body_seen_key_for("/echo", ""), "probe:body_seen:/echo");
+        // Distinct requests (different tags) must never share a key.
+        assert_ne!(
+            body_seen_key_for("/echo", "bmark=1&btag=a"),
+            body_seen_key_for("/echo", "bmark=1&btag=b")
+        );
     }
 
     #[test]
