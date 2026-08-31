@@ -8,7 +8,7 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, app, h2c, reload, state};
+use openrusty_server::{active_probe, listeners, reload, state};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -121,8 +121,17 @@ async fn main() {
         });
     }
 
-    let router = app::router(state);
-    if let Err(e) = h2c::serve(cfg.server.listen, cfg.server.http1_only, router, rx).await {
+    // Role-based multi-listener: `[[server.listeners]]` entries are authoritative
+    // when written, otherwise a single inbound listener is derived from
+    // `server.listen` (which keeps the historical single-socket shape).
+    if !cfg.server.listeners.is_empty() {
+        tracing::warn!(
+            listen = %cfg.server.listen,
+            "server.listen is ignored: [[server.listeners]] entries are authoritative"
+        );
+    }
+    let listeners_cfg = openrusty_core::effective_listeners(&cfg);
+    if let Err(e) = listeners::serve(listeners::mounts(&state, &listeners_cfg), rx).await {
         tracing::error!(error = %e, "listener failed");
         std::process::exit(1);
     }

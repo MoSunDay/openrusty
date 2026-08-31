@@ -4,7 +4,8 @@
 //! target: every module below is compiled exactly once and re-used by
 //! external embedders (init-pro), who can construct the shared gateway
 //! state with [`state::AppState::from_config`], wrap it in [`app::router`]
-//! and serve HTTP/1.1 + h2c on one port in-process via [`h2c::serve`].
+//! and serve HTTP/1.1 + h2c on one port in-process via [`h2c::serve`] (or
+//! drive role-scoped sockets with [`listeners::serve`]).
 //! Config swaps that never touch the filesystem go through
 //! [`reload::apply_config`].
 //!
@@ -17,6 +18,7 @@ pub mod active_probe;
 pub mod app;
 pub mod body_filter;
 pub mod h2c;
+pub mod listeners;
 pub mod metrics;
 pub mod pipeline;
 pub mod pipeline_peer;

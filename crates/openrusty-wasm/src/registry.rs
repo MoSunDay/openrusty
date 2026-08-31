@@ -152,7 +152,8 @@ impl PluginRegistry {
                 let dir = PathBuf::from(&cfg.plugins.dir);
                 let names = discover(&dir)?;
                 let ordered = order_plugins(&names, &cfg.plugins.order);
-                let plugins = load_plugins(&engine, &linker, &cfg, &dir, &ordered, Some(&build_from))?;
+                let plugins =
+                    load_plugins(&engine, &linker, &cfg, &dir, &ordered, Some(&build_from))?;
                 Ok(PluginSnapshot {
                     generation: build_from.generation + 1,
                     plugins,
@@ -264,6 +265,7 @@ mod tests {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 log_level: "info".into(),
                 http1_only: false,
+                listeners: Vec::new(),
             },
             plugins: PluginsConfig {
                 dir: dir.into(),

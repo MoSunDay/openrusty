@@ -92,3 +92,34 @@ timeout_ms = 30000
 path_prefix = "/"
 upstream = "vllm"
 timeout_ms = 30000
+
+# --- Role-based multi-listener (sidecar mode) -------------------------------
+# Uncommenting ANY [[server.listeners]] entry below switches the gateway into
+# multi-socket mode, and those entries become the ONLY authority for which
+# sockets are bound: the `listen` under [server] above is then ignored (a
+# warning is logged once at boot). With no [[server.listeners]] at all, the
+# gateway derives a single inbound listener from [server] listen/http1_only,
+# the backward-compatible single-socket shape (management routes included).
+#
+# Rules: at most one listener per role (inbound | outbound | admin) and no
+# duplicated address. `http1_only` applies to inbound/outbound only; an admin
+# listener ignores it and serves the /openrusty/* management routes ONLY
+# (when an admin listener exists, those routes are removed from the data
+# ports). Roles follow the linkerd sidecar split:
+#   inbound  - local workload traffic entering the process
+#   outbound - egress traffic leaving the mesh
+#   admin    - /openrusty/status | /openrusty/reload | /openrusty/metrics
+#
+# [[server.listeners]]
+# role = "inbound"
+# listen = "0.0.0.0:4143"
+# # http1_only = false
+#
+# [[server.listeners]]
+# role = "outbound"
+# listen = "127.0.0.1:4140"
+# # http1_only = false
+#
+# [[server.listeners]]
+# role = "admin"
+# listen = "127.0.0.1:4191"

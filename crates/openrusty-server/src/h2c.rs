@@ -101,8 +101,10 @@ pub async fn serve(
 }
 
 /// Accept loop over an already-bound listener. Split out from [`serve`] so
-/// tests can bind port 0, learn the port, and inject custom timeouts.
-async fn serve_listener(
+/// multi-socket assembly (`crate::listeners::serve`) can drive one accept
+/// task per bound socket, and so tests can bind port 0, learn the port, and
+/// inject custom timeouts.
+pub(crate) async fn serve_listener(
     router: axum::Router,
     listener: tokio::net::TcpListener,
     http1_only: bool,
@@ -349,7 +351,9 @@ mod tests {
         // completes: the http1 half must reap it after `header_read`.
         // (With zero bytes the auto sniffer cannot even pick a protocol,
         // so this is the h2c analogue of the idle test above.)
-        sock.write_all(b"GET /openrusty/status HTTP/1.1\r\n").await.unwrap();
+        sock.write_all(b"GET /openrusty/status HTTP/1.1\r\n")
+            .await
+            .unwrap();
         let started = Instant::now();
         tokio::time::timeout(Duration::from_secs(5), read_until_closed(&mut sock))
             .await

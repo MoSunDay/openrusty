@@ -7,6 +7,8 @@ pub mod config;
 pub mod context;
 pub mod phase;
 
-pub use config::{load_config, Config, ConfigError, FailPolicy};
+pub use config::{
+    effective_listeners, load_config, Config, ConfigError, FailPolicy, ListenerConfig, ListenerRole,
+};
 pub use context::ReqCtx;
 pub use phase::{Decision, Phase};
