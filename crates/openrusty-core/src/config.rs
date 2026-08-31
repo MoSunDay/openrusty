@@ -37,6 +37,67 @@ pub struct ServerConfig {
     /// Serve HTTP/1.1 only; `false` (default) auto-detects h2c on the same port.
     #[serde(default)]
     pub http1_only: bool,
+    /// Role-scoped listeners under `[[server.listeners]]`. Empty (default) keeps the
+    /// single-socket shape: one inbound listener derived from `listen`. When
+    /// non-empty this list is the sole authority and `listen` above is
+    /// ignored (see [`effective_listeners`]).
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
+}
+
+/// Role of a listener socket, linkerd-aligned sidecar split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerRole {
+    /// Data plane serving local workload traffic.
+    Inbound,
+    /// Data plane serving egress traffic.
+    Outbound,
+    /// Management plane: `/openrusty/*` routes only.
+    Admin,
+}
+
+impl ListenerRole {
+    /// Stable lowercase name, used in errors and log lines.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ListenerRole::Inbound => "inbound",
+            ListenerRole::Outbound => "outbound",
+            ListenerRole::Admin => "admin",
+        }
+    }
+}
+
+/// One role-scoped socket under `[[server.listeners]]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerConfig {
+    pub role: ListenerRole,
+    /// Address to bind for this role.
+    pub listen: SocketAddr,
+    /// Serve plain HTTP/1.1 only (skip the h2c preface sniffing). Only
+    /// meaningful for inbound/outbound; an admin listener ignores it and
+    /// always speaks both protocols.
+    #[serde(default)]
+    pub http1_only: bool,
+}
+
+/// Effective listener set for the gateway (pure derivation).
+///
+/// `[[server.listeners]]` entries, when present, are the only authority: they are
+/// returned verbatim and `server.listen` plays no further role. With no
+/// `[[server.listeners]]` written, a single `inbound` listener is derived from
+/// `server.listen` + `server.http1_only`, which reproduces the historical
+/// single-socket behaviour exactly (including admin routes on that socket).
+pub fn effective_listeners(cfg: &Config) -> Vec<ListenerConfig> {
+    if !cfg.server.listeners.is_empty() {
+        return cfg.server.listeners.clone();
+    }
+    vec![ListenerConfig {
+        role: ListenerRole::Inbound,
+        listen: cfg.server.listen,
+        http1_only: cfg.server.http1_only,
+    }]
 }
 
 fn default_log_level() -> String {
@@ -236,6 +297,29 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     if cfg.plugins.max_memory_mb == 0 {
         return Err(bad("plugins.max_memory_mb must be > 0"));
     }
+    // Multi-listener mode: [[server.listeners]] must not bind the same role or the
+    // same address twice. There is intentionally no cross-check against
+    // `server.listen`: when listeners are present, `server.listen` is dead
+    // config (the gateway logs a warning at boot).
+    if !cfg.server.listeners.is_empty() {
+        let mut roles = std::collections::HashSet::new();
+        let mut addrs = std::collections::HashSet::new();
+        for (i, l) in cfg.server.listeners.iter().enumerate() {
+            if !roles.insert(l.role) {
+                return Err(bad(&format!(
+                    "listeners[{}] repeats role {}; one listener per role",
+                    i,
+                    l.role.as_str()
+                )));
+            }
+            if !addrs.insert(l.listen) {
+                return Err(bad(&format!(
+                    "listeners[{}] repeats address {}; addresses must be unique",
+                    i, l.listen
+                )));
+            }
+        }
+    }
     // The plugin registry (openrusty-wasm) trusts `order` to name each plugin
     // at most once; a duplicate would make execution order ambiguous.
     let mut seen_order = std::collections::HashSet::new();
@@ -350,6 +434,138 @@ upstream = "vllm"
         assert_eq!(cfg.plugins.timeout_ms, 50);
         assert_eq!(cfg.plugins.on_failure, FailPolicy::FailOpen);
         assert_eq!(cfg.upstreams[0].balancer, BalancerKind::Swrr);
+        // No [[server.listeners]] written: derive a single inbound listener from
+        // server.listen (the historical single-socket shape).
+        let ls = effective_listeners(&cfg);
+        assert_eq!(ls.len(), 1);
+        assert_eq!(ls[0].role, ListenerRole::Inbound);
+        assert_eq!(ls[0].listen, "127.0.0.1:8080".parse().unwrap());
+        assert!(!ls[0].http1_only);
+    }
+
+    #[test]
+    fn empty_listeners_derive_inbound_from_server_listen() {
+        // http1_only must propagate into the derived listener too.
+        let cfg: Config = toml::from_str(
+            "[server]\nlisten = \"127.0.0.1:18080\"\nhttp1_only = true\n\n[plugins]\ndir = \"build/plugins\"\n",
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let ls = effective_listeners(&cfg);
+        assert_eq!(ls.len(), 1);
+        assert_eq!(ls[0].role, ListenerRole::Inbound);
+        assert_eq!(ls[0].listen, "127.0.0.1:18080".parse().unwrap());
+        assert!(ls[0].http1_only);
+    }
+
+    #[test]
+    fn explicit_listeners_are_authoritative_and_verbatim() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[plugins]
+dir = "build/plugins"
+
+[[server.listeners]]
+role = "inbound"
+listen = "0.0.0.0:4143"
+
+[[server.listeners]]
+role = "outbound"
+listen = "127.0.0.1:4140"
+http1_only = true
+
+[[server.listeners]]
+role = "admin"
+listen = "127.0.0.1:4191"
+"#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let ls = effective_listeners(&cfg);
+        let roles: Vec<_> = ls.iter().map(|l| l.role).collect();
+        assert_eq!(
+            roles,
+            [
+                ListenerRole::Inbound,
+                ListenerRole::Outbound,
+                ListenerRole::Admin
+            ]
+        );
+        // server.listen is dead config here; listeners win verbatim.
+        assert_eq!(ls[0].listen, "0.0.0.0:4143".parse().unwrap());
+        assert!(ls[1].http1_only);
+        assert!(!ls[2].http1_only);
+    }
+
+    #[test]
+    fn rejects_duplicate_listener_role() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[plugins]
+dir = "build/plugins"
+
+[[server.listeners]]
+role = "inbound"
+listen = "127.0.0.1:4143"
+
+[[server.listeners]]
+role = "inbound"
+listen = "127.0.0.1:4144"
+"#,
+        )
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("repeats role inbound"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_listener_address() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[plugins]
+dir = "build/plugins"
+
+[[server.listeners]]
+role = "inbound"
+listen = "127.0.0.1:4143"
+
+[[server.listeners]]
+role = "admin"
+listen = "127.0.0.1:4143"
+"#,
+        )
+        .unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("repeats address 127.0.0.1:4143"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_listener_role_and_fields() {
+        // Unknown role names are rejected by the serde enum.
+        assert!(toml::from_str::<Config>(
+            "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[server.listeners]]\nrole = \"east-west\"\nlisten = \"127.0.0.1:4143\"\n"
+        )
+        .is_err());
+        // Unknown fields are rejected by deny_unknown_fields.
+        assert!(toml::from_str::<Config>(
+            "[server]\nlisten = \"127.0.0.1:8080\"\n\n[[server.listeners]]\nrole = \"admin\"\nlisten = \"127.0.0.1:4191\"\nnope = 1\n"
+        )
+        .is_err());
     }
 
     #[test]
@@ -360,9 +576,10 @@ upstream = "vllm"
         assert_eq!(plain.routes[0].host, None);
 
         // Present `host`: parsed verbatim (matching normalizes case later).
-        let with_host: Config = toml::from_str(
-            &GOOD.replace("path_prefix = \"/\"", "host = \"Example.COM\"\npath_prefix = \"/\""),
-        )
+        let with_host: Config = toml::from_str(&GOOD.replace(
+            "path_prefix = \"/\"",
+            "host = \"Example.COM\"\npath_prefix = \"/\"",
+        ))
         .unwrap();
         validate(&with_host).unwrap();
         assert_eq!(with_host.routes[0].host.as_deref(), Some("Example.COM"));

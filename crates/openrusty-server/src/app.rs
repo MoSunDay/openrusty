@@ -17,15 +17,37 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Build the gateway router: management routes first, everything else
-/// falls through to the proxy pipeline.
-pub fn router(state: Arc<AppState>) -> Router {
+/// Admin-plane routes (`/openrusty/*`). Shared between the admin listener
+/// and the combined single-socket router.
+///
+/// Mounting rule (pure, see `listeners::mounts`): when a `[[server.listeners]]`
+/// entry with `role = "admin"` exists, these routes live ONLY on the admin
+/// socket and are removed from every data-plane socket; without an admin
+/// listener they stay mounted on the data-plane router (historical shape).
+fn admin_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/openrusty/status", get(status))
         .route("/openrusty/reload", post(reload_endpoint))
         .route("/openrusty/metrics", get(metrics_endpoint))
-        .fallback(fallback)
-        .with_state(state)
+}
+
+/// Admin-only router: `/openrusty/*` and nothing else; every other path 404s
+/// without touching the proxy pipeline.
+pub fn admin_router(state: Arc<AppState>) -> Router {
+    admin_routes().with_state(state)
+}
+
+/// Data-plane router without the admin plane: everything falls through to
+/// the proxy pipeline.
+pub fn data_router(state: Arc<AppState>) -> Router {
+    Router::new().fallback(fallback).with_state(state)
+}
+
+/// Combined gateway router: management routes first, everything else falls
+/// through to the proxy pipeline. This is the single-socket shape used when
+/// no dedicated admin listener is configured (and by embedders/tests).
+pub fn router(state: Arc<AppState>) -> Router {
+    admin_routes().fallback(fallback).with_state(state)
 }
 
 /// Proxy fallback; ConnectInfo is inserted per request by `h2c::serve`.

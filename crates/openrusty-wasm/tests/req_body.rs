@@ -52,6 +52,7 @@ fn cfg(dir: &str) -> Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             log_level: "info".into(),
             http1_only: false,
+            listeners: Vec::new(),
         },
         plugins: PluginsConfig {
             dir: dir.into(),
