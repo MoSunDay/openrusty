@@ -2,26 +2,15 @@
 //!
 //! HTTP/1.1 + h2c on one port, plugin phases via wasmtime, proxying with
 //! retries, WebSocket pass-through, SSE streaming, atomic hot reload.
-
-mod active_probe;
-mod app;
-mod body_filter;
-mod h2c;
-mod metrics;
-mod pipeline;
-mod pipeline_peer;
-mod reload;
-mod state;
-#[cfg(test)]
-mod testutil;
-mod ws;
+//!
+//! Thin binary glue only: the gateway itself lives in the lib target
+//! (`openrusty_server`), so external embedders (init-pro) reuse the same
+//! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_proxy as proxy;
+use openrusty_server::{active_probe, app, h2c, reload, state};
 use openrusty_wasm::host_state;
-use openrusty_wasm::PluginRegistry;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
@@ -64,29 +53,17 @@ async fn main() {
     tracing::info!(config = %config_path.display(), "starting openrusty");
 
     // Compile all plugins before serving; a broken module is fatal at boot.
-    let registry = match PluginRegistry::bootstrap(&cfg) {
-        Ok(r) => r,
+    // `from_config` is the single construction path, shared with the test
+    // helpers and external embedders.
+    let state = match state::from_config(cfg.clone(), config_path) {
+        Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "plugin bootstrap failed");
             std::process::exit(1);
         }
     };
-
-    let state = Arc::new(state::AppState {
-        registry,
-        health: Arc::new(proxy::new()),
-        pool: Arc::new(proxy::new_pool()),
-        metrics: Arc::new(metrics::Metrics::new()),
-        runtime: arc_swap::ArcSwap::from_pointee(state::empty_runtime()),
-        config_path,
-        started_at: std::time::Instant::now(),
-        probe_task: std::sync::Mutex::new(None),
-        reload_gate: tokio::sync::Mutex::new(()),
-    });
-    let gen = state.registry.snapshot().generation;
-    state::apply_runtime(&state, &cfg, gen);
     // Start active health probing (no-op when no upstream enables it).
-    crate::active_probe::spawn(&state);
+    active_probe::spawn(&state);
 
     // KV sweeper: expire stale plugin KV entries.
     {

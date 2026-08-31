@@ -7,6 +7,7 @@
 //! untouched.
 
 use crate::state::{apply_runtime, AppState};
+use openrusty_core::config::Config;
 use openrusty_core::load_config;
 use std::sync::Arc;
 
@@ -36,6 +37,31 @@ impl std::fmt::Display for ReloadError {
     }
 }
 
+impl std::error::Error for ReloadError {}
+
+/// Swap the plugin snapshot, then the runtime, then re-arm active probing.
+///
+/// Memory-only shared tail of every reload path (the file-based [`reload`]
+/// and the in-memory [`apply_config`]); never touches the filesystem.
+/// Callers must already hold the reload gate. Ordering matters:
+/// `apply_runtime` runs after the plugin registry published its new
+/// snapshot, so any failure (compile, ABI) leaves both the old plugin
+/// snapshot and the old runtime untouched.
+async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError> {
+    // Compiles off the request path; Err leaves the old snapshot in place.
+    let generation = state
+        .registry
+        .reload(cfg)
+        .await
+        .map_err(|e| ReloadError::Failed(format!("plugins: {e}")))?;
+
+    // Plugins are already published; now swap the runtime to match, then
+    // re-arm active probing -- both inside the reload gate.
+    apply_runtime(state, cfg, generation);
+    crate::active_probe::spawn(state);
+    Ok(generation)
+}
+
 /// Run one full reload cycle against `state.config_path`.
 ///
 /// Reloads are serialized: whoever gets the gate first runs the whole cycle
@@ -54,17 +80,7 @@ pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> 
         .map_err(|e| ReloadError::Failed(format!("reload task failed: {e}")))?
         .map_err(|e| ReloadError::Failed(format!("config: {e}")))?;
 
-    // Compiles off the request path; Err leaves the old snapshot in place.
-    let generation = state
-        .registry
-        .reload(&cfg)
-        .await
-        .map_err(|e| ReloadError::Failed(format!("plugins: {e}")))?;
-
-    // Plugins are already published; now swap the runtime to match, then
-    // re-arm active probing -- both inside the reload gate.
-    apply_runtime(state, &cfg, generation);
-    crate::active_probe::spawn(state);
+    let generation = publish(state, &cfg).await?;
 
     let plugins = state
         .registry
@@ -78,6 +94,25 @@ pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> 
         generation,
         plugins,
     })
+}
+
+/// Apply an in-memory [`Config`] to a running state: hot-swap the plugins,
+/// routing and upstream runtime (and restart the active-probe task) without
+/// ever touching the filesystem.
+///
+/// The file-based entry point stays [`reload`] (it re-reads
+/// `state.config_path`); this variant serves embedders (init-pro) that
+/// build their `Config` programmatically and share one long-lived
+/// [`AppState`]. Same [`ReloadError`] contract as [`reload`]: serialized
+/// through `state.reload_gate`, so a caller while another reload runs gets
+/// [`ReloadError::InFlight`], and any [`ReloadError::Failed`] leaves the
+/// previous plugin snapshot and runtime in effect. Returns the new
+/// generation.
+pub async fn apply_config(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError> {
+    let _gate = state.reload_gate.try_lock().map_err(|_| ReloadError::InFlight)?;
+    let generation = publish(state, cfg).await?;
+    tracing::info!(generation, "in-memory config applied");
+    Ok(generation)
 }
 
 #[cfg(test)]
@@ -159,5 +194,65 @@ mod tests {
         drop(_held);
         let report = reload(&state).await.unwrap();
         assert_eq!(report.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_config_hot_swaps_without_touching_the_filesystem() {
+        let dir = TmpDir::new("apply-mem");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        assert_eq!(state.runtime.load().generation, 1);
+
+        // In-memory swap to a config that was never written to disk.
+        let mut cfg = openrusty_core::load_config(&dir.config_path()).unwrap();
+        cfg.routes[0].path_prefix = "/mem-only".to_string();
+        let gen = apply_config(&state, &cfg).await.unwrap();
+        assert_eq!(gen, 2);
+        assert_eq!(state.runtime.load().generation, 2);
+        assert_eq!(state.registry.snapshot().generation, 2);
+        assert_eq!(state.runtime.load().routes[0].path_prefix, "/mem-only");
+
+        // The on-disk config is untouched: a file reload still serves "/".
+        let report = reload(&state).await.unwrap();
+        assert_eq!(report.generation, 3);
+        assert_eq!(state.runtime.load().routes[0].path_prefix, "/");
+    }
+
+    #[tokio::test]
+    async fn failed_apply_config_keeps_previous_runtime() {
+        let dir = TmpDir::new("apply-broken");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+
+        // Corrupt the module; the whole apply must fail atomically.
+        dir.write_plugin("p.wasm", b"garbage");
+        let cfg = openrusty_core::load_config(&dir.config_path()).unwrap();
+        let err = apply_config(&state, &cfg).await.unwrap_err();
+        assert!(
+            matches!(err, ReloadError::Failed(ref e) if e.contains("plugins")),
+            "got: {err:?}"
+        );
+        // Nothing changed: the boot snapshot and runtime stay in effect.
+        assert_eq!(state.runtime.load().generation, 1);
+        assert_eq!(state.registry.snapshot().generation, 1);
+        assert_eq!(state.runtime.load().routes[0].path_prefix, "/");
+    }
+
+    #[tokio::test]
+    async fn apply_config_shares_the_reload_gate_with_file_reloads() {
+        let dir = TmpDir::new("apply-gate");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+
+        // Hold the gate exactly like an in-flight file reload would.
+        let cfg = openrusty_core::load_config(&dir.config_path()).unwrap();
+        let _held = state.reload_gate.try_lock().unwrap();
+        let err = apply_config(&state, &cfg).await.unwrap_err();
+        assert!(matches!(err, ReloadError::InFlight), "got: {err:?}");
+        assert_eq!(state.runtime.load().generation, 1);
+        assert_eq!(state.registry.snapshot().generation, 1);
     }
 }

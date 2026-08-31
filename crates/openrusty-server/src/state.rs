@@ -59,6 +59,38 @@ pub fn empty_runtime() -> RuntimeSnapshot {
     }
 }
 
+/// Construct an `AppState` from an already-parsed and validated `Config`.
+///
+/// The single construction path, shared by the `openrusty` binary, the
+/// test helpers and external embedders (init-pro): bootstraps the plugin
+/// registry (compiling every plugin before serving), then publishes the
+/// first runtime snapshot. `config_path` is only recorded for the
+/// file-based reload path; in-memory embedders can pass any placeholder.
+///
+/// The only fallible step is the plugin bootstrap, so the error type is
+/// the registry's own [`openrusty_wasm::ReloadError`]; config parse and
+/// validation errors surface earlier, from `openrusty_core::load_config`.
+pub fn from_config(
+    cfg: Config,
+    config_path: PathBuf,
+) -> Result<Arc<AppState>, openrusty_wasm::ReloadError> {
+    let registry = PluginRegistry::bootstrap(&cfg)?;
+    let state = Arc::new(AppState {
+        registry,
+        health: Arc::new(proxy::new()),
+        pool: Arc::new(proxy::new_pool()),
+        metrics: Arc::new(metrics::Metrics::new()),
+        runtime: arc_swap::ArcSwap::from_pointee(empty_runtime()),
+        config_path,
+        started_at: std::time::Instant::now(),
+        probe_task: Mutex::new(None),
+        reload_gate: tokio::sync::Mutex::new(()),
+    });
+    let generation = state.registry.snapshot().generation;
+    apply_runtime(&state, &cfg, generation);
+    Ok(state)
+}
+
 /// Rebuild the runtime snapshot from `cfg` and publish it atomically.
 ///
 /// Upstreams are re-derived from config. Passive health slots are refreshed
