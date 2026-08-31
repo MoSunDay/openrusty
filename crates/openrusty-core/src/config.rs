@@ -199,6 +199,14 @@ fn default_pool_idle_timeout_ms() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub path_prefix: String,
+    /// Optional exact host constraint (TOML: `host = "example.com"` under
+    /// `[[routes]]`). When set, the route only matches requests whose
+    /// `Host` header (port stripped, compared case-insensitively) equals
+    /// this value; when absent the route matches any host. Host selection
+    /// runs before path matching and never changes path precedence within
+    /// a match class (see `openrusty-server` `pipeline::match_route`).
+    #[serde(default)]
+    pub host: Option<String>,
     pub upstream: String,
     #[serde(default)]
     pub timeout_ms: u64,
@@ -299,6 +307,11 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !route.path_prefix.starts_with('/') {
             return Err(bad(&format!("route #{i} path_prefix must start with '/'")));
         }
+        if let Some(h) = &route.host {
+            if h.trim().is_empty() {
+                return Err(bad(&format!("route #{i} host must not be empty")));
+            }
+        }
         if !cfg.upstreams.iter().any(|u| u.name == route.upstream) {
             return Err(bad(&format!(
                 "route #{i} references unknown upstream: {}",
@@ -337,6 +350,29 @@ upstream = "vllm"
         assert_eq!(cfg.plugins.timeout_ms, 50);
         assert_eq!(cfg.plugins.on_failure, FailPolicy::FailOpen);
         assert_eq!(cfg.upstreams[0].balancer, BalancerKind::Swrr);
+    }
+
+    #[test]
+    fn route_host_is_optional_and_defaults_to_none() {
+        // Absent `host`: backward compatible, matches any host.
+        let plain: Config = toml::from_str(GOOD).unwrap();
+        validate(&plain).unwrap();
+        assert_eq!(plain.routes[0].host, None);
+
+        // Present `host`: parsed verbatim (matching normalizes case later).
+        let with_host: Config = toml::from_str(
+            &GOOD.replace("path_prefix = \"/\"", "host = \"Example.COM\"\npath_prefix = \"/\""),
+        )
+        .unwrap();
+        validate(&with_host).unwrap();
+        assert_eq!(with_host.routes[0].host.as_deref(), Some("Example.COM"));
+
+        // An empty host can never match; reject it at validation time.
+        let blank: Config = toml::from_str(
+            &GOOD.replace("path_prefix = \"/\"", "host = \"  \"\npath_prefix = \"/\""),
+        )
+        .unwrap();
+        assert!(validate(&blank).is_err());
     }
 
     #[test]
