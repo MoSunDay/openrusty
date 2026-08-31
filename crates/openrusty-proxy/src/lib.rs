@@ -12,6 +12,8 @@
 //! - [`client`] - pooled keep-alive HTTP/1 clients, one per peer address.
 //! - [`forward`] - request forwarding with retryability classification and
 //!   bidirectional tunneling for upgraded connections.
+//! - [`orig_dst`] - original-destination lookup (`SO_ORIGINAL_DST` /
+//!   `IP6T_SO_ORIGINAL_DST`) for transparently redirected connections.
 //!
 //! The public surface is plain structs and (mostly) pure functions: state
 //! lives in explicitly passed registries/pools, selection math is pure, and
@@ -21,6 +23,7 @@ pub mod balancer;
 pub mod client;
 pub mod forward;
 pub mod health;
+pub mod orig_dst;
 pub mod upstream;
 
 pub use balancer::{ip_hash_pick, swrr_next};
@@ -33,6 +36,7 @@ pub use health::{
     active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
     is_healthy, new, record_failure, record_probe, record_success, register, HealthRegistry,
 };
+pub use orig_dst::original_dst;
 pub use upstream::{
     from_config, is_hop_by_hop, is_websocket_upgrade, strip_hop_by_hop, Peer, Upstream,
 };
