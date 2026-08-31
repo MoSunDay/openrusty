@@ -83,6 +83,10 @@ path_prefix = "/v1"
 upstream = "vllm"
 # Whole-request timeout (milliseconds); 0 disables.
 timeout_ms = 30000
+# Optional exact host constraint: only requests whose Host header (port
+# stripped, case-insensitive) equals this value match the route. Routes
+# without `host` match any host; host-specific routes win over catch-alls.
+# host = "api.example.com"
 
 [[routes]]
 path_prefix = "/"

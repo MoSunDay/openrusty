@@ -28,16 +28,51 @@ pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
     tracing::info!(status, path = %session.ctx().path, attempts, "request finished");
 }
 
-/// Longest-prefix route match (same semantics as
-/// `openrusty_core::context::match_route`, specialized for `RouteConfig`
-/// to avoid the higher-ranked lifetime bound on its closure argument).
+/// Host-aware route match, mirroring nginx's server_name-then-location
+/// precedence. Matching happens in two steps:
+///
+/// 1. Host class: routes with `host = "..."` whose value equals the
+///    request's normalized `Host` form the host-specific class; routes
+///    without `host` form the catch-all class. The host-specific class is
+///    searched first and wins even against a LONGER catch-all path prefix
+///    (a host picks the virtual server, the prefix then picks the location
+///    inside it); the catch-all class applies only when the host-specific
+///    class yields nothing. A `host`-constrained route whose value differs
+///    from the request host never matches, and it never matches a request
+///    without a `Host` header.
+/// 2. Path precedence inside a class is the existing semantics, unchanged:
+///    longest `path_prefix` wins, first route wins on ties (same semantics
+///    as `openrusty_core::context::match_route`).
+///
 /// `pub(crate)` so the metrics endpoint can resolve the route label.
 pub(crate) fn match_route(
     routes: &[openrusty_core::config::RouteConfig],
+    host: Option<&str>,
+    path: &str,
+) -> Option<usize> {
+    longest_prefix(
+        routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.host.is_some() && host_matches(r.host.as_deref(), host)),
+        path,
+    )
+    .or_else(|| {
+        longest_prefix(
+            routes.iter().enumerate().filter(|(_, r)| r.host.is_none()),
+            path,
+        )
+    })
+}
+
+/// Longest-prefix match over the candidate routes (longest `path_prefix`
+/// wins, first route wins on ties).
+fn longest_prefix<'a>(
+    cands: impl Iterator<Item = (usize, &'a openrusty_core::config::RouteConfig)>,
     path: &str,
 ) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
-    for (i, r) in routes.iter().enumerate() {
+    for (i, r) in cands {
         let p = r.path_prefix.as_str();
         if path == p || path.starts_with(p) {
             match best {
@@ -47,6 +82,43 @@ pub(crate) fn match_route(
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// Exact, case-insensitive host comparison (HTTP host semantics). A route
+/// without a host constraint matches every request; a constrained route
+/// never matches a request that carries no usable `Host`.
+fn host_matches(route_host: Option<&str>, req_host: Option<&str>) -> bool {
+    match (route_host, req_host) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(r), Some(h)) => r.eq_ignore_ascii_case(h),
+    }
+}
+
+/// Normalized request host for route matching: the `Host` header value
+/// (hyper exposes the HTTP/2 `:authority` pseudo-header as `Host`),
+/// trimmed, lowercased and with the port stripped (`example.com:8443` and
+/// `[::1]:8080` both reduce to the bare hostname). `None` when the request
+/// carries no usable Host value.
+pub(crate) fn request_host(headers: &[(String, String)]) -> Option<String> {
+    let raw = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.trim())?;
+    if raw.is_empty() {
+        return None;
+    }
+    let bare = if let Some(rest) = raw.strip_prefix('[') {
+        // IPv6 literal: `[::1]:8080` -> `::1`.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        match raw.rsplit_once(':') {
+            // `example.com:8443` -> `example.com`.
+            Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => raw,
+        }
+    };
+    Some(bare.to_ascii_lowercase())
 }
 
 /// Plain text response helper shared across the crate.
@@ -121,8 +193,10 @@ pub async fn handle_request(
         })
         .collect();
 
-    // 3. Route match (longest prefix wins; first wins on ties).
-    let Some(route_idx) = match_route(&rt.routes, &path) else {
+    // 3. Route match: host class first (host-specific routes win over
+    // catch-alls), then longest prefix, first wins on ties.
+    let host = request_host(&headers);
+    let Some(route_idx) = match_route(&rt.routes, host.as_deref(), &path) else {
         return (text_response(404, "404 not found\n"), None);
     };
     let route = rt.routes[route_idx].clone();
@@ -393,6 +467,84 @@ mod tests {
     use crate::testutil::{boot_state, TmpDir};
     use axum::extract::ConnectInfo;
     use tower::ServiceExt;
+
+    fn route(host: Option<&str>, prefix: &str) -> openrusty_core::config::RouteConfig {
+        openrusty_core::config::RouteConfig {
+            path_prefix: prefix.to_string(),
+            host: host.map(str::to_string),
+            upstream: "u".to_string(),
+            timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn host_specific_route_wins_over_catch_all() {
+        // Both orders: the host-specific class is searched first, so the
+        // position in the route table does not matter.
+        let host_first = vec![route(Some("example.com"), "/"), route(None, "/")];
+        let catch_all_first = vec![route(None, "/"), route(Some("example.com"), "/")];
+        assert_eq!(
+            match_route(&host_first, Some("example.com"), "/x"),
+            Some(0)
+        );
+        assert_eq!(
+            match_route(&catch_all_first, Some("example.com"), "/x"),
+            Some(1)
+        );
+
+        // A host-specific class with a shorter prefix still wins over a
+        // longer catch-all prefix: host picks the server, prefix picks the
+        // location inside it.
+        let nested = vec![route(Some("example.com"), "/"), route(None, "/api")];
+        assert_eq!(match_route(&nested, Some("example.com"), "/api/x"), Some(0));
+        // Another host falls through to the catch-all class.
+        assert_eq!(match_route(&nested, Some("other.com"), "/api/x"), Some(1));
+    }
+
+    #[test]
+    fn host_mismatch_falls_through() {
+        let routes = vec![
+            route(Some("example.com"), "/api"),
+            route(None, "/"),
+        ];
+        // A different host never enters the host-specific class; the
+        // catch-all route takes the request.
+        assert_eq!(match_route(&routes, Some("other.com"), "/api"), Some(1));
+        // No Host header at all: constrained routes never match.
+        assert_eq!(match_route(&routes, None, "/api"), Some(1));
+
+        // Without a catch-all, a host mismatch (or missing Host) is a miss.
+        let strict = vec![route(Some("example.com"), "/")];
+        assert_eq!(match_route(&strict, Some("other.com"), "/x"), None);
+        assert_eq!(match_route(&strict, None, "/x"), None);
+    }
+
+    #[test]
+    fn no_host_route_matches_as_before() {
+        let routes = vec![route(None, "/api"), route(None, "/api/v2")];
+        // Any host, longest prefix wins, first wins on ties.
+        assert_eq!(
+            match_route(&routes, Some("anything.org"), "/api/v2/x"),
+            Some(1)
+        );
+        assert_eq!(match_route(&routes, None, "/api/x"), Some(0));
+    }
+
+    #[test]
+    fn request_host_is_normalized_for_matching() {
+        let routes = vec![route(Some("example.com"), "/")];
+        // Case-insensitive, port stripped, IPv6 literal handled.
+        let headers = |host: &str| vec![("Host".to_string(), host.to_string())];
+        assert_eq!(request_host(&headers("EXAMPLE.com:8443")).as_deref(), Some("example.com"));
+        assert_eq!(request_host(&headers("[::1]:8080")).as_deref(), Some("::1"));
+        assert_eq!(request_host(&[]), None);
+        assert_eq!(request_host(&headers("   ")), None);
+
+        assert_eq!(
+            match_route(&routes, request_host(&headers("EXAMPLE.com:8443")).as_deref(), "/x"),
+            Some(0)
+        );
+    }
 
     #[tokio::test]
     async fn unmatched_route_is_404_without_label() {
