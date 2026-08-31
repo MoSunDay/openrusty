@@ -14,6 +14,8 @@
 //!   bidirectional tunneling for upgraded connections.
 //! - [`orig_dst`] - original-destination lookup (`SO_ORIGINAL_DST` /
 //!   `IP6T_SO_ORIGINAL_DST`) for transparently redirected connections.
+//! - [`detect`] - raw protocol sniffing (`H1` / `H2` / `Opaque`) over a
+//!   redirected connection's first bytes, bytes never dropped.
 //!
 //! The public surface is plain structs and (mostly) pure functions: state
 //! lives in explicitly passed registries/pools, selection math is pure, and
@@ -21,6 +23,7 @@
 
 pub mod balancer;
 pub mod client;
+pub mod detect;
 pub mod forward;
 pub mod health;
 pub mod orig_dst;
@@ -28,6 +31,7 @@ pub mod upstream;
 
 pub use balancer::{ip_hash_pick, swrr_next};
 pub use client::{evict_except, get, new_pool, ClientPool, HttpBody, HttpClient};
+pub use detect::{detect, Protocol};
 pub use forward::{
     failure_kind, forward, is_idempotent, may_retry, merge_xff, tunnel, FailureKind, ForwardError,
     ForwardRequest,
