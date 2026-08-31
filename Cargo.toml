@@ -38,7 +38,7 @@ wasmtime = "48"
 arc-swap = "1"
 dashmap = "6"
 thiserror = "2"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 
 [profile.release]
 lto = "thin"
