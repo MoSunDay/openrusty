@@ -3,13 +3,10 @@
 
 use crate::state::{self, AppState};
 use openrusty_core::load_config;
-use openrusty_proxy as proxy;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-
-use crate::metrics;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -87,22 +84,10 @@ impl Drop for TmpDir {
 }
 
 /// Build an `AppState` from the scratch dir's config: bootstrap the plugin
-/// registry and publish the first runtime snapshot.
+/// registry and publish the first runtime snapshot. Delegates to
+/// [`crate::state::from_config`], the single construction path shared with
+/// the binary and external embedders.
 pub fn boot_state(dir: &TmpDir) -> Arc<AppState> {
     let cfg = load_config(&dir.config_path()).unwrap();
-    let registry = openrusty_wasm::PluginRegistry::bootstrap(&cfg).unwrap();
-    let state = Arc::new(AppState {
-        registry,
-        health: Arc::new(proxy::new()),
-        pool: Arc::new(proxy::new_pool()),
-        metrics: Arc::new(metrics::Metrics::new()),
-        runtime: arc_swap::ArcSwap::from_pointee(state::empty_runtime()),
-        config_path: dir.config_path(),
-        started_at: std::time::Instant::now(),
-        probe_task: std::sync::Mutex::new(None),
-        reload_gate: tokio::sync::Mutex::new(()),
-    });
-    let gen = state.registry.snapshot().generation;
-    state::apply_runtime(&state, &cfg, gen);
-    state
+    state::from_config(cfg, dir.config_path()).unwrap()
 }
