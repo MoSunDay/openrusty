@@ -5,7 +5,7 @@
 //! is driven directly with hand-built snapshots.
 
 use super::*;
-use crate::testutil::{boot_state, TmpDir};
+use crate::testutil::{boot_state, fixture_path, TmpDir};
 use openrusty_k8s::parse_line;
 use serde::de::DeserializeOwned;
 
@@ -29,6 +29,36 @@ fn booted(tag: &str) -> (TmpDir, Arc<AppState>) {
     dir.write_config(&dir.standard_config());
     let state = boot_state(&dir);
     (dir, state)
+}
+
+/// Like [`booted`], but the config declares a TLS-terminating inbound
+/// listener (dynamic source: no static material), so the state carries
+/// the shared SNI resolver. No listener is ever bound here.
+fn booted_with_tls_listener(tag: &str) -> (TmpDir, Arc<AppState>) {
+    let dir = TmpDir::new(tag);
+    let mut cfg = dir.standard_config();
+    cfg.push_str(
+        "\n[[server.listeners]]\nrole = \"inbound\"\nlisten = \"127.0.0.1:1\"\ntls = true\n\
+         \n[ingress]\nenabled = true\n",
+    );
+    dir.write_config(&cfg);
+    let state = boot_state(&dir);
+    (dir, state)
+}
+
+/// Base64 of a fixture file, for hand-built k8s Secret bodies.
+fn b64_fixture(name: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(std::fs::read(fixture_path(name)).unwrap())
+}
+
+/// First DER cert of a fixture PEM (identity of published material).
+fn fixture_leaf_der(path: &str) -> Vec<u8> {
+    let pem = std::fs::read_to_string(path).unwrap();
+    let mut cursor = pem.as_bytes();
+    let der = rustls_pemfile::certs(&mut cursor).next().unwrap().unwrap();
+    der.as_ref().to_vec()
 }
 
 #[test]
@@ -187,9 +217,66 @@ async fn apply_publishes_merged_runtime_at_plugin_generation() {
     assert_eq!(rt.generation, state.registry.snapshot().generation);
 }
 
+/// The closed TLS loop: a successful apply publishes the rendered
+/// secrets into the shared SNI resolver (case-normalized), while a
+/// gateway without any TLS listener simply has no resolver to publish
+/// into.
 #[tokio::test]
-async fn failed_client_setup_marks_watching_false_and_serves_static() {
-    let (_dir, state) = booted("ingress-nocreds");
+async fn apply_publishes_rendered_tls_into_the_sni_resolver() {
+    let (_dir, state) = booted_with_tls_listener("ingress-tls-publish");
+    let base = state.static_config.clone();
+    let resolver = state
+        .tls_resolver
+        .as_ref()
+        .expect("tls listener -> shared resolver");
+    assert!(resolver.lookup(Some("app.example.com")).is_none());
+
+    let tls_rule = TLS_RULE.replace("absent", "app-tls");
+    let secret = format!(
+        r#"{{"metadata":{{"name":"app-tls","namespace":"shop","resourceVersion":"50"}},"type":"kubernetes.io/tls","data":{{"tls.crt":"{crt}","tls.key":"{key}"}}}}"#,
+        crt = b64_fixture("server.crt"),
+        key = b64_fixture("server.key"),
+    );
+    let pair = (
+        snap::<Ingress>(&tls_rule, "12"),
+        snap::<Secret>(&secret, "50"),
+    );
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+
+    // Routes applied AND material published in the same apply.
+    assert!(
+        route_keys(&state.runtime.load().routes)
+            .iter()
+            .any(|r| r.0.as_deref() == Some("app.example.com")),
+        "routes: {:?}",
+        route_keys(&state.runtime.load().routes)
+    );
+    let got = resolver
+        .lookup(Some("app.example.com"))
+        .expect("TLS material published by the apply");
+    assert_eq!(
+        got.cert[0].as_ref(),
+        fixture_leaf_der(&fixture_path("server.crt")),
+        "published identity is the rendered secret's leaf"
+    );
+    // SNI matching is case-insensitive, like the resolver promises.
+    assert!(resolver.lookup(Some("APP.EXAMPLE.COM")).is_some());
+}
+
+/// A gateway without TLS listeners builds no resolver, and apply_pair
+/// must not try to publish into one.
+#[tokio::test]
+async fn apply_without_tls_listeners_needs_no_resolver() {
+    let (_dir, state) = booted("ingress-tls-absent");
+    assert!(state.tls_resolver.is_none());
+    let base = state.static_config.clone();
+    let pair = (snap::<Ingress>(API_RULE, "11"), Snapshot::<Secret>::new());
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    assert_eq!(state.runtime.load().routes.len(), 2);
+}
+
+#[tokio::test]
+async fn failed_client_setup_marks_watching_false_and_serves_static() {    let (_dir, state) = booted("ingress-nocreds");
     let cfg = IngressConfig {
         enabled: true,
         kubeconfig: "/nonexistent/openrusty-kubeconfig".to_string(),

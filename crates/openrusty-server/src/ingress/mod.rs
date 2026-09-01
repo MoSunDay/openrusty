@@ -348,6 +348,14 @@ fn apply_pair(
     // the runtime can never disagree with the compiled plugin set.
     let generation = state.registry.snapshot().generation;
     state::apply_runtime(state, &cfg, generation);
+    // TLS: publish the freshly rendered secrets into the shared SNI
+    // resolver. Broken entries are skipped inside (one bad Secret must
+    // not sink the table), and the swap only affects new handshakes -
+    // established connections keep their session certificates.
+    if let Some(resolver) = &state.tls_resolver {
+        let hosts = crate::tls::update_from_tls_pairs(resolver, &tls);
+        tracing::info!(hosts, "ingress TLS material published to the SNI resolver");
+    }
 }
 
 /// Compose the applied config from the static base and the rendered view
