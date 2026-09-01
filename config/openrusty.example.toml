@@ -91,6 +91,13 @@ timeout_ms = 30000
 # stripped, case-insensitive) equals this value match the route. Routes
 # without `host` match any host; host-specific routes win over catch-alls.
 # host = "api.example.com"
+# Exact path matching (nginx `location =`, k8s Ingress pathType=Exact):
+# with `exact = true` the route matches ONLY when the request path equals
+# path_prefix verbatim (never a longer or shorter path), and an exact hit
+# wins over any (even longer) prefix route within the same host class.
+# Default is false: prefix matching. The first `[[routes]]` below, for
+# instance, would then only serve the bare path "/v1".
+# exact = true
 
 [[routes]]
 path_prefix = "/"

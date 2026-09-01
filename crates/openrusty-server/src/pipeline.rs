@@ -40,9 +40,14 @@ pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
 ///    class yields nothing. A `host`-constrained route whose value differs
 ///    from the request host never matches, and it never matches a request
 ///    without a `Host` header.
-/// 2. Path precedence inside a class is the existing semantics, unchanged:
-///    longest `path_prefix` wins, first route wins on ties (same semantics
-///    as `openrusty_core::context::match_route`).
+/// 2. Path precedence inside a class: an `exact` route (`exact = true`,
+///    nginx `location =` aligned) matches only when the request path
+///    equals its `path_prefix` byte-for-byte, and such a hit wins outright
+///    over any (even longer) prefix route in the same class. Without an
+///    exact hit the existing rule applies unchanged: longest `path_prefix`
+///    wins, first route wins on ties. Host-class precedence is evaluated
+///    entirely before path precedence, so an exact hit can never promote
+///    the catch-all class over the host-specific one.
 ///
 /// `pub(crate)` so the metrics endpoint can resolve the route label.
 pub(crate) fn match_route(
@@ -50,7 +55,7 @@ pub(crate) fn match_route(
     host: Option<&str>,
     path: &str,
 ) -> Option<usize> {
-    longest_prefix(
+    path_in_class(
         routes
             .iter()
             .enumerate()
@@ -58,30 +63,41 @@ pub(crate) fn match_route(
         path,
     )
     .or_else(|| {
-        longest_prefix(
+        path_in_class(
             routes.iter().enumerate().filter(|(_, r)| r.host.is_none()),
             path,
         )
     })
 }
 
-/// Longest-prefix match over the candidate routes (longest `path_prefix`
-/// wins, first route wins on ties).
-fn longest_prefix<'a>(
+/// Path precedence inside one host class (single pass, no allocation):
+/// the first exact hit wins outright; otherwise the longest prefix wins,
+/// first route wins on ties. `exact` routes never behave as prefixes, so
+/// a non-matching exact route is simply skipped.
+fn path_in_class<'a>(
     cands: impl Iterator<Item = (usize, &'a openrusty_core::config::RouteConfig)>,
     path: &str,
 ) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
+    let mut exact: Option<usize> = None;
+    let mut best_prefix: Option<(usize, usize)> = None;
     for (i, r) in cands {
+        if r.exact {
+            // Exact routes only ever match the verbatim path (first wins
+            // on ties among exacts).
+            if exact.is_none() && r.path_prefix == path {
+                exact = Some(i);
+            }
+            continue;
+        }
         let p = r.path_prefix.as_str();
         if path == p || path.starts_with(p) {
-            match best {
+            match best_prefix {
                 Some((_, len)) if p.len() <= len => {}
-                _ => best = Some((i, p.len())),
+                _ => best_prefix = Some((i, p.len())),
             }
         }
     }
-    best.map(|(i, _)| i)
+    exact.or(best_prefix.map(|(i, _)| i))
 }
 
 /// Exact, case-insensitive host comparison (HTTP host semantics). A route
@@ -472,9 +488,110 @@ mod tests {
         openrusty_core::config::RouteConfig {
             path_prefix: prefix.to_string(),
             host: host.map(str::to_string),
+            exact: false,
             upstream: "u".to_string(),
             timeout_ms: 0,
         }
+    }
+
+    fn exact_route(host: Option<&str>, path: &str) -> openrusty_core::config::RouteConfig {
+        openrusty_core::config::RouteConfig {
+            exact: true,
+            ..route(host, path)
+        }
+    }
+
+    /// Exact hit wins outright inside its host class, even against a
+    /// longer prefix route, regardless of table order.
+    #[test]
+    fn exact_hit_wins_over_longer_prefix() {
+        let routes = vec![
+            route(Some("example.com"), "/api/v1/chain"),
+            exact_route(Some("example.com"), "/api"),
+        ];
+        assert_eq!(
+            match_route(&routes, Some("example.com"), "/api"),
+            Some(1),
+            "exact hit beats the longer /api/v1/chain prefix"
+        );
+        // Same verdict when the exact route comes first.
+        let routes = vec![
+            exact_route(Some("example.com"), "/api"),
+            route(Some("example.com"), "/api/v1/chain"),
+        ];
+        assert_eq!(match_route(&routes, Some("example.com"), "/api"), Some(0));
+    }
+
+    /// An exact route never matches longer or shorter paths: `/api`
+    /// exact is not `/api/x`, and a non-matching exact route falls back
+    /// to the prefix rules of its class.
+    #[test]
+    fn exact_route_matches_only_verbatim_path() {
+        let routes = vec![
+            exact_route(Some("example.com"), "/api"),
+            route(Some("example.com"), "/"),
+        ];
+        // Sub-path: the exact route is skipped, the "/" prefix applies.
+        assert_eq!(match_route(&routes, Some("example.com"), "/api/x"), Some(1));
+        // Shorter path: same.
+        assert_eq!(match_route(&routes, Some("example.com"), "/ap"), Some(1));
+        // Verbatim path: exact wins even over the catch-all prefix.
+        assert_eq!(match_route(&routes, Some("example.com"), "/api"), Some(0));
+        // No exact hit and no prefix hit -> no route at all.
+        let only_exact = vec![exact_route(Some("example.com"), "/api")];
+        assert_eq!(match_route(&only_exact, Some("example.com"), "/api/x"), None);
+    }
+
+    /// Host semantics are untouched: a host-specific exact route wins
+    /// over a catch-all prefix for its host, and other hosts fall back to
+    /// the catch-all class (exact never crosses the class boundary).
+    #[test]
+    fn host_specific_exact_vs_catch_all_prefix() {
+        let routes = vec![
+            exact_route(Some("api.example.com"), "/v1"),
+            route(None, "/v1"),
+        ];
+        assert_eq!(
+            match_route(&routes, Some("api.example.com"), "/v1"),
+            Some(0),
+            "host-specific exact wins inside the host class"
+        );
+        assert_eq!(
+            match_route(&routes, Some("other.com"), "/v1"),
+            Some(1),
+            "other hosts never see the host-specific exact route"
+        );
+        assert_eq!(
+            match_route(&routes, Some("api.example.com"), "/v1/models"),
+            Some(1),
+            "the exact route does not swallow sub-paths of its own host"
+        );
+    }
+
+    /// Regression: `exact = false` keeps the longest-prefix, first-on-ties
+    /// semantics bit-for-bit, including when exact routes are present in
+    /// the table but miss.
+    #[test]
+    fn prefix_semantics_unchanged_when_exact_absent_or_missing() {
+        let routes = vec![route(Some("example.com"), "/"), route(None, "/")];
+        assert_eq!(
+            match_route(&routes, Some("example.com"), "/x"),
+            Some(0),
+            "host-specific prefix still beats the catch-all prefix"
+        );
+        let nested = vec![route(None, "/api"), route(None, "/api/v2")];
+        assert_eq!(
+            match_route(&nested, None, "/api/v2/x"),
+            Some(1),
+            "longest prefix still wins"
+        );
+        // A missing exact route never disturbs prefix precedence.
+        let mixed = vec![
+            exact_route(None, "/nope"),
+            route(None, "/api"),
+            route(None, "/api/v2"),
+        ];
+        assert_eq!(match_route(&mixed, None, "/api/v2/x"), Some(2));
     }
 
     #[test]

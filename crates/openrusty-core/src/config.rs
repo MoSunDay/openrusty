@@ -231,6 +231,15 @@ pub struct RouteConfig {
     /// a match class (see `openrusty-server` `pipeline::match_route`).
     #[serde(default)]
     pub host: Option<String>,
+    /// Exact path matching (nginx `location =`, k8s Ingress
+    /// `pathType: Exact`). When true the route matches ONLY when the
+    /// request path equals `path_prefix` byte-for-byte: never a longer or
+    /// shorter path. Within a host match class an exact hit wins outright,
+    /// even over a longer prefix route; without an exact hit the existing
+    /// longest-prefix rule applies (see `openrusty-server`
+    /// `pipeline::match_route`). Defaults to false (prefix semantics).
+    #[serde(default)]
+    pub exact: bool,
     pub upstream: String,
     #[serde(default)]
     pub timeout_ms: u64,
@@ -408,6 +417,37 @@ upstream = "vllm"
         )
         .unwrap();
         assert!(validate(&blank).is_err());
+    }
+
+    /// `exact` is optional and defaults to false (prefix semantics).
+    #[test]
+    fn route_exact_defaults_to_false() {
+        let cfg: Config = toml::from_str(GOOD).unwrap();
+        assert!(!cfg.routes[0].exact);
+    }
+
+    /// `exact = true` parses verbatim and passes validation (the existing
+    /// `path_prefix`-starts-with-'/' check covers exact routes).
+    #[test]
+    fn route_exact_parses_and_validates() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "path_prefix = \"/\"",
+            "exact = true\npath_prefix = \"/v1/chat\"",
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.routes[0].exact);
+        assert_eq!(cfg.routes[0].path_prefix, "/v1/chat");
+    }
+
+    /// An exact route still needs an absolute `path_prefix`.
+    #[test]
+    fn rejects_exact_route_without_leading_slash() {
+        let cfg: Config = toml::from_str(
+            &GOOD.replace("path_prefix = \"/\"", "exact = true\npath_prefix = \"api\""),
+        )
+        .unwrap();
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
