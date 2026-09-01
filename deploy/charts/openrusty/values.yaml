@@ -1,0 +1,47 @@
+# Default values for the openrusty chart (ingress + egress-gateway).
+
+image:
+  repository: ghcr.io/openrusty/openrusty
+  # Placeholder: the real registry/image channel is 0.2 gating. Renders
+  # fine, but do not expect the tag to exist upstream yet.
+  tag: "0.0.0-placeholder"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# UID the proxy sidecar runs as (and the iptables-init owner-match
+# exemption). Must match `openrusty inject --proxy-uid` defaults.
+proxyUid: 511
+
+# Fixed three-port convention (inbound / outbound / admin). The sidecar
+# shapes and configs below are rendered from these; keep in sync with
+# `openrusty inject`.
+ports:
+  inbound: 4143
+  outbound: 4140
+  admin: 4191
+
+# Ingress-adopted classes (config.openrusty.io class matching).
+ingressClass: openrusty
+
+# Edge gateway adopting Kubernetes Ingresses.
+ingress:
+  replicas: 2
+  logLevel: warn
+  service:
+    type: LoadBalancer
+    # Edge data port. Non-transparent, TLS off in v1 (plain HTTP/1.1+h2c):
+    # front it with your own TLS LB, or flip a later chart value.
+    port: 8443
+
+# Cluster egress gateway (transparent inbound receiving forwarded egress).
+egressGateway:
+  replicas: 2
+  service:
+    type: ClusterIP
+
+# Demo workload with the statically written injection result
+# (tests/fixtures/inject/deployment.yaml | openrusty inject).
+demo:
+  enabled: false

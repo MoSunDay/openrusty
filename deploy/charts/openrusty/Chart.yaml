@@ -1,0 +1,8 @@
+apiVersion: v2
+name: openrusty
+description: nginx-style API gateway with WASM plugins - ingress gateway, egress gateway.
+type: application
+version: 0.1.0
+# Placeholder until the real image channel ships (0.2 gating); the chart
+# renders against it but the tag is not pullable from any registry yet.
+appVersion: "0.0.0-placeholder"

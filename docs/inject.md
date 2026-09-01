@@ -81,3 +81,26 @@ read `metadata.annotations`.
 Output is always two YAML documents (workload first, then ConfigMap).
 Key order inside the workload may differ from the input because the parsed
 tree is re-rendered; `kubectl apply` treats both shapes identically.
+
+## Helm chart (`deploy/charts/openrusty`)
+
+The chart renders the two cluster roles around the injected sidecar:
+
+- `ingress` - Deployment + `LoadBalancer` Service on a non-transparent,
+  plain-HTTP data port (8443, `tls = false`; edge TLS stays with a
+  fronting LB or a later chart value) plus the admin port, with
+  `[ingress] enabled = true` and the adopted class rendered into an
+  in-chart ConfigMap.
+- `egress-gateway` - Deployment (pause container + statically baked
+  `openrusty-proxy` sidecar with transparent inbound on 4143) + Service
+  exposing the data (4143) and admin/probe (4191) ports, carrying the
+  gateway identity annotations (`config.openrusty.io/egress-gateway:
+  "true"`, `inject: "disabled"` so a later re-inject never double-injects).
+- `demo` (`demo.enabled=false` by default) - the shared fixture workload
+  with its injection result written out statically.
+
+`scripts/chart-lint.sh` helm-templates three releases (defaults /
+`demo.enabled=true` / `ingress.service.type=NodePort`), runs the inject
+CLI over `tests/fixtures/inject/deployment.yaml` and asserts the rendered
+chart sidecar matches the CLI output (ports, UID, init flags, mounts,
+TOML body). No cluster or kubeconfig involved.
