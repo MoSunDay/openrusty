@@ -1,0 +1,28 @@
+{
+  "kind": "Ingress",
+  "metadata": {
+    "name": "bare",
+    "namespace": "web",
+    "resourceVersion": "102"
+  },
+  "spec": {
+    "rules": [
+      {
+        "host": "bare.example.com",
+        "http": {
+          "paths": [
+            {
+              "path": "/x",
+              "backend": {
+                "service": {
+                  "name": "example-svc",
+                  "port": { "number": 8000 }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

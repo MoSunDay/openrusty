@@ -142,6 +142,7 @@ mod tests {
             retry_on_timeout: true,
             connect_timeout_ms: 1500,
             pool_idle_timeout_ms: 30_000,
+            endpoints: Vec::new(),
             peers: vec![
                 openrusty_core::config::PeerConfig {
                     addr: "127.0.0.1:9001".parse().unwrap(),
