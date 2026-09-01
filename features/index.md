@@ -8,6 +8,7 @@ Commit: d9a7ede
 - [负载均衡与健康检查](./load-balancing/index.md) —— swrr/ip_hash、被动健康、故障摘除与恢复
 - [vllm-kv-scheduler 亲和调度](./vllm-kv-scheduler/index.md) —— vLLM 风格 KV-cache 亲和：task key 粘滞、最少任务选择、TTL 释放
 - [运维与部署](./ops/index.md) —— `/openrusty/status`、systemd 开机自启、配置加载、三层验证
+- [K8s 三形态](./k8s-forms/index.md) —— sidecar 透明拦截、ingress watch+TLS、egress 三态；iptables-init/inject/chart 部署面
 
 ## Changelog
 - [changelog](./changelog/)
