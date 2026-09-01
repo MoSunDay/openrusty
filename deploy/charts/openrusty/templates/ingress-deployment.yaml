@@ -1,0 +1,99 @@
+{{/* Ingress gateway: adopts Kubernetes Ingresses ([ingress] enabled) and
+     serves the edge data port. RBAC (ServiceAccount + watch permissions)
+     lands together with the real image channel (0.2 gating). */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openrusty.ingressName" . }}-config
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+data:
+  openrusty.toml: |
+    [server]
+    listen = "0.0.0.0:{{ .Values.ingress.service.port }}"
+    log_level = "{{ .Values.ingress.logLevel }}"
+
+    [[server.listeners]]
+    role = "inbound"
+    listen = "0.0.0.0:{{ .Values.ingress.service.port }}"
+    tls = false
+
+    [[server.listeners]]
+    role = "admin"
+    listen = "0.0.0.0:{{ .Values.ports.admin }}"
+
+    [plugins]
+    dir = "/dev/null-plugins"
+
+    [ingress]
+    enabled = true
+    ingress_class = "{{ .Values.ingressClass }}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openrusty.ingressName" . }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+spec:
+  replicas: {{ .Values.ingress.replicas }}
+  selector:
+    matchLabels:
+      {{- include "openrusty.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ingress
+  template:
+    metadata:
+      labels:
+        {{- include "openrusty.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ingress
+    spec:
+      containers:
+        - name: openrusty
+          image: {{ include "openrusty.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - /etc/openrusty/openrusty.toml
+          ports:
+            - name: http
+              containerPort: {{ .Values.ingress.service.port }}
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+          readinessProbe:
+            httpGet:
+              path: /openrusty/ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /openrusty/live
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openrusty
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openrusty.ingressName" . }}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openrusty.ingressName" . }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+spec:
+  type: {{ .Values.ingress.service.type }}
+  selector:
+    {{- include "openrusty.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+  ports:
+    - name: http
+      port: {{ .Values.ingress.service.port }}
+      targetPort: http

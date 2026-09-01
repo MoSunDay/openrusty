@@ -1,0 +1,109 @@
+{{/* Egress gateway: the transparent entry point mesh sidecars forward
+     plain-HTTP egress to. Shape mirrors the multicluster gateway
+     convention: a workload-carrying pod (pause) plus the openrusty-proxy
+     sidecar, a Service exposing the data port, and identity annotations
+     on the pod template. The sidecar is baked in statically - the pod
+     template therefore opts itself out of `openrusty inject`. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openrusty.egressName" . }}-config
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress-gateway
+data:
+  openrusty.toml: |
+    [server]
+    listen = "0.0.0.0:{{ .Values.ports.inbound }}"
+    log_level = "warn"
+
+    [[server.listeners]]
+    role = "inbound"
+    listen = "0.0.0.0:{{ .Values.ports.inbound }}"
+    transparent = true
+
+    [[server.listeners]]
+    role = "admin"
+    listen = "0.0.0.0:{{ .Values.ports.admin }}"
+
+    [plugins]
+    dir = "/dev/null-plugins"
+
+    [egress]
+    # The gateway serves forwarded egress; it does not originate traffic.
+    # Opaque streams it cannot route fail closed until gateway policy
+    # (routes/RBAC/image channel) lands.
+    mode = "deny"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openrusty.egressName" . }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress-gateway
+spec:
+  replicas: {{ .Values.egressGateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "openrusty.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: egress-gateway
+  template:
+    metadata:
+      labels:
+        {{- include "openrusty.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: egress-gateway
+      annotations:
+        config.openrusty.io/egress-gateway: "true"
+        config.openrusty.io/inject: "disabled"
+        config.openrusty.io/proxy-uid: "{{ .Values.proxyUid }}"
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+        - name: openrusty-proxy
+          image: {{ include "openrusty.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - /etc/openrusty/openrusty.toml
+          ports:
+            - name: proxy
+              containerPort: {{ .Values.ports.inbound }}
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+          securityContext:
+            runAsUser: {{ .Values.proxyUid }}
+          readinessProbe:
+            httpGet:
+              path: /openrusty/ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/openrusty
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "openrusty.egressName" . }}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openrusty.egressName" . }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress-gateway
+spec:
+  type: {{ .Values.egressGateway.service.type }}
+  selector:
+    {{- include "openrusty.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: egress-gateway
+  ports:
+    - name: proxy
+      port: {{ .Values.ports.inbound }}
+      targetPort: proxy
+    - name: admin
+      port: {{ .Values.ports.admin }}
+      targetPort: admin
