@@ -1166,6 +1166,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "openrusty-core",
+ "openrusty-k8s",
  "openrusty-proxy",
  "openrusty-wasm",
  "serde",

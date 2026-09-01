@@ -104,6 +104,21 @@ path_prefix = "/"
 upstream = "vllm"
 timeout_ms = 30000
 
+# --- Kubernetes ingress adoption (optional) ---------------------------------
+# Watches cluster Ingress objects of the matching ingress class and folds
+# them into the runtime route table (static routes first, rendered after).
+# Off by default: without this section the gateway serves the static config
+# only. Credentials never live in this file - `kubeconfig` is a PATH only
+# (empty = explicit path > $KUBECONFIG > ~/.kube/config > in-cluster).
+# A TLS secret referenced by an adopted Ingress that is missing or not of
+# type kubernetes.io/tls blocks the apply (previous runtime stays active),
+# exactly like a static/rendered route conflict does.
+# [ingress]
+# enabled = false
+# ingress_class = "openrusty"
+# kubeconfig = ""
+# namespaces = []              # empty = all namespaces (RBAC still applies)
+
 # --- Role-based multi-listener (sidecar mode) -------------------------------
 # Uncommenting ANY [[server.listeners]] entry below switches the gateway into
 # multi-socket mode, and those entries become the ONLY authority for which

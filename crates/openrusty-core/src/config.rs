@@ -4,6 +4,7 @@
 //! re-exported here, so `openrusty_core::config::ListenerConfig` and friends
 //! keep their historical paths.
 
+mod ingress;
 mod listeners;
 
 use serde::Deserialize;
@@ -12,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
+pub use ingress::IngressConfig;
 pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
 
 #[derive(Debug, Error)]
@@ -34,6 +36,10 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Kubernetes ingress adoption; everything off by default, so the
+    /// gateway stays a purely static-config proxy unless opted in.
+    #[serde(default)]
+    pub ingress: IngressConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,6 +287,8 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Listener-specific invariants (role/address uniqueness, transparency
     // sanity) live with the listener types.
     listeners::validate_listeners(cfg)?;
+    // Ingress invariants (class must be matchable, namespaces non-empty).
+    ingress::validate(&cfg.ingress)?;
     // The plugin registry (openrusty-wasm) trusts `order` to name each plugin
     // at most once; a duplicate would make execution order ambiguous.
     let mut seen_order = std::collections::HashSet::new();

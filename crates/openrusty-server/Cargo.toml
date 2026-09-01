@@ -12,6 +12,7 @@ path = "src/main.rs"
 openrusty-core = { workspace = true }
 openrusty-wasm = { workspace = true }
 openrusty-proxy = { workspace = true }
+openrusty-k8s = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
