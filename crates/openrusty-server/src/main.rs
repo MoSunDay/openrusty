@@ -8,12 +8,19 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, ingress, listeners, reload, shutdown, state};
+use openrusty_server::{active_probe, ingress, init, listeners, reload, shutdown, state};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
+
+/// Subcommand dispatch happens before any config work: `openrusty
+/// iptables-init` is a one-shot parameter-plane tool that must run (and
+/// fail fast) without a gateway config file or a serving runtime.
+fn is_iptables_init() -> bool {
+    std::env::args().nth(1).as_deref() == Some(init::SUBCOMMAND)
+}
 
 fn resolve_config_path() -> PathBuf {
     std::env::args()
@@ -25,6 +32,9 @@ fn resolve_config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    if is_iptables_init() {
+        std::process::exit(init::exec::run_cli(std::env::args().skip(2).collect()));
+    }
     let config_path = resolve_config_path();
     if !config_path.is_file() {
         eprintln!(
