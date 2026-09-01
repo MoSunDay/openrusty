@@ -43,6 +43,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
@@ -232,13 +233,18 @@ async fn handle_conn<S>(
         Step::Sniff(dst) => {
             let budget = Duration::from_millis(cfg.detect_timeout_ms);
             match proxy::detect(&mut stream, budget).await {
-                Ok((protocol, prefix)) => match route_http(protocol) {
-                    HttpStep::ServeHttp(mode) => {
-                        let io = PrefixedStream::new(prefix, stream);
-                        serve_conn(svc, io, remote, mode, rx, timeouts).await;
+                Ok((protocol, prefix)) => {
+                    // The sniff only *borrowed* the leading bytes, so every
+                    // branch must see them again: re-inject the prefix ahead
+                    // of the live socket before the stream is consumed.
+                    let io = PrefixedStream::new(prefix, stream);
+                    match route_http(protocol) {
+                        HttpStep::ServeHttp(mode) => {
+                            serve_conn(svc, io, remote, mode, rx, timeouts).await;
+                        }
+                        HttpStep::Tunnel => tunnel_to(io, dst, remote).await,
                     }
-                    HttpStep::Tunnel => tunnel_to(stream, dst, remote).await,
-                },
+                }
                 // EOF before the prefix settled: the peer gave up first.
                 Err(e) => {
                     tracing::debug!(
@@ -254,8 +260,12 @@ async fn handle_conn<S>(
 }
 
 /// Dials the original destination and shovels bytes verbatim between it and
-/// the intercepted connection until both ends are done.
-async fn tunnel_to(client: TcpStream, dst: SocketAddr, remote: SocketAddr) {
+/// the intercepted connection until both ends are done. `client` is the
+/// (possibly prefix-reinjecting) client side of the intercepted connection.
+async fn tunnel_to<S>(client: S, dst: SocketAddr, remote: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     match TcpStream::connect(dst).await {
         Ok(upstream) => {
             let _ = upstream.set_nodelay(true);
@@ -343,5 +353,49 @@ mod tests {
             HttpStep::ServeHttp(ProtoMode::ForceHttp2)
         );
         assert_eq!(route_http(proxy::Protocol::Opaque), HttpStep::Tunnel);
+    }
+
+    /// An opaque intercepted connection must reach its original destination
+    /// byte-for-byte: `detect` only *borrows* the leading bytes, so the
+    /// client side handed to the tunnel must carry the re-injected prefix -
+    /// dropping it would corrupt e.g. a TLS ClientHello. The call site is
+    /// exercised end to end by `scripts/local-netns-test.sh` under a real
+    /// REDIRECT (a unit test cannot fake `SO_ORIGINAL_DST`).
+    #[tokio::test]
+    async fn tunnel_forwards_the_reinjected_prefix_verbatim() {
+        use tokio::io::AsyncWriteExt;
+
+        let dst = TcpListener::bind("127.0.0.1:0").await.expect("bind dst");
+        let dst_addr = dst.local_addr().expect("dst addr");
+
+        let local = TcpListener::bind("127.0.0.1:0").await.expect("bind local");
+        let addr = local.local_addr().expect("local addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (stream, remote) = local.accept().await.expect("accept");
+
+        let prefix = bytes::Bytes::from_static(b"\x16\x03\x01 borrowed!");
+        let task = tokio::spawn(tunnel_to(
+            PrefixedStream::new(prefix, stream),
+            dst_addr,
+            remote,
+        ));
+
+        client.write_all(b"rest-of-stream").await.expect("write");
+        client.shutdown().await.expect("half-close");
+        drop(client);
+
+        let (mut up, _) = dst.accept().await.expect("tunnel dialed dst");
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut up, &mut got)
+            .await
+            .expect("read tunneled bytes");
+        assert_eq!(
+            got, b"\x16\x03\x01 borrowed!rest-of-stream",
+            "tunnel must deliver every byte, prefix included"
+        );
+        // The tunnel finishes only when both directions are done; close the
+        // destination side so the b -> a copy sees its EOF.
+        drop(up);
+        task.await.expect("tunnel_to ends");
     }
 }
