@@ -1,0 +1,70 @@
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "Ingress",
+  "metadata": {
+    "name": "app",
+    "namespace": "web",
+    "resourceVersion": "101",
+    "uid": "11111111-2222-3333-4444-555555555555",
+    "creationTimestamp": "2026-01-01T00:00:00Z",
+    "annotations": {
+      "openrusty.example/dummy": "yes"
+    }
+  },
+  "spec": {
+    "ingressClassName": "openrusty",
+    "tls": [
+      {
+        "hosts": ["app.example.com"],
+        "secretName": "app-tls"
+      }
+    ],
+    "rules": [
+      {
+        "host": "App.Example.COM",
+        "http": {
+          "paths": [
+            {
+              "path": "/v1/chat",
+              "pathType": "Exact",
+              "backend": {
+                "service": {
+                  "name": "example-svc",
+                  "port": { "number": 8000 }
+                }
+              }
+            },
+            {
+              "path": "/",
+              "pathType": "Prefix",
+              "backend": {
+                "service": {
+                  "name": "example-svc",
+                  "port": { "number": 8000 }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "http": {
+          "paths": [
+            {
+              "path": "/catch-all",
+              "pathType": "ImplementationSpecific",
+              "backend": {
+                "service": {
+                  "name": "wildcard-svc",
+                  "port": { "number": 9000 }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "status": { "loadBalancer": {} },
+  "unknownFutureField": { "anything": true }
+}

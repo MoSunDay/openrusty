@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
-pub use listeners::{ListenerConfig, ListenerRole, effective_listeners};
+pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -207,6 +207,15 @@ pub struct UpstreamConfig {
     pub pool_idle_timeout_ms: u64,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// DNS endpoints (`host:port`) for service-discovered upstreams, e.g.
+    /// the ClusterIP service DNS names rendered from Kubernetes Ingresses
+    /// by `openrusty-k8s` (`svc.ns.svc.cluster.local:port`). Static TOML
+    /// upstreams leave this empty and use `peers` instead; an upstream
+    /// must define at least one of the two. Endpoints are resolved to
+    /// socket addresses on the connect path at apply time (kube-proxy does
+    /// the DNAT/load-balancing behind the ClusterIP), never at parse time.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
     #[serde(default)]
     pub health: HealthConfig,
 }
@@ -295,8 +304,16 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if !seen.insert(up.name.clone()) {
             return Err(bad(&format!("duplicate upstream name: {}", up.name)));
         }
-        if up.peers.is_empty() {
+        if up.peers.is_empty() && up.endpoints.is_empty() {
             return Err(bad(&format!("upstream {} has no peers", up.name)));
+        }
+        for (i, ep) in up.endpoints.iter().enumerate() {
+            if ep.trim().is_empty() {
+                return Err(bad(&format!(
+                    "upstream {} endpoint #{i} must not be empty",
+                    up.name
+                )));
+            }
         }
         for (i, p) in up.peers.iter().enumerate() {
             if p.weight == 0 {
@@ -507,6 +524,28 @@ upstream = "vllm"
         ))
         .unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    /// k8s-rendered upstreams carry DNS endpoints instead of static peer
+    /// addresses (ClusterIP service DNS); validation must accept the
+    /// endpoints-only shape and still reject an upstream with neither.
+    #[test]
+    fn accepts_endpoint_only_upstream() {
+        let peers_block = r#"  [[upstreams.peers]]
+  addr = "127.0.0.1:9001""#;
+        let endpoints_block = r#"endpoints = ["example-svc.web.svc.cluster.local:8000"]"#;
+        let cfg: Config = toml::from_str(&GOOD.replace(peers_block, endpoints_block)).unwrap();
+        assert_eq!(cfg.upstreams[0].peers.len(), 0);
+        assert_eq!(
+            cfg.upstreams[0].endpoints,
+            vec!["example-svc.web.svc.cluster.local:8000".to_string()]
+        );
+        validate(&cfg).unwrap();
+
+        let cfg: Config =
+            toml::from_str(&GOOD.replace(peers_block, "endpoints = [\" \"]")).unwrap();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("endpoint #0"), "{err}");
     }
 
     #[test]

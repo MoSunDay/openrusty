@@ -1,0 +1,18 @@
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "Ingress",
+  "metadata": {
+    "name": "fallback",
+    "namespace": "web",
+    "resourceVersion": "103"
+  },
+  "spec": {
+    "ingressClassName": "openrusty",
+    "defaultBackend": {
+      "service": {
+        "name": "fallback-svc",
+        "port": { "number": 8080 }
+      }
+    }
+  }
+}

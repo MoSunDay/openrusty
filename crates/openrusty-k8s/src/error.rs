@@ -69,6 +69,11 @@ pub enum K8sError {
     #[error("http request failed: {0}")]
     Http(#[from] hyper_util::client::legacy::Error),
 
+    /// A payload from the apiserver (watch event line, list body) is not
+    /// valid JSON or does not match the expected object shape.
+    #[error("json decode failed: {0}")]
+    Json(#[from] serde_json::Error),
+
     /// Assembling an HTTP request failed (bad URI/header values).
     #[error("http request build failed: {0}")]
     RequestBuild(#[from] hyper::http::Error),
