@@ -175,6 +175,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "plugins": plugins,
         "routes": rt.routes.len(),
         "upstreams": upstreams,
+        "ingress": crate::ingress::status_node(&state.ingress.load()),
     }))
 }
 

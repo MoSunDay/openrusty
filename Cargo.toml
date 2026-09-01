@@ -21,6 +21,7 @@ openrusty-wasm = { path = "crates/openrusty-wasm" }
 openrusty-proxy = { path = "crates/openrusty-proxy" }
 openrusty-sdk = { path = "crates/openrusty-sdk" }
 openrusty-macros = { path = "crates/openrusty-macros" }
+openrusty-k8s = { path = "crates/openrusty-k8s" }
 
 axum = "0.8"
 hyper = { version = "1.11", features = ["full"] }

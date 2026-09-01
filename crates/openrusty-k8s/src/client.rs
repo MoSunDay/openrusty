@@ -54,10 +54,13 @@ pub type ByteStream = hyper::body::Incoming;
 /// version omits the parameter, which the apiserver interprets as "start
 /// from now".
 pub fn watch_path(path: &str, resource_version: &str) -> String {
+    // `path` may already carry a query (e.g. the TLS fieldSelector on the
+    // secrets watch); join with `&` there instead of emitting a second `?`.
+    let sep = if path.contains('?') { '&' } else { '?' };
     if resource_version.is_empty() {
-        format!("{path}?watch=1&allowWatchBookmarks=true")
+        format!("{path}{sep}watch=1&allowWatchBookmarks=true")
     } else {
-        format!("{path}?watch=1&allowWatchBookmarks=true&resourceVersion={resource_version}")
+        format!("{path}{sep}watch=1&allowWatchBookmarks=true&resourceVersion={resource_version}")
     }
 }
 
@@ -278,10 +281,26 @@ mod tests {
         assert_eq!(
             watch_path("/api/v1/ingresses", "4215"),
             "/api/v1/ingresses?watch=1&allowWatchBookmarks=true&resourceVersion=4215"
+
         );
         assert_eq!(
             watch_path("/api/v1/ingresses", ""),
             "/api/v1/ingresses?watch=1&allowWatchBookmarks=true"
+        );
+    }
+
+    /// A path that already carries a query (the TLS fieldSelector on the
+    /// secrets watch) must be joined with `&`, never a second `?`.
+    #[test]
+    fn watch_path_joins_an_existing_query() {
+        let path = "/api/v1/secrets?fieldSelector=type%3Dkubernetes.io%2Ftls";
+        assert_eq!(
+            watch_path(path, "7"),
+            format!("{path}&watch=1&allowWatchBookmarks=true&resourceVersion=7")
+        );
+        assert_eq!(
+            watch_path(path, ""),
+            format!("{path}&watch=1&allowWatchBookmarks=true")
         );
     }
 

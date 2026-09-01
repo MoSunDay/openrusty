@@ -8,7 +8,7 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, listeners, reload, shutdown, state};
+use openrusty_server::{active_probe, ingress, listeners, reload, shutdown, state};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -65,6 +65,18 @@ async fn main() {
     };
     // Start active health probing (no-op when no upstream enables it).
     active_probe::spawn(&state);
+
+    // Ingress watch (optional, `[ingress] enabled = true`): cluster
+    // snapshots are rendered and applied OFF the serve path via
+    // `state::apply_runtime`; any failure only downgrades to the static
+    // config. The spawned loops park in their watch streams and are
+    // reclaimed by the runtime at process exit - no shutdown bookkeeping.
+    if cfg.ingress.enabled {
+        let st = state.clone();
+        let ingress_cfg = cfg.ingress.clone();
+        let static_routes = cfg.routes.clone();
+        tokio::spawn(ingress::run(st, ingress_cfg, static_routes));
+    }
 
     // KV sweeper: expire stale plugin KV entries.
     {

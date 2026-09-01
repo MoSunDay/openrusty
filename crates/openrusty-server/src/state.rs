@@ -41,6 +41,16 @@ pub struct AppState {
     pub metrics: Arc<metrics::Metrics>,
     pub runtime: arc_swap::ArcSwap<RuntimeSnapshot>,
     pub config_path: PathBuf,
+    /// The boot-time static configuration. Base of the ingress render
+    /// merge (static upstreams/routes plus the `[ingress]` segment); a
+    /// file reload swaps the runtime directly and never rewrites this
+    /// base (see `crate::ingress` for the documented interplay).
+    pub static_config: Config,
+    /// Live status of the optional ingress watch loops (generation
+    /// counters, reconnects, last hand-over); read by
+    /// `/openrusty/status`, updated rarely via `rcu`. All-default while
+    /// ingress is disabled.
+    pub ingress: arc_swap::ArcSwap<crate::ingress::WatchStatus>,
     pub started_at: std::time::Instant,
     /// Handle of the active-probe task; cancelled and replaced on reload.
     pub probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -86,13 +96,15 @@ pub fn from_config(
         metrics: Arc::new(metrics::Metrics::new()),
         runtime: arc_swap::ArcSwap::from_pointee(empty_runtime()),
         config_path,
+        static_config: cfg,
+        ingress: arc_swap::ArcSwap::from_pointee(crate::ingress::WatchStatus::default()),
         started_at: std::time::Instant::now(),
         probe_task: Mutex::new(None),
         reload_gate: tokio::sync::Mutex::new(()),
         shutdown: crate::shutdown::new_signal(),
     });
     let generation = state.registry.snapshot().generation;
-    apply_runtime(&state, &cfg, generation);
+    apply_runtime(&state, &state.static_config, generation);
     Ok(state)
 }
 
