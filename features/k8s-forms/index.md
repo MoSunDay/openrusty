@@ -25,6 +25,7 @@
 - upstream 直拨 ClusterIP DNS（`ing-{ns}-{svc}-{port}` → `svc.ns.svc.cluster.local:port`），被动健康禁用（`max_fails = 0`）；路由支持 exact + host 约束。
 - 凭据不可用时仅记录错误、留在静态配置——ingress 是增强不是依赖。
 - 观测面：`/openrusty/status` 的 `ingress` 节（enabled/watching/generation/last_rv/reconnects/last_success_age_ms + secrets）。
+- 验收入口：`scripts/cluster-e2e.sh`（M4 集群 e2e 七组断言 + 10min 观察窗；`--preflight` 无集群可跑，见 [changelog](../changelog/2026-09-01/cluster-e2e.md)）。
 
 ## 部署面（同属本批能力）
 - `openrusty iptables-init`：nat REDIRECT 参数面（OPENRUSTY_IN/OPENRUSTY_OUT custom chain、owner 豁免第一条、幂等、preflight 自检、--dry-run）。

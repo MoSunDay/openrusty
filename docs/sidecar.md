@@ -373,6 +373,10 @@ families on `/openrusty/metrics`.
 | `scripts/local-netns-test.sh` | full transparent inbound/outbound path under a real iptables REDIRECT inside a throwaway netns: orig_dst recovery, opaque byte-faithful tunnel, loop guard, iptables-init idempotence, graceful shutdown (26 checks) |
 | `scripts/local-egress-test.sh` | egress tri-mode over a netns topology: direct/deny/gateway phases with the `openrusty_transparent_conns_total` contract as the assertion surface, XFF injection, opaque refusal (21 checks) |
 | `scripts/chart-lint.sh` | helm-render the chart (3 releases) plus the inject-CLI vs chart sidecar consistency drill (24 checks) |
+| `scripts/cluster-e2e.sh` | M4 cluster e2e, seven assertion groups: preflight (RBAC/version/image, gaps named), deploy + reach (LB with recorded NodePort fallback), routes + TLS handshake, watch resilience (stale-serve blackout), conflict red lines, removal rollback, 10-min observation window; `--preflight` runs without a cluster |
 
-All three gate their environment up front and print a visible SKIP
-instead of failing on un-capable machines; no cluster is involved.
+The three local drills gate their environment up front and print a
+visible SKIP instead of failing on un-capable machines; no cluster is
+involved. `cluster-e2e.sh` follows the same gate: without kubectl, a
+kubeconfig or a reachable cluster it names every gap and SKIPs
+(exit 0); with them, a hard G1 gap fails loudly (exit 1).
