@@ -40,10 +40,13 @@ use prefixed::PrefixedStream;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
+
+use crate::shutdown::{self, InFlight};
 
 /// Why a transparently intercepted connection is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,13 +114,15 @@ pub(crate) fn route_http(protocol: proxy::Protocol) -> HttpStep {
 /// Accept loop for a transparent listener: per connection, recover the
 /// original destination and split by protocol. Mirrors the shutdown
 /// handling of `h2c::serve_listener` (transient accept errors are logged,
-/// never fatal). `own_ports` is every listener port, all roles included.
+/// never fatal). `own_ports` is every listener port, all roles included;
+/// `in_flight` counts accepted connections for the drain summary.
 pub(crate) async fn serve_listener(
     router: axum::Router,
     cfg: ListenerConfig,
     listener: TcpListener,
     own_ports: Arc<[u16]>,
-    mut shutdown: broadcast::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
+    in_flight: InFlight,
 ) -> io::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(
@@ -127,27 +132,40 @@ pub(crate) async fn serve_listener(
         "listening (transparent intercept)"
     );
     let svc = router.into_service::<axum::body::Body>();
+    // A signal that arrived before the loop started still stops it.
+    if shutdown::is_draining(&shutdown) {
+        tracing::info!(%addr, "shutdown signalled; not accepting");
+        return Ok(());
+    }
     loop {
         tokio::select! {
-            sig = shutdown.recv() => {
+            sig = shutdown.changed() => {
+                // The flip - or the sender being dropped, which tests and
+                // embedders use as the stop shortcut - ends the loop.
                 match sig {
-                    Ok(()) | Err(broadcast::error::RecvError::Closed) => {
+                    Err(_) => {
+                        tracing::info!("shutdown channel closed; stop accepting");
+                        return Ok(());
+                    }
+                    Ok(()) if *shutdown.borrow() => {
                         tracing::info!("shutdown signal received; stop accepting");
                         return Ok(());
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!(n, "shutdown channel lagged");
-                    }
+                    // Not our flip; keep serving.
+                    Ok(()) => {}
                 }
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, remote)) => {
                     let svc = svc.clone();
-                    let rx = shutdown.resubscribe();
+                    let rx = shutdown.clone();
                     let cfg = cfg.clone();
                     let ports = own_ports.clone();
+                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    let pending = in_flight.clone();
                     tokio::spawn(async move {
                         handle_conn(svc, stream, remote, cfg, ports, rx).await;
+                        pending.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -161,13 +179,16 @@ pub(crate) async fn serve_listener(
 
 /// One intercepted connection: route it through the stage-1/stage-2
 /// decisions above. Dropping the stream at any point closes the connection.
+/// HTTP branches share the h2c driver and drain on the unified signal; an
+/// established opaque tunnel intentionally keeps serving until either peer
+/// closes - the shutdown grace is what force-closes a stuck one.
 async fn handle_conn<S>(
     svc: S,
     mut stream: TcpStream,
     remote: SocketAddr,
     cfg: ListenerConfig,
     own_ports: Arc<[u16]>,
-    rx: broadcast::Receiver<()>,
+    rx: watch::Receiver<bool>,
 ) where
     S: tower::Service<
             axum::extract::Request,

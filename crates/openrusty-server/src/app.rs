@@ -1,9 +1,27 @@
 //! Management endpoints (`/openrusty/status`, `/openrusty/reload`) plus the
 //! fallback that hands every other request to the proxy pipeline.
+//!
+//! Lifecycle endpoints (all three share the unified shutdown signal of
+//! `shutdown::ShutdownSignal`):
+//!
+//! - `GET /openrusty/ready`: `200 {"status":"ready"}` while the gateway
+//!   serves; `503 {"status":"draining"}` once the shutdown signal flipped
+//!   (accept stopped, in-flight draining). Readiness is pure data - a borrow
+//!   of the watch receiver - so load balancers can pull the instance before
+//!   the socket stops accepting.
+//! - `GET /openrusty/live`: `200 {"status":"live"}` unconditionally. The
+//!   process answering is alive, draining or not: livez and readyz stay
+//!   orthogonal (k8s semantics).
+//! - `POST /openrusty/shutdown`: flips the unified signal (equivalent to
+//!   SIGTERM) and answers `200 {"status":"shutting down"}` immediately. The
+//!   response itself is an in-flight request and completes through the
+//!   normal graceful drain; the bounded wait for the listeners runs in
+//!   `shutdown::run`, driven by the binary (or an embedder).
 
 use crate::metrics;
 use crate::pipeline::{handle_request, text_response};
 use crate::reload;
+use crate::shutdown;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -29,6 +47,9 @@ fn admin_routes() -> Router<Arc<AppState>> {
         .route("/openrusty/status", get(status))
         .route("/openrusty/reload", post(reload_endpoint))
         .route("/openrusty/metrics", get(metrics_endpoint))
+        .route("/openrusty/ready", get(ready))
+        .route("/openrusty/live", get(live))
+        .route("/openrusty/shutdown", post(shutdown_endpoint))
 }
 
 /// Admin-only router: `/openrusty/*` and nothing else; every other path 404s
@@ -186,6 +207,35 @@ async fn reload_endpoint(
     }
 }
 
+/// Readiness (`GET /openrusty/ready`): 200 while serving, 503 draining once
+/// the unified shutdown signal flipped. Answers from a borrow of the watch
+/// receiver - no locks, no side effects.
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    if shutdown::is_draining(&state.shutdown.rx) {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "draining"}))).into_response()
+    } else {
+        (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
+    }
+}
+
+/// Liveness (`GET /openrusty/live`): 200 always - the process answering is
+/// alive, draining or not, so orchestrators never restart a draining
+/// instance that is merely finishing its connections.
+async fn live() -> Response {
+    (StatusCode::OK, Json(json!({"status": "live"}))).into_response()
+}
+
+/// Shutdown trigger (`POST /openrusty/shutdown`): equivalent to SIGTERM.
+/// Flips the unified signal and answers 200 right away - the flip only
+/// stops *accepting*, so this response still goes out through the normal
+/// graceful drain. The bounded wait and the summary log live in
+/// `shutdown::run`, which the binary drives after any trigger.
+async fn shutdown_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    let _ = state.shutdown.tx.send(true);
+    tracing::warn!("shutdown requested via admin endpoint");
+    (StatusCode::OK, Json(json!({"status": "shutting down"}))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +328,93 @@ mod tests {
         assert_eq!(resp.status(), 409);
         let body = body_string(resp).await;
         assert!(body.contains("reload already in progress"), "body: {body}");
+    }
+
+    /// Readiness: 200 `ready` while serving; the flip of the unified signal
+    /// (SIGTERM and the shutdown endpoint are the same flag) turns it into
+    /// 503 `draining` - the LB pull happens before the socket closes.
+    #[tokio::test]
+    async fn ready_flips_to_draining_when_shutdown_signal_fires() {
+        let dir = TmpDir::new("ready");
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/openrusty/ready", "127.0.0.1:40006"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(body_string(resp).await.contains("\"ready\""),);
+
+        state.shutdown.tx.send(true).unwrap();
+
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/openrusty/ready", "127.0.0.1:40007"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(body_string(resp).await.contains("\"draining\""));
+    }
+
+    /// Liveness stays 200 while draining: livez and readyz are orthogonal.
+    #[tokio::test]
+    async fn live_stays_ok_while_draining() {
+        let dir = TmpDir::new("live");
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/openrusty/live", "127.0.0.1:40008"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(body_string(resp).await.contains("\"live\""));
+
+        state.shutdown.tx.send(true).unwrap();
+
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/openrusty/live", "127.0.0.1:40009"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(body_string(resp).await.contains("\"live\""));
+    }
+
+    /// The shutdown endpoint is the SIGTERM equivalent: it flips the very
+    /// same signal and answers first, so the response can still be written
+    /// through the drain.
+    #[tokio::test]
+    async fn shutdown_endpoint_flips_the_unified_signal() {
+        let dir = TmpDir::new("shutdown-endpoint");
+        dir.write_config(&dir.standard_config());
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        let resp = svc
+            .clone()
+            .oneshot(request("POST", "/openrusty/shutdown", "127.0.0.1:40010"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(body_string(resp).await.contains("\"shutting down\""));
+
+        assert!(
+            crate::shutdown::is_draining(&state.shutdown.rx),
+            "endpoint did not flip the unified signal"
+        );
+        // Second trigger is a no-op on the flag, still a 200.
+        let resp = svc
+            .clone()
+            .oneshot(request("POST", "/openrusty/shutdown", "127.0.0.1:40011"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]

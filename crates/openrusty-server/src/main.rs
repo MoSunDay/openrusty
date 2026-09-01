@@ -8,10 +8,11 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, listeners, reload, state};
+use openrusty_server::{active_probe, listeners, reload, shutdown, state};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
 fn resolve_config_path() -> PathBuf {
@@ -81,8 +82,6 @@ async fn main() {
         });
     }
 
-    let (shutdown_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
-
     // SIGHUP: hot reload (config + plugins), never disrupts serving.
     {
         let st = state.clone();
@@ -110,17 +109,6 @@ async fn main() {
         });
     }
 
-    // Ctrl-C: broadcast shutdown and let connections drain.
-    {
-        let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("ctrl-c received; shutting down");
-                let _ = tx.send(());
-            }
-        });
-    }
-
     // Role-based multi-listener: `[[server.listeners]]` entries are authoritative
     // when written, otherwise a single inbound listener is derived from
     // `server.listen` (which keeps the historical single-socket shape).
@@ -131,9 +119,60 @@ async fn main() {
         );
     }
     let listeners_cfg = openrusty_core::effective_listeners(&cfg);
-    if let Err(e) = listeners::serve(listeners::mounts(&state, &listeners_cfg), rx).await {
-        tracing::error!(error = %e, "listener failed");
+    // Bind everything up front (fail-fast) and keep the accept-task handles:
+    // the shutdown sequence waits on exactly these.
+    let tasks = match listeners::spawn(listeners::mounts(&state, &listeners_cfg), &state.shutdown)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "listener failed");
+            std::process::exit(1);
+        }
+    };
+
+    // Shutdown trigger: SIGTERM, SIGINT and POST /openrusty/shutdown are
+    // three doors into the same room - all of them are answered by the one
+    // three-phase sequence below (stop accepting, bounded drain, summary).
+    tokio::select! {
+        _ = wait_signal(SignalKind::terminate()) => {
+            tracing::info!("SIGTERM received; shutting down");
+        }
+        _ = wait_signal(SignalKind::interrupt()) => {
+            tracing::info!("SIGINT received; shutting down");
+        }
+        _ = shutdown::wait_for_shutdown(state.shutdown.rx.clone()) => {
+            tracing::info!("shutdown endpoint triggered; shutting down");
+        }
+    }
+
+    let grace = Duration::from_millis(cfg.server.shutdown_grace_ms);
+    let report = shutdown::run(
+        state.shutdown.tx.clone(),
+        tasks,
+        state.shutdown.in_flight.clone(),
+        grace,
+    )
+    .await;
+    if report.task_errors > 0 {
+        tracing::error!(errors = report.task_errors, "accept tasks failed during drain");
         std::process::exit(1);
     }
-    drop(shutdown_tx);
+    // Exit 0 in both outcomes; an expired grace is already logged as a warn
+    // with the force-closed connection count.
+}
+
+/// Resolves on the given unix signal. If the handler cannot be installed
+/// (extremely constrained environments), log and park forever so the admin
+/// endpoint trigger keeps working.
+async fn wait_signal(kind: SignalKind) {
+    match tokio::signal::unix::signal(kind) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install signal handler");
+            std::future::pending::<()>().await;
+        }
+    }
 }
