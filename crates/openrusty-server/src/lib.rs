@@ -19,6 +19,7 @@ pub mod app;
 pub mod body_filter;
 pub mod h2c;
 pub mod ingress;
+pub mod init;
 pub mod listeners;
 pub mod metrics;
 pub mod pipeline;
