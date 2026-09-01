@@ -20,6 +20,7 @@ pub mod body_filter;
 pub mod egress;
 pub mod h2c;
 pub mod ingress;
+pub mod inject;
 pub mod init;
 pub mod listeners;
 pub mod metrics;

@@ -8,7 +8,7 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, ingress, init, listeners, reload, shutdown, state};
+use openrusty_server::{active_probe, ingress, inject, init, listeners, reload, shutdown, state};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,8 +18,8 @@ use tracing_subscriber::EnvFilter;
 /// Subcommand dispatch happens before any config work: `openrusty
 /// iptables-init` is a one-shot parameter-plane tool that must run (and
 /// fail fast) without a gateway config file or a serving runtime.
-fn is_iptables_init() -> bool {
-    std::env::args().nth(1).as_deref() == Some(init::SUBCOMMAND)
+fn arg_is(name: &str) -> bool {
+    std::env::args().nth(1).as_deref() == Some(name)
 }
 
 fn resolve_config_path() -> PathBuf {
@@ -32,8 +32,16 @@ fn resolve_config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    if is_iptables_init() {
+    if arg_is(init::SUBCOMMAND) {
         std::process::exit(init::exec::run_cli(std::env::args().skip(2).collect()));
+    }
+    // `openrusty inject` rewrites a workload manifest from stdin to stdout
+    // (linkerd-inject shape); same one-shot contract, no config, no runtime.
+    if arg_is(inject::SUBCOMMAND) {
+        std::process::exit(inject::run_cli(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+        ));
     }
     let config_path = resolve_config_path();
     if !config_path.is_file() {
