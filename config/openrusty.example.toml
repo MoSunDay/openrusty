@@ -110,15 +110,39 @@ timeout_ms = 30000
 #   outbound - egress traffic leaving the mesh
 #   admin    - /openrusty/status | /openrusty/reload | /openrusty/metrics
 #
+# Transparent interception (data plane roles only; an admin listener parses
+# but ignores the flag): when `transparent = true` the socket expects traffic
+# redirected by iptables/nftables REDIRECT (original destination preserved in
+# SO_ORIGINAL_DST):
+#   inbound  - each connection is protocol-sniffed (HTTP/1.x or h2c) within
+#              `detect_timeout_ms` and then either fed to the normal plugin
+#              pipeline (HTTP) or spliced as a raw TCP tunnel to the original
+#              destination (opaque TLS etc.).
+#   outbound - connections are dialed straight at the original destination,
+#              which the proxy targets INSTEAD of the [upstream] table; no
+#              per-request upstream rewriting happens on this path.
+#   both     - a loop guard rejects tunnels back to any of the gateway's own
+#              listener ports (a transparent listener without an iptables
+#              REDIRECT rule loops every connection into itself, so all
+#              traffic on it is refused by design - fail fast, not hang).
+# If the original destination cannot be read (plain connection, no redirect),
+# inbound degrades to the normal HTTP pipeline and outbound closes the
+# connection; `http1_only` only shapes the degraded inbound path - the
+# sniffed protocol decides the fast path.
+# `detect_timeout_ms` must be > 0 whenever `transparent = true`.
+#
 # [[server.listeners]]
 # role = "inbound"
 # listen = "0.0.0.0:4143"
 # # http1_only = false
+# # transparent = false
+# # detect_timeout_ms = 3000
 #
 # [[server.listeners]]
 # role = "outbound"
 # listen = "127.0.0.1:4140"
 # # http1_only = false
+# # transparent = false
 #
 # [[server.listeners]]
 # role = "admin"
