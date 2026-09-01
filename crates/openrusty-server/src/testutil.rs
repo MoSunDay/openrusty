@@ -1,5 +1,6 @@
-//! Shared test helpers: scratch directories, config generation and a
-//! fully wired `AppState` without any real listener.
+//! Shared test helpers: scratch directories, config generation, a fully
+//! wired `AppState` without any real listener, plus fixture paths and a
+//! one-shot echo upstream for proxy drills.
 
 use crate::state::{self, AppState};
 use openrusty_core::load_config;
@@ -7,6 +8,50 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Path to a committed fixture under `tests/fixtures/`.
+pub fn fixture_path(name: &str) -> String {
+    format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
+}
+
+/// Bind-then-release port reservation, matching `listeners.rs` tests.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// One-shot HTTP/1.1 upstream: reads the request head, answers with a
+/// fixed 200 "hello" and closes; enough for one proxied GET per test.
+pub async fn spawn_echo_upstream() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = head; // request head content is irrelevant here
+                let resp = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello";
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    port
+}
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 

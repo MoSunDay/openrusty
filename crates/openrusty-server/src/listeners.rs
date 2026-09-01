@@ -18,21 +18,26 @@ use crate::app;
 use crate::h2c;
 use crate::shutdown::ShutdownSignal;
 use crate::state::AppState;
+use crate::tls::{self, TlsPlan};
 use crate::transparent;
 use openrusty_core::config::{ListenerConfig, ListenerRole};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 /// One listener with its mounted router: the pure decision output of
-/// [`mounts`], consumed by [`serve`].
+/// [`mounts`], consumed by [`serve`]. `tls` carries the TLS plan (shared
+/// resolver + classified certificate sources) for `tls = true` listeners;
+/// `None` elsewhere.
 pub struct Mount {
     pub listener: ListenerConfig,
     pub router: axum::Router,
+    pub(crate) tls: Option<TlsPlan>,
 }
 
 /// Pure mounting decision: pair every effective listener with the router its
-/// role serves. Deliberately side-effect free so the admin-plane placement
-/// rule is unit-testable without sockets.
+/// role serves (and, when the listener terminates TLS, with the state's
+/// shared SNI resolver). Deliberately side-effect free so the admin-plane
+/// placement rule is unit-testable without sockets.
 pub fn mounts(state: &Arc<AppState>, listeners: &[ListenerConfig]) -> Vec<Mount> {
     let has_admin = listeners.iter().any(|l| l.role == ListenerRole::Admin);
     listeners
@@ -49,6 +54,15 @@ pub fn mounts(state: &Arc<AppState>, listeners: &[ListenerConfig]) -> Vec<Mount>
                 }
             },
             listener: l.clone(),
+            tls: state.tls_resolver.as_ref().filter(|_| tls::uses_tls(l)).map(
+                |resolver| TlsPlan {
+                    resolver: resolver.clone(),
+                    sources: tls::TlsSources::classify(
+                        l,
+                        state.static_config.ingress.enabled,
+                    ),
+                },
+            ),
         })
         .collect()
 }
@@ -86,45 +100,62 @@ pub async fn spawn(
     mounts: Vec<Mount>,
     signal: &ShutdownSignal,
 ) -> std::io::Result<Vec<JoinHandle<std::io::Result<()>>>> {
-    // Phase 1: bind everything up front. A failure here leaves nothing
-    // serving, so the caller can exit without tearing down live sockets.
+    // Phase 1: bind everything up front, and read each TLS listener's
+    // static certificate material exactly once (fail-fast: an unreadable
+    // file aborts before a single request is served; reloads never
+    // re-read it - the dynamic rotation path is ingress-driven).
     let mut bound = Vec::with_capacity(mounts.len());
+    let mut tls_cfgs = Vec::with_capacity(mounts.len());
     for m in &mounts {
         let listener = tokio::net::TcpListener::bind(m.listener.listen).await?;
+        let tls_cfg = match &m.tls {
+            Some(plan) => Some(tls::boot(plan, m.listener.http1_only)?),
+            None => None,
+        };
         tracing::info!(
             role = m.listener.role.as_str(),
             addr = %m.listener.listen,
             http1_only = m.listener.http1_only,
             transparent = m.listener.transparent,
+            tls = tls_cfg.is_some(),
             "listener bound"
         );
         bound.push(listener);
+        tls_cfgs.push(tls_cfg);
     }
     // Phase 2: one accept task per socket; all share the shutdown signal
-    // and the in-flight counter. Transparent listeners get the intercept
-    // accept loop (detect router + orig-dst tunnel), everyone else the
-    // plain HTTP pipeline.
+    // and the in-flight counter. Dispatch per shape: TLS termination
+    // (handshake + ALPN, then the shared pipeline), the transparent
+    // intercept loop (detect router + orig-dst tunnel), or the plain
+    // HTTP pipeline.
     let ports = own_ports(mounts.iter().map(|m| &m.listener));
     let mut tasks = Vec::with_capacity(mounts.len());
-    for (m, listener) in mounts.into_iter().zip(bound) {
+    for ((m, listener), tls_cfg) in mounts.into_iter().zip(bound).zip(tls_cfgs) {
         let rx = signal.rx.clone();
         let in_flight = signal.in_flight.clone();
         let ports = ports.clone();
         let transparent = uses_transparent(&m.listener);
         tasks.push(tokio::spawn(async move {
-            if transparent {
-                transparent::serve_listener(m.router, m.listener, listener, ports, rx, in_flight)
+            match tls_cfg {
+                Some(config) => {
+                    tls::serve_listener(m.router, m.listener, listener, config, rx, in_flight)
+                        .await
+                }
+                None if transparent => {
+                    transparent::serve_listener(m.router, m.listener, listener, ports, rx, in_flight)
+                        .await
+                }
+                None => {
+                    h2c::serve_listener(
+                        m.router,
+                        listener,
+                        m.listener.http1_only,
+                        rx,
+                        h2c::conn_timeouts(),
+                        in_flight,
+                    )
                     .await
-            } else {
-                h2c::serve_listener(
-                    m.router,
-                    listener,
-                    m.listener.http1_only,
-                    rx,
-                    h2c::conn_timeouts(),
-                    in_flight,
-                )
-                .await
+                }
             }
         }));
     }
@@ -200,6 +231,9 @@ mod tests {
             http1_only,
             transparent: false,
             detect_timeout_ms: 3_000,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 

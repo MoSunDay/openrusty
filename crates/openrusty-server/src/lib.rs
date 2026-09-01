@@ -26,6 +26,7 @@ pub mod pipeline_peer;
 pub mod reload;
 pub mod shutdown;
 pub mod state;
+pub mod tls;
 pub mod transparent;
 pub mod ws;
 

@@ -51,6 +51,12 @@ pub struct AppState {
     /// `/openrusty/status`, updated rarely via `rcu`. All-default while
     /// ingress is disabled.
     pub ingress: arc_swap::ArcSwap<crate::ingress::WatchStatus>,
+    /// Shared SNI certificate resolver for TLS-terminating listeners
+    /// (`Some` iff at least one effective listener sets `tls = true`).
+    /// Static material is seeded at boot; ingress applies publish
+    /// rendered secrets into it. Rotation swaps resolver tables and
+    /// never disturbs established connections.
+    pub tls_resolver: Option<Arc<crate::tls::DynamicCertResolver>>,
     pub started_at: std::time::Instant,
     /// Handle of the active-probe task; cancelled and replaced on reload.
     pub probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -89,6 +95,13 @@ pub fn from_config(
     config_path: PathBuf,
 ) -> Result<Arc<AppState>, openrusty_wasm::ReloadError> {
     let registry = PluginRegistry::bootstrap(&cfg)?;
+    // One shared SNI resolver whenever any listener terminates TLS; the
+    // material itself is loaded later, in the listener bind phase (so a
+    // bad static cert aborts boot fail-fast, not here).
+    let tls_resolver = openrusty_core::effective_listeners(&cfg)
+        .iter()
+        .any(crate::tls::uses_tls)
+        .then(|| Arc::new(crate::tls::DynamicCertResolver::new()));
     let state = Arc::new(AppState {
         registry,
         health: Arc::new(proxy::new()),
@@ -98,6 +111,7 @@ pub fn from_config(
         config_path,
         static_config: cfg,
         ingress: arc_swap::ArcSwap::from_pointee(crate::ingress::WatchStatus::default()),
+        tls_resolver,
         started_at: std::time::Instant::now(),
         probe_task: Mutex::new(None),
         reload_gate: tokio::sync::Mutex::new(()),

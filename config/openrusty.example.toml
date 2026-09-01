@@ -157,12 +157,38 @@ timeout_ms = 30000
 # sniffed protocol decides the fast path.
 # `detect_timeout_ms` must be > 0 whenever `transparent = true`.
 #
+# TLS termination (data plane roles only; an outbound listener parses but
+# ignores `tls`): `tls = true` turns the listener into a rustls endpoint that
+# terminates TLS and negotiates HTTP/2 via ALPN (h2 + http/1.1; a
+# `http1_only = true` listener offers http/1.1 only). `tls` is mutually
+# exclusive with `transparent` on the same listener. Certificates come in two
+# flavours, combined freely (ingress entries win, the static pair is the SNI
+# miss fallback):
+#   static  - `tls_cert` + `tls_key` PEM paths, read ONCE at boot; reload
+#             never re-reads them and never rebinds sockets. Both paths must
+#             be given together (or neither).
+#   ingress - with `[ingress] enabled = true`, k8s `kubernetes.io/tls`
+#             Secrets referenced by adopted Ingresses are rendered and
+#             published into the SNI table on every apply (hot rotation).
+# An SNI name with neither a table hit nor a static fallback fails the
+# handshake; the listener keeps serving.
+#
 # [[server.listeners]]
 # role = "inbound"
 # listen = "0.0.0.0:4143"
 # # http1_only = false
 # # transparent = false
 # # detect_timeout_ms = 3000
+# # Static pair example (boot-time, also the SNI miss fallback):
+# # tls = true
+# # tls_cert = "/etc/openrusty/tls/cert.pem"
+# # tls_key = "/etc/openrusty/tls/key.pem"
+#
+# [[server.listeners]]
+# role = "inbound"
+# listen = "0.0.0.0:8443"
+# # Ingress-driven example: certificates arrive via rendered k8s Secrets.
+# # tls = true
 #
 # [[server.listeners]]
 # role = "outbound"
