@@ -122,6 +122,26 @@ pub fn from_config(
     Ok(state)
 }
 
+/// Log non-fatal health advisories for upstreams whose passive-health
+/// settings are risky in their deployment shape. Advisory only: nothing in
+/// the runtime depends on this, no behavior changes. The known case is
+/// Kubernetes ingress rendering: every rendered upstream is named `ing-*`
+/// and must keep `max_fails = 0`, because a single ClusterIP endpoint
+/// failing `max_fails` times would mark the *whole ClusterIP peer* down
+/// (kube-proxy never surfaces per-pod addresses here).
+fn log_health_advisories(cfg: &Config) {
+    for up in &cfg.upstreams {
+        if up.name.starts_with("ing-") && up.health.max_fails > 0 {
+            tracing::warn!(
+                upstream = %up.name,
+                max_fails = up.health.max_fails,
+                "passive health on a k8s-rendered upstream: consider max_fails = 0 \
+                 (a single ClusterIP endpoint's 5xx must not mark the ClusterIP down)"
+            );
+        }
+    }
+}
+
 /// Rebuild the runtime snapshot from `cfg` and publish it atomically.
 ///
 /// Upstreams are re-derived from config. Passive health slots are refreshed
@@ -132,6 +152,7 @@ pub fn from_config(
 /// removed peers cannot linger. Called only after the plugin registry
 /// published a new snapshot, so config and plugins never disagree.
 pub fn apply_runtime(state: &AppState, cfg: &Config, generation: u64) {
+    log_health_advisories(cfg);
     let mut upstreams = HashMap::new();
     let mut live_addrs: Vec<SocketAddr> = Vec::new();
     for uc in &cfg.upstreams {

@@ -5,6 +5,11 @@
 //! combinations within a family are sorted, bucket lines use the fixed
 //! [`DURATION_BUCKETS`] order. No I/O, no locks — the caller samples the
 //! snapshot and the live gauges first.
+//!
+//! The `openrusty_transparent_conns_total` family is fed purely by the
+//! collector (`record_transparent`, called from the transparent intercept
+//! loop and the egress runtime), so it renders straight from the snapshot
+//! like the request/attempts counters - no live view involved.
 
 use super::{MetricsSnapshot, DURATION_BUCKETS};
 use std::collections::HashMap;
@@ -39,7 +44,8 @@ fn format_sum(v: f64) -> String {
 /// Render the full exposition text for one snapshot.
 ///
 /// Families appear in a fixed order: request counters, duration histogram,
-/// upstream attempts, plugin errors, peer health gauge, KV gauge. Label
+/// upstream attempts, plugin errors, transparent connection counters, peer
+/// health gauge, KV gauge. Label
 /// combinations within a family are sorted; buckets use the fixed
 /// [`DURATION_BUCKETS`] order with `+Inf` implied by `_count`.
 ///
@@ -130,6 +136,21 @@ pub fn render(
         ));
     }
 
+    // openrusty_transparent_conns_total
+    out.push_str(
+        "# HELP openrusty_transparent_conns_total Transparently intercepted connections by listener role and disposition.\n",
+    );
+    out.push_str("# TYPE openrusty_transparent_conns_total counter\n");
+    let mut transparent: Vec<_> = snap.transparent.iter().collect();
+    transparent.sort_by(|a, b| a.0.cmp(b.0));
+    for ((role, outcome), n) in transparent {
+        out.push_str(&format!(
+            "openrusty_transparent_conns_total{{role=\"{}\",outcome=\"{}\"}} {n}\n",
+            escape_label(role),
+            escape_label(outcome)
+        ));
+    }
+
     // openrusty_peer_healthy (gauge, sampled at render time)
     out.push_str("# HELP openrusty_peer_healthy Whether an upstream peer is currently healthy.\n");
     out.push_str("# TYPE openrusty_peer_healthy gauge\n");
@@ -164,7 +185,10 @@ mod tests {
     use super::*;
     // `super::super` is the `metrics` module both standalone (crate root)
     // and once wired as `mod metrics;` from main.rs.
-    use super::super::{Metrics, KIND_TRAP, RESULT_SUCCESS, RESULT_TIMEOUT};
+    use super::super::{
+        Metrics, KIND_TRAP, OUTCOME_EGRESS_DIRECT, OUTCOME_EGRESS_GATEWAY_FAIL, OUTCOME_HTTP,
+        OUTCOME_TUNNEL, RESULT_SUCCESS, RESULT_TIMEOUT,
+    };
 
     #[test]
     fn render_emits_help_type_and_escaped_labels() {
@@ -175,6 +199,7 @@ mod tests {
         m.record_duration(0.5);
         m.record_attempt("vllm", RESULT_TIMEOUT);
         m.record_plugin_error("sched", KIND_TRAP);
+        m.record_transparent("inbound", OUTCOME_HTTP);
         let snap = m.snapshot();
         let peers = vec![
             ("vllm".to_string(), "127.0.0.1:8000".to_string(), true),
@@ -195,6 +220,8 @@ mod tests {
             "# TYPE openrusty_upstream_attempts_total counter",
             "# HELP openrusty_plugin_errors_total ",
             "# TYPE openrusty_plugin_errors_total counter",
+            "# HELP openrusty_transparent_conns_total ",
+            "# TYPE openrusty_transparent_conns_total counter",
             "# HELP openrusty_peer_healthy ",
             "# TYPE openrusty_peer_healthy gauge",
             "# HELP openrusty_kv_entries ",
@@ -211,6 +238,9 @@ mod tests {
             .contains("openrusty_upstream_attempts_total{upstream=\"vllm\",result=\"timeout\"} 1"));
         // Snapshot counter (1) + live registry view (2) merge into 3.
         assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
+        assert!(out.contains(
+            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 1"
+        ));
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8000\"} 1"));
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8001\"} 0"));
         assert!(out.contains("openrusty_kv_entries{plugin=\"sched\"} 3"));
@@ -281,5 +311,45 @@ mod tests {
         // Same key: snapshot 1 + live 2 = 3; live-only key passes through.
         assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
         assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"timeout\"} 3"));
+    }
+
+    /// The transparent family renders every recorded (role, outcome) pair
+    /// with exact counts and stays sorted by label combination. This is the
+    /// shape the netns drills assert against (outcome totals == request
+    /// samples), so the exposition must be byte-stable.
+    #[test]
+    fn transparent_conns_render_per_role_and_outcome() {
+        let m = Metrics::new();
+        for _ in 0..3 {
+            m.record_transparent("inbound", OUTCOME_HTTP);
+        }
+        m.record_transparent("inbound", OUTCOME_TUNNEL);
+        m.record_transparent("outbound", OUTCOME_EGRESS_DIRECT);
+        m.record_transparent("outbound", OUTCOME_EGRESS_GATEWAY_FAIL);
+        m.record_transparent("outbound", OUTCOME_EGRESS_DIRECT);
+
+        let out = render(&m.snapshot(), &[], &[], &[]);
+        assert!(out.contains(
+            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 3"
+        ));
+        assert!(out.contains(
+            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"tunnel\"} 1"
+        ));
+        assert!(out.contains(
+            "openrusty_transparent_conns_total{role=\"outbound\",outcome=\"egress_direct\"} 2"
+        ));
+        assert!(out.contains(
+            "openrusty_transparent_conns_total{role=\"outbound\",outcome=\"egress_gateway_fail\"} 1"
+        ));
+
+        // Family order: transparent conns before the peer gauge, sorted
+        // within the family by (role, outcome).
+        let first = out.find("openrusty_transparent_conns_total{").unwrap();
+        let inbound = out.find("role=\"inbound\"").unwrap();
+        let outbound = out.find("role=\"outbound\"").unwrap();
+        let gauge = out.find("# HELP openrusty_peer_healthy").unwrap();
+        assert!(inbound < outbound, "(role, outcome) must be sorted");
+        assert!(out.find("role=\"inbound\",outcome=\"tunnel\"").unwrap() > inbound);
+        assert!(first < gauge, "transparent family must precede the gauge");
     }
 }

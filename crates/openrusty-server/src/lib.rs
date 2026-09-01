@@ -17,6 +17,7 @@
 pub mod active_probe;
 pub mod app;
 pub mod body_filter;
+pub mod egress;
 pub mod h2c;
 pub mod ingress;
 pub mod init;

@@ -4,6 +4,7 @@
 //! re-exported here, so `openrusty_core::config::ListenerConfig` and friends
 //! keep their historical paths.
 
+mod egress;
 mod ingress;
 mod listeners;
 
@@ -13,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
+pub use egress::{resolve_gateway, EgressConfig, EgressMode};
 pub use ingress::IngressConfig;
 pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
 
@@ -40,6 +42,11 @@ pub struct Config {
     /// gateway stays a purely static-config proxy unless opted in.
     #[serde(default)]
     pub ingress: IngressConfig,
+    /// Outbound (egress) policy for transparently intercepted connections;
+    /// `direct` by default, so existing sidecars keep dialing the original
+    /// destination. Inbound/admin listeners never consult this.
+    #[serde(default)]
+    pub egress: EgressConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +296,8 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     listeners::validate_listeners(cfg)?;
     // Ingress invariants (class must be matchable, namespaces non-empty).
     ingress::validate(&cfg.ingress)?;
+    // Egress invariants (gateway mode needs a resolvable gateway address).
+    egress::validate(&cfg.egress)?;
     // The plugin registry (openrusty-wasm) trusts `order` to name each plugin
     // at most once; a duplicate would make execution order ambiguous.
     let mut seen_order = std::collections::HashSet::new();

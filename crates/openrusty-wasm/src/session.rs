@@ -251,6 +251,7 @@ mod tests {
             upstreams: Vec::new(),
             routes: Vec::new(),
             ingress: Default::default(),
+            egress: Default::default(),
         }
     }
 
