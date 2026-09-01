@@ -1,0 +1,33 @@
+# Shared injection fixture: consumed by `openrusty inject` unit tests
+# (crates/openrusty-server/src/inject/tests.rs) and by
+# scripts/chart-lint.sh (inject-CLI vs chart sidecar shape consistency).
+# The demo app in deploy/charts/openrusty (demo.enabled=true) carries the
+# static injection result of exactly this manifest - keep the three in
+# sync (annotations -> init flags -> sidecar shape).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: demo
+  labels:
+    app: echo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+      annotations:
+        config.openrusty.io/inject: "enabled"
+        config.openrusty.io/skip-inbound-ports: "9090,15002"
+        config.openrusty.io/opaque-ports: "8443"
+    spec:
+      containers:
+        - name: echo
+          image: ghcr.io/openrusty/echo:0.0.0-placeholder
+          ports:
+            - name: http
+              containerPort: 8080
