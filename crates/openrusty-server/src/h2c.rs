@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
@@ -88,6 +89,50 @@ where
     }
 }
 
+impl<I, S, E> GracefulDrain for hyper::server::conn::http2::Connection<I, S, E>
+where
+    S: hyper::service::HttpService<Incoming>,
+    S::Error: Into<BoxError>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+    S::ResBody: hyper::body::Body + 'static,
+    <S::ResBody as hyper::body::Body>::Error: Into<BoxError>,
+    // The auto trait is a supertrait alias of hyper's `Http2ServerConnExec`,
+    // which `TokioExecutor` satisfies; reusing it keeps this impl bound to
+    // the same executor type the rest of the module already names.
+    E: HttpServerConnExec<S::Future, S::ResBody>,
+{
+    fn drain(self: Pin<&mut Self>) {
+        self.graceful_shutdown()
+    }
+}
+
+/// Protocol handling mode for one accepted connection.
+///
+/// `Auto` is the historical single-port shape: hyper-util's auto builder
+/// sniffs the h2c preface per connection. The forced variants skip sniffing
+/// entirely: the transparent intercept path (`crate::transparent`) has
+/// already classified the stream with `proxy::detect` and re-injects the
+/// sniffed bytes, so re-sniffing would only repeat settled work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtoMode {
+    /// Sniff per connection (hyper-util auto builder): HTTP/1.1 or h2c.
+    Auto,
+    /// Plain HTTP/1.1, no sniffing.
+    ForceHttp1,
+    /// HTTP/2 prior knowledge, no sniffing.
+    ForceHttp2,
+}
+
+impl From<bool> for ProtoMode {
+    fn from(http1_only: bool) -> Self {
+        if http1_only {
+            ProtoMode::ForceHttp1
+        } else {
+            ProtoMode::Auto
+        }
+    }
+}
+
 /// Accept connections on `addr` until `shutdown` fires. When `http1_only`
 /// is set, connections are served as plain HTTP/1.1 without h2c detection.
 pub async fn serve(
@@ -133,7 +178,16 @@ pub(crate) async fn serve_listener(
                     let svc = svc.clone();
                     let rx = shutdown.resubscribe();
                     tokio::spawn(async move {
-                        serve_conn(svc, stream, remote, http1_only, rx, timeouts).await;
+                        let _ = stream.set_nodelay(true);
+                        serve_conn(
+                            svc,
+                            stream,
+                            remote,
+                            ProtoMode::from(http1_only),
+                            rx,
+                            timeouts,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -146,16 +200,17 @@ pub(crate) async fn serve_listener(
     Ok(())
 }
 
-/// One connection: sniff the protocol (or, when `http1_only` is set, serve
-/// plain HTTP/1.1 directly), serve requests through the router, and
-/// gracefully drain when shutdown is signalled. `timeouts` bounds how long
-/// a client may take to produce a request head and drives HTTP/2
-/// keep-alive; both need a timer installed to fire at all.
-async fn serve_conn<S>(
+/// One connection: serve requests through the router in the requested
+/// [`ProtoMode`], and gracefully drain when shutdown is signalled. Generic
+/// over the IO so the transparent intercept path can hand over a stream
+/// with its sniffed prefix re-injected ([`crate::transparent`]). `timeouts`
+/// bounds how long a client may take to produce a request head and drives
+/// HTTP/2 keep-alive; both need a timer installed to fire at all.
+pub(crate) async fn serve_conn<S, I>(
     svc: S,
-    stream: tokio::net::TcpStream,
+    io: I,
     remote: SocketAddr,
-    http1_only: bool,
+    mode: ProtoMode,
     rx: broadcast::Receiver<()>,
     timeouts: ConnTimeouts,
 ) where
@@ -167,8 +222,8 @@ async fn serve_conn<S>(
         + Send
         + 'static,
     S::Future: Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let _ = stream.set_nodelay(true);
     let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
         let svc = svc.clone();
         async move {
@@ -183,39 +238,56 @@ async fn serve_conn<S>(
         }
     });
 
-    let io = TokioIo::new(stream);
+    let io = TokioIo::new(io);
     // `with_upgrades` so WebSocket (HTTP/1 upgrade) requests get the
     // `OnUpgrade` extension and hyper holds the socket after the 101.
-    if http1_only {
-        // Cheaper path: no preface sniffing, no http/2 state machine.
-        // (`http1::Builder` has no `serve_connection_with_upgrades`; the
-        // upgrade wrapper is applied separately below.)
-        // `header_read_timeout` panics without a timer, so the timer goes
-        // first: it bounds stalled/half-dead clients on this path too.
-        let mut builder = hyper::server::conn::http1::Builder::new();
-        builder
-            .timer(TokioTimer::new())
-            .keep_alive(true)
-            .header_read_timeout(Some(timeouts.header_read));
-        let conn = builder.serve_connection(io, service).with_upgrades();
-        drive(conn, rx, remote).await;
-    } else {
-        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-        // Both protocol halves get a timer: http1 needs it for
-        // `header_read_timeout`, http2 needs it for the keep-alive pings.
-        builder
-            .http1()
-            .timer(TokioTimer::new())
-            .keep_alive(true)
-            .header_read_timeout(Some(timeouts.header_read));
-        builder
-            .http2()
-            .timer(TokioTimer::new())
-            .adaptive_window(true)
-            .keep_alive_interval(timeouts.h2_keep_alive_interval)
-            .keep_alive_timeout(timeouts.h2_keep_alive_timeout);
-        let conn = builder.serve_connection_with_upgrades(io, service);
-        drive(conn, rx, remote).await;
+    match mode {
+        ProtoMode::ForceHttp1 => {
+            // Cheaper path: no preface sniffing, no http/2 state machine.
+            // (`http1::Builder` has no `serve_connection_with_upgrades`; the
+            // upgrade wrapper is applied separately below.)
+            // `header_read_timeout` panics without a timer, so the timer goes
+            // first: it bounds stalled/half-dead clients on this path too.
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder
+                .timer(TokioTimer::new())
+                .keep_alive(true)
+                .header_read_timeout(Some(timeouts.header_read));
+            let conn = builder.serve_connection(io, service).with_upgrades();
+            drive(conn, rx, remote).await;
+        }
+        ProtoMode::ForceHttp2 => {
+            // Prior-knowledge h2: the transparent sniff already saw the
+            // client preface, so no negotiation happens (and none is
+            // attempted). No upgrade wrapper: h2 upgrades are extended
+            // CONNECTs, handled inside the connection itself.
+            let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+            builder
+                .timer(TokioTimer::new())
+                .adaptive_window(true)
+                .keep_alive_interval(timeouts.h2_keep_alive_interval)
+                .keep_alive_timeout(timeouts.h2_keep_alive_timeout);
+            let conn = builder.serve_connection(io, service);
+            drive(conn, rx, remote).await;
+        }
+        ProtoMode::Auto => {
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            // Both protocol halves get a timer: http1 needs it for
+            // `header_read_timeout`, http2 needs it for the keep-alive pings.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .keep_alive(true)
+                .header_read_timeout(Some(timeouts.header_read));
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .adaptive_window(true)
+                .keep_alive_interval(timeouts.h2_keep_alive_interval)
+                .keep_alive_timeout(timeouts.h2_keep_alive_timeout);
+            let conn = builder.serve_connection_with_upgrades(io, service);
+            drive(conn, rx, remote).await;
+        }
     }
 }
 

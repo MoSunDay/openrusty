@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod pipeline_peer;
 pub mod reload;
 pub mod state;
+pub mod transparent;
 pub mod ws;
 
 #[cfg(test)]

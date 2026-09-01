@@ -17,6 +17,7 @@
 use crate::app;
 use crate::h2c;
 use crate::state::AppState;
+use crate::transparent;
 use openrusty_core::config::{ListenerConfig, ListenerRole};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -51,6 +52,27 @@ pub fn mounts(state: &Arc<AppState>, listeners: &[ListenerConfig]) -> Vec<Mount>
         .collect()
 }
 
+/// True when a listener must run the transparent intercept path: the config
+/// declares a REDIRECT in front of the socket and the role carries
+/// data-plane traffic. An admin listener ignores `transparent` by design
+/// (see `config::listeners`); the assembly layer is where the flag is
+/// dropped, so the semantics live in exactly one place.
+pub(crate) fn uses_transparent(l: &ListenerConfig) -> bool {
+    l.transparent && !matches!(l.role, ListenerRole::Admin)
+}
+
+/// Ports of every effective listener, all roles included. The transparent
+/// loop guard compares against this whole set: a hijacked connection aimed
+/// at *any* of our sockets would recurse if tunneled onward.
+pub(crate) fn own_ports<'a>(
+    listeners: impl IntoIterator<Item = &'a ListenerConfig>,
+) -> Arc<[u16]> {
+    let mut ports: Vec<u16> = listeners.into_iter().map(|l| l.listen.port()).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports.into()
+}
+
 /// Bind every listener, then drive one accept task per bound socket until
 /// `shutdown` fires. Bind failures propagate before any serving starts
 /// (fail-fast); accept loops run until the shutdown broadcast reaches them.
@@ -64,23 +86,33 @@ pub async fn serve(mounts: Vec<Mount>, shutdown: broadcast::Receiver<()>) -> std
             role = m.listener.role.as_str(),
             addr = %m.listener.listen,
             http1_only = m.listener.http1_only,
+            transparent = m.listener.transparent,
             "listener bound"
         );
         bound.push(listener);
     }
     // Phase 2: one accept task per socket; all share the shutdown broadcast.
+    // Transparent listeners get the intercept accept loop (detect router +
+    // orig-dst tunnel), everyone else the plain HTTP pipeline.
+    let ports = own_ports(mounts.iter().map(|m| &m.listener));
     let mut tasks = Vec::with_capacity(mounts.len());
     for (m, listener) in mounts.into_iter().zip(bound) {
         let rx = shutdown.resubscribe();
+        let ports = ports.clone();
+        let transparent = uses_transparent(&m.listener);
         tasks.push(tokio::spawn(async move {
-            h2c::serve_listener(
-                m.router,
-                listener,
-                m.listener.http1_only,
-                rx,
-                h2c::conn_timeouts(),
-            )
-            .await
+            if transparent {
+                transparent::serve_listener(m.router, m.listener, listener, ports, rx).await
+            } else {
+                h2c::serve_listener(
+                    m.router,
+                    listener,
+                    m.listener.http1_only,
+                    rx,
+                    h2c::conn_timeouts(),
+                )
+                .await
+            }
         }));
     }
     // Phase 3: drain. Every task ends only when shutdown fires (accept
@@ -102,6 +134,34 @@ mod tests {
     use super::*;
     use crate::testutil::{boot_state, TmpDir};
     use std::net::SocketAddr;
+
+    /// The assembly selection rule: `transparent` only takes effect on data
+    /// plane roles; the management plane parses but ignores the flag.
+    #[test]
+    fn transparent_flag_applies_only_to_data_plane_roles() {
+        let mut admin = listener(ListenerRole::Admin, 4191, false);
+        assert!(!uses_transparent(&admin));
+        admin.transparent = true;
+        assert!(!uses_transparent(&admin), "admin ignores transparent");
+
+        for role in [ListenerRole::Inbound, ListenerRole::Outbound] {
+            let mut l = listener(role, 4143, false);
+            assert!(!uses_transparent(&l));
+            l.transparent = true;
+            assert!(uses_transparent(&l));
+        }
+    }
+
+    /// Every listener port feeds the loop guard, deduplicated and sorted.
+    #[test]
+    fn own_ports_collect_all_listener_ports() {
+        let ports = own_ports(&[
+            listener(ListenerRole::Inbound, 4143, false),
+            listener(ListenerRole::Outbound, 4140, true),
+            listener(ListenerRole::Admin, 4191, false),
+        ]);
+        assert_eq!(&ports[..], &[4140, 4143, 4191]);
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Reserve a free ephemeral port by bind-then-release (the gateway will
@@ -119,6 +179,8 @@ mod tests {
             role,
             listen: SocketAddr::from(([127, 0, 0, 1], port)),
             http1_only,
+            transparent: false,
+            detect_timeout_ms: 3_000,
         }
     }
 

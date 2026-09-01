@@ -18,8 +18,9 @@
 //!   redirected connection's first bytes, bytes never dropped.
 //! - [`tunnel`] - opaque TCP passthrough (`copy_bidirectional` wrapper)
 //!   for transparent inbound and outbound forwarding.
-//! - [`loop_guard`] - refusal test for transparently intercepted
-//!   connections whose original destination is the gateway itself.
+//! - [`loop_guard`] - refusal test ([`is_loopback`]) for transparently
+//!   intercepted connections whose original destination is the gateway
+//!   itself.
 //!
 //! The public surface is plain structs and (mostly) pure functions: state
 //! lives in explicitly passed registries/pools, selection math is pure, and
@@ -46,6 +47,7 @@ pub use health::{
     active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
     is_healthy, new, record_failure, record_probe, record_success, register, HealthRegistry,
 };
+pub use loop_guard::is_loopback;
 pub use orig_dst::original_dst;
 // `tunnel::tunnel` aliased in the flat surface: the name `tunnel` is taken
 // by `forward::tunnel`; the function stays reachable as `tunnel::tunnel`.
