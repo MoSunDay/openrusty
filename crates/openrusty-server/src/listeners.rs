@@ -16,11 +16,12 @@
 
 use crate::app;
 use crate::h2c;
+use crate::shutdown::ShutdownSignal;
 use crate::state::AppState;
 use crate::transparent;
 use openrusty_core::config::{ListenerConfig, ListenerRole};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 /// One listener with its mounted router: the pure decision output of
 /// [`mounts`], consumed by [`serve`].
@@ -73,10 +74,18 @@ pub(crate) fn own_ports<'a>(
     ports.into()
 }
 
-/// Bind every listener, then drive one accept task per bound socket until
-/// `shutdown` fires. Bind failures propagate before any serving starts
-/// (fail-fast); accept loops run until the shutdown broadcast reaches them.
-pub async fn serve(mounts: Vec<Mount>, shutdown: broadcast::Receiver<()>) -> std::io::Result<()> {
+/// Bind every listener, then spawn one accept task per bound socket.
+///
+/// Bind failures propagate before any serving starts (fail-fast); the
+/// returned handles end when the unified shutdown signal fires (see
+/// `shutdown::run`, which awaits them inside the grace window) - their
+/// accepted connections drain through the existing per-connection graceful
+/// shutdown. The signal is passed by reference so every accept task clones
+/// the same `watch` receiver and shares one in-flight counter.
+pub async fn spawn(
+    mounts: Vec<Mount>,
+    signal: &ShutdownSignal,
+) -> std::io::Result<Vec<JoinHandle<std::io::Result<()>>>> {
     // Phase 1: bind everything up front. A failure here leaves nothing
     // serving, so the caller can exit without tearing down live sockets.
     let mut bound = Vec::with_capacity(mounts.len());
@@ -91,18 +100,21 @@ pub async fn serve(mounts: Vec<Mount>, shutdown: broadcast::Receiver<()>) -> std
         );
         bound.push(listener);
     }
-    // Phase 2: one accept task per socket; all share the shutdown broadcast.
-    // Transparent listeners get the intercept accept loop (detect router +
-    // orig-dst tunnel), everyone else the plain HTTP pipeline.
+    // Phase 2: one accept task per socket; all share the shutdown signal
+    // and the in-flight counter. Transparent listeners get the intercept
+    // accept loop (detect router + orig-dst tunnel), everyone else the
+    // plain HTTP pipeline.
     let ports = own_ports(mounts.iter().map(|m| &m.listener));
     let mut tasks = Vec::with_capacity(mounts.len());
     for (m, listener) in mounts.into_iter().zip(bound) {
-        let rx = shutdown.resubscribe();
+        let rx = signal.rx.clone();
+        let in_flight = signal.in_flight.clone();
         let ports = ports.clone();
         let transparent = uses_transparent(&m.listener);
         tasks.push(tokio::spawn(async move {
             if transparent {
-                transparent::serve_listener(m.router, m.listener, listener, ports, rx).await
+                transparent::serve_listener(m.router, m.listener, listener, ports, rx, in_flight)
+                    .await
             } else {
                 h2c::serve_listener(
                     m.router,
@@ -110,14 +122,21 @@ pub async fn serve(mounts: Vec<Mount>, shutdown: broadcast::Receiver<()>) -> std
                     m.listener.http1_only,
                     rx,
                     h2c::conn_timeouts(),
+                    in_flight,
                 )
                 .await
             }
         }));
     }
-    // Phase 3: drain. Every task ends only when shutdown fires (accept
-    // errors are logged, never fatal), so awaiting them drains cleanly.
-    for t in tasks {
+    Ok(tasks)
+}
+
+/// Drive every listener to completion: bind, spawn the accept tasks, then
+/// await them until the shutdown signal ends each loop. Embedder-facing
+/// convenience over [`spawn`] - the binary uses `spawn` directly so it can
+/// own the three-phase sequence (`shutdown::run`).
+pub async fn serve(mounts: Vec<Mount>, signal: &ShutdownSignal) -> std::io::Result<()> {
+    for t in spawn(mounts, signal).await? {
         t.await.map_err(|e| {
             if e.is_panic() {
                 std::io::Error::other("listener accept task panicked")
@@ -188,21 +207,45 @@ mod tests {
     /// Uses the prefix-only config so no route matches `/openrusty/*`: any
     /// admin path on a data socket then 404s via the pipeline's unmatched
     /// branch, proving the admin plane was detached (hermetic: no upstream
-    /// stub needed, the request never leaves the proxy pipeline).
-    async fn spawn(listeners: Vec<ListenerConfig>) -> (Vec<ListenerConfig>, broadcast::Sender<()>) {
+    /// stub needed, the request never leaves the proxy pipeline). Returns
+    /// the accept-task handles so shutdown tests can drive the real
+    /// three-phase sequence.
+    async fn boot(
+        listeners: Vec<ListenerConfig>,
+    ) -> (
+        Vec<ListenerConfig>,
+        Arc<AppState>,
+        Vec<JoinHandle<std::io::Result<()>>>,
+    ) {
         let dir = TmpDir::new("listeners");
         dir.write_config(&dir.prefix_only_config());
         let state = boot_state(&dir);
-        let (tx, rx) = broadcast::channel::<()>(1);
         let mts = mounts(&state, &listeners);
-        tokio::spawn(serve(mts, rx));
-        (listeners, tx)
+        // The listener assembly shares the state's own signal, exactly like
+        // main does - so an endpoint flip is visible to the accept tasks.
+        let tasks = spawn(mts, &state.shutdown).await.unwrap();
+        (listeners, state, tasks)
     }
 
     /// Raw HTTP/1.1 GET returning the status line + head, retrying until the
     /// listener accepts (the bind-then-release port reservation is racy).
     async fn get(port: u16, path: &str) -> String {
-        let req = format!("GET {path} HTTP/1.1\r\nHost: gw\r\nConnection: close\r\n\r\n");
+        raw(port, &format!("GET {path} HTTP/1.1\r\nHost: gw\r\nConnection: close\r\n\r\n")).await
+    }
+
+    /// Raw HTTP/1.1 POST with an empty body, same retry contract as [`get`].
+    async fn post(port: u16, path: &str) -> String {
+        raw(
+            port,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: gw\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        )
+        .await
+    }
+
+    async fn raw(port: u16, req: &str) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await {
@@ -228,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_admin_listener_mounts_admin_plane_on_data_router() {
-        let (ls, _tx) = spawn(vec![listener(ListenerRole::Inbound, free_port(), false)]).await;
+        let (ls, _state, _tasks) = boot(vec![listener(ListenerRole::Inbound, free_port(), false)]).await;
         let port = ls[0].listen.port();
         let head = get(port, "/openrusty/status").await;
         assert!(
@@ -239,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_listener_detaches_admin_plane_from_data_router() {
-        let (ls, _tx) = spawn(vec![
+        let (ls, _state, _tasks) = boot(vec![
             listener(ListenerRole::Inbound, free_port(), false),
             listener(ListenerRole::Outbound, free_port(), true),
             listener(ListenerRole::Admin, free_port(), false),
@@ -269,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_plane_still_served_alongside_split_admin() {
-        let (ls, _tx) = spawn(vec![
+        let (ls, _state, _tasks) = boot(vec![
             listener(ListenerRole::Inbound, free_port(), false),
             listener(ListenerRole::Admin, free_port(), false),
         ])
@@ -281,5 +324,56 @@ mod tests {
             head.starts_with("HTTP/1.1 404"),
             "data plane broken when admin is split out: {head}"
         );
+    }
+
+    /// The endpoint-triggered three-phase sequence over real sockets: a
+    /// serving listener answers /openrusty/ready with 200, the shutdown
+    /// POST flips the unified signal while still answering, the accept task
+    /// then ends and new connections are refused, and `shutdown::run`
+    /// finishes with a clean report - exactly what main does.
+    #[tokio::test]
+    async fn shutdown_endpoint_drives_the_three_phase_sequence() {
+        let (ls, state, tasks) =
+            boot(vec![listener(ListenerRole::Inbound, free_port(), false)]).await;
+        let port = ls[0].listen.port();
+
+        // Phase 0: serving. Readiness answers 200 on the merged socket.
+        let head = get(port, "/openrusty/ready").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "ready pre: {head}");
+
+        // Trigger: POST /openrusty/shutdown must answer first (the response
+        // itself is in-flight and finishes through the drain), and the flip
+        // must be visible on the shared signal.
+        let head = post(port, "/openrusty/shutdown").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "shutdown post: {head}");
+        assert!(head.contains("shutting down"), "shutdown post: {head}");
+        assert!(
+            crate::shutdown::is_draining(&state.shutdown.rx),
+            "signal not flipped by the endpoint"
+        );
+
+        // Stop accepting: every fresh connect is eventually refused once
+        // the accept task closed the socket.
+        let refused = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > refused {
+                panic!("gateway still accepting after the shutdown flip");
+            }
+            match tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await {
+                Err(_) => break,
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+
+        // Phase 2/3: bounded drain ends cleanly with nothing force-closed.
+        let report = crate::shutdown::run(
+            state.shutdown.tx.clone(),
+            tasks,
+            state.shutdown.in_flight.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!report.timed_out, "drain hit the grace window: {report:?}");
+        assert_eq!(report.task_errors, 0, "accept task failed: {report:?}");
     }
 }

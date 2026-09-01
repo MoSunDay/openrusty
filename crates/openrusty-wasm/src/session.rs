@@ -239,6 +239,7 @@ mod tests {
                 log_level: "info".into(),
                 http1_only: false,
                 listeners: Vec::new(),
+                shutdown_grace_ms: 5_000,
             },
             plugins: PluginsConfig {
                 dir: dir.into(),

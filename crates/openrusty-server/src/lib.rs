@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod pipeline_peer;
 pub mod reload;
+pub mod shutdown;
 pub mod state;
 pub mod transparent;
 pub mod ws;

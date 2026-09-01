@@ -12,6 +12,10 @@ log_level = "warn"
 # Set to true to serve plain HTTP/1.1 only and skip the h2c preface sniffing
 # (each connection then runs the cheaper http/1 code path).
 # http1_only = false
+# Grace period (milliseconds) for draining in-flight requests during the
+# three-phase shutdown (stop accept -> drain -> summary). Connections still
+# active when the grace elapses are force-closed. Default is 5000.
+# shutdown_grace_ms = 5000
 
 [plugins]
 # Directory scanned for *.wasm plugin modules (loaded in `order`, else sorted by file name).

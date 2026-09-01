@@ -51,10 +51,20 @@ pub struct ServerConfig {
     /// ignored (see [`effective_listeners`]).
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
+    /// Grace window of the three-phase shutdown (milliseconds): stop
+    /// accepting, let in-flight connections finish, then force-close
+    /// whatever is still alive (and still exit 0). See
+    /// `openrusty_server::shutdown`.
+    #[serde(default = "default_shutdown_grace_ms")]
+    pub shutdown_grace_ms: u64,
 }
 
 fn default_log_level() -> String {
     "warn".to_string()
+}
+
+fn default_shutdown_grace_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -405,6 +415,24 @@ upstream = "vllm"
         let cfg: Config =
             toml::from_str(&GOOD.replace("upstream = \"vllm\"", "upstream = \"nope\"")).unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    /// Absent `shutdown_grace_ms`: the documented five-second drain window.
+    #[test]
+    fn shutdown_grace_defaults_to_five_seconds() {
+        let cfg: Config = toml::from_str(GOOD).unwrap();
+        assert_eq!(cfg.server.shutdown_grace_ms, 5_000);
+    }
+
+    /// Written `shutdown_grace_ms`: parsed verbatim (milliseconds).
+    #[test]
+    fn shutdown_grace_is_parseable() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "listen = \"127.0.0.1:8080\"",
+            "listen = \"127.0.0.1:8080\"\nshutdown_grace_ms = 750",
+        ))
+        .unwrap();
+        assert_eq!(cfg.server.shutdown_grace_ms, 750);
     }
 
     #[test]

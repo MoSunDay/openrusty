@@ -9,6 +9,11 @@
 //! timeouts (see [`conn_timeouts`]): without them a client that opens a
 //! socket and stalls (or silently dies without FIN) would pin accept-loop
 //! capacity and buffers forever.
+//!
+//! Shutdown is the unified `watch` flag (`crate::shutdown`): the accept
+//! loop leaves the loop on the flip and hyper's graceful shutdown takes
+//! over the in-flight connections ([`GracefulDrain`]); a dropped sender is
+//! honoured exactly like the flip (tests and embedders use that shortcut).
 
 use axum::extract::ConnectInfo;
 use hyper::body::Incoming;
@@ -17,10 +22,14 @@ use hyper_util::server::conn::auto::HttpServerConnExec;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tower::ServiceExt;
+
+use crate::shutdown::{self, InFlight};
 
 /// Connection-level timeouts applied to every accepted socket.
 ///
@@ -133,50 +142,73 @@ impl From<bool> for ProtoMode {
     }
 }
 
-/// Accept connections on `addr` until `shutdown` fires. When `http1_only`
-/// is set, connections are served as plain HTTP/1.1 without h2c detection.
+/// Accept connections on `addr` until the shutdown signal fires. When
+/// `http1_only` is set, connections are served as plain HTTP/1.1 without
+/// h2c detection. Embedder-facing convenience over [`serve_listener`].
 pub async fn serve(
     addr: SocketAddr,
     http1_only: bool,
     router: axum::Router,
-    shutdown: broadcast::Receiver<()>,
+    shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_listener(router, listener, http1_only, shutdown, conn_timeouts()).await
+    serve_listener(
+        router,
+        listener,
+        http1_only,
+        shutdown,
+        conn_timeouts(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .await
 }
 
 /// Accept loop over an already-bound listener. Split out from [`serve`] so
-/// multi-socket assembly (`crate::listeners::serve`) can drive one accept
+/// multi-socket assembly (`crate::listeners::spawn`) can drive one accept
 /// task per bound socket, and so tests can bind port 0, learn the port, and
-/// inject custom timeouts.
+/// inject custom timeouts. On the shutdown flip the loop ends; the accepted
+/// connections keep draining (and are counted in `in_flight` until done).
 pub(crate) async fn serve_listener(
     router: axum::Router,
     listener: tokio::net::TcpListener,
     http1_only: bool,
-    mut shutdown: broadcast::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
     timeouts: ConnTimeouts,
+    in_flight: InFlight,
 ) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(%addr, http1_only, "listening (http/1.1 + h2c on one port)");
     let svc = router.into_service::<axum::body::Body>();
 
+    // A signal that arrived before the loop started still stops it.
+    if shutdown::is_draining(&shutdown) {
+        tracing::info!(%addr, "shutdown signalled; not accepting");
+        return Ok(());
+    }
     loop {
         tokio::select! {
-            sig = shutdown.recv() => {
+            sig = shutdown.changed() => {
+                // The flip - or the sender being dropped, which tests and
+                // embedders use as the stop shortcut - ends the loop.
                 match sig {
-                    Ok(()) | Err(broadcast::error::RecvError::Closed) => {
+                    Err(_) => {
+                        tracing::info!("shutdown channel closed; stop accepting");
+                        break;
+                    }
+                    Ok(()) if *shutdown.borrow() => {
                         tracing::info!("shutdown signal received; stop accepting");
                         break;
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!(n, "shutdown channel lagged");
-                    }
+                    // Not our flip; keep serving.
+                    Ok(()) => {}
                 }
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, remote)) => {
                     let svc = svc.clone();
-                    let rx = shutdown.resubscribe();
+                    let rx = shutdown.clone();
+                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    let pending = in_flight.clone();
                     tokio::spawn(async move {
                         let _ = stream.set_nodelay(true);
                         serve_conn(
@@ -188,6 +220,7 @@ pub(crate) async fn serve_listener(
                             timeouts,
                         )
                         .await;
+                        pending.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(e) => {
@@ -211,7 +244,7 @@ pub(crate) async fn serve_conn<S, I>(
     io: I,
     remote: SocketAddr,
     mode: ProtoMode,
-    rx: broadcast::Receiver<()>,
+    rx: watch::Receiver<bool>,
     timeouts: ConnTimeouts,
 ) where
     S: tower::Service<
@@ -293,15 +326,17 @@ pub(crate) async fn serve_conn<S, I>(
 
 /// Shared shutdown/serve loop: run the connection to completion, or start a
 /// graceful drain once the shutdown signal fires. Generic over the http1-only
-/// and auto (h2c) connection types, whose error types differ.
-async fn drive<C, E>(conn: C, mut rx: broadcast::Receiver<()>, remote: SocketAddr)
+/// and auto (h2c) connection types, whose error types differ. A signal that
+/// fired before the connection even started drains it right away.
+async fn drive<C, E>(conn: C, rx: watch::Receiver<bool>, remote: SocketAddr)
 where
     C: std::future::Future<Output = Result<(), E>> + GracefulDrain,
     E: std::fmt::Display,
 {
     tokio::pin!(conn);
 
-    let mut shutting = false;
+    let mut rx = rx;
+    let mut shutting = shutdown::is_draining(&rx);
     loop {
         tokio::select! {
             res = &mut conn => {
@@ -310,16 +345,11 @@ where
                 }
                 break;
             }
-            sig = rx.recv(), if !shutting => {
-                match sig {
-                    Ok(()) | Err(broadcast::error::RecvError::Closed) => {
-                        shutting = true;
-                        conn.as_mut().drain();
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!(n, "shutdown channel lagged");
-                    }
-                }
+            _ = rx.changed(), if !shutting => {
+                // The flip and a dropped sender both mean: no new requests,
+                // finish the in-flight one.
+                shutting = true;
+                conn.as_mut().drain();
             }
         }
     }
@@ -346,21 +376,20 @@ mod tests {
 
     /// Boot a real router on an ephemeral port with the given timeouts and
     /// return the bound address (the shutdown sender is kept alive by the
-    /// caller; dropping it stops the accept loop).
-    async fn spawn_server(
-        dir: &TmpDir,
-        timeouts: ConnTimeouts,
-    ) -> (SocketAddr, broadcast::Sender<()>) {
+    /// caller; dropping it stops the accept loop and drains connections).
+    async fn spawn_server(dir: &TmpDir, timeouts: ConnTimeouts) -> (SocketAddr, watch::Sender<bool>)
+    {
         let state = boot_state(dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, rx) = broadcast::channel::<()>(4);
+        let (tx, rx) = watch::channel(false);
         tokio::spawn(serve_listener(
             app::router(state),
             listener,
             false,
             rx,
             timeouts,
+            shutdown::new_signal().in_flight,
         ));
         (addr, tx)
     }
@@ -383,7 +412,7 @@ mod tests {
         let state = boot_state(&dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (_tx, rx) = broadcast::channel::<()>(4);
+        let (_tx, rx) = watch::channel(false);
         // Plain HTTP/1.1 path: the header timeout arms before any byte
         // arrives, so a socket opened and then abandoned is reaped.
         tokio::spawn(serve_listener(
@@ -392,6 +421,7 @@ mod tests {
             true,
             rx,
             test_timeouts(),
+            shutdown::new_signal().in_flight,
         ));
 
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();

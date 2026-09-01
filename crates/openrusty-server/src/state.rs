@@ -48,6 +48,10 @@ pub struct AppState {
     /// this async mutex, so only one reload runs at a time. A second
     /// requester gets the in-flight (conflict) answer instead of queueing.
     pub reload_gate: tokio::sync::Mutex<()>,
+    /// Unified shutdown signal (`shutdown::ShutdownSignal`): SIGTERM/SIGINT
+    /// and POST /openrusty/shutdown flip it, the accept loops and the
+    /// readiness endpoint read it, the counter feeds the drain summary.
+    pub shutdown: crate::shutdown::ShutdownSignal,
 }
 
 /// Empty runtime used before the first [`apply_runtime`] call.
@@ -85,6 +89,7 @@ pub fn from_config(
         started_at: std::time::Instant::now(),
         probe_task: Mutex::new(None),
         reload_gate: tokio::sync::Mutex::new(()),
+        shutdown: crate::shutdown::new_signal(),
     });
     let generation = state.registry.snapshot().generation;
     apply_runtime(&state, &cfg, generation);
