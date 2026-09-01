@@ -55,7 +55,8 @@ VH=""
 PIDS=()
 PASS=0
 FAIL=0
-GATE_UID=65534
+SKIP_TAG="local-netns"
+NET_TAG="m1"
 APP_IP=10.123.0.2
 VIP_IP=10.123.0.3
 APP_PORT=18080
@@ -63,8 +64,12 @@ RAW_PORT=18081
 INB_PORT=4143
 OUT_PORT=4140
 ADM_PORT=4191
-IPT=iptables
 
+# Shared helpers (checks, gates, ports, teardown) live in lib-netns.sh.
+. "$(dirname "$0")/lib-netns.sh"
+
+# M1-specific prelude: the drill installs a custom OUTPUT hook (chain
+# ORRM1) for the loop-guard probe; remove it before the shared teardown.
 cleanup() {
     if [ -n "$NS" ] && ip netns list 2>/dev/null | grep -q "^${NS}"; then
         if ip netns exec "$NS" "$IPT" -t nat list >/dev/null 2>&1; then
@@ -73,113 +78,13 @@ cleanup() {
             ip netns exec "$NS" "$IPT" -t nat -X ORRM1 >/dev/null 2>&1 || true
         fi
     fi
-    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-    sleep 0.3
-    for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
-    [ -n "$NS" ] && ip netns del "$NS" >/dev/null 2>&1 || true
-    [ -n "$VH" ] && ip link del "$VH" >/dev/null 2>&1 || true
-    [ -n "$TMP" ] && rm -rf "$TMP"
+    netns_teardown
 }
 trap cleanup EXIT
 
-# Gateway logs are styled by tracing (ANSI escapes wrap field names/values);
-# strip them so greps see plain `field=value` text.
-plain_log() { sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null; }
-export -f plain_log
-
-check() { # name condition...
-    local name="$1"; shift
-    if "$@" >/dev/null 2>&1; then PASS=$((PASS+1)); echo "PASS: $name"
-    else FAIL=$((FAIL+1)); echo "FAIL: $name"; fi
-}
-
-skip() {
-    echo "SKIP(local-netns): $1"
-    exit 0
-}
-
-gate() { # name ok|no - a "no" is a hard, visible SKIP
-    if [ "$2" = "ok" ]; then printf 'GATE: %-38s ok\n' "$1"
-    else skip "$1 not satisfied"; fi
-}
-
-gate_run() { # name command...
-    local name="$1"; shift
-    if "$@" >/dev/null 2>&1; then gate "$name" ok; else gate "$name" no; fi
-}
-
-ns_open() { ip netns exec "$NS" bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
-
-wait_port() { # port timeout_s
-    for _ in $(seq 1 $(( $2 * 10 ))); do
-        ns_open "$1" && return 0
-        sleep 0.1
-    done
-    return 1
-}
-
-require_alive() { # name pid...
-    local name="$1"; shift
-    local p
-    for p in "$@"; do
-        if ! kill -0 "$p" 2>/dev/null; then
-            echo "FATAL: $name (pid $p) is no longer running" >&2
-            return 1
-        fi
-    done
-    return 0
-}
-
-ns_curl() { ip netns exec "$NS" curl -s "$@"; }
-
-echo "== environment gates =="
-gate_run "root (EUID 0)" test "$(id -u)" = "0"
-for tool in ip iptables curl python3 setpriv bash; do
-    gate_run "tool: $tool" command -v "$tool"
-done
-if command -v iptables >/dev/null 2>&1; then
-    IPT=iptables
-elif command -v nft >/dev/null 2>&1 && command -v iptables-nft >/dev/null 2>&1; then
-    IPT=iptables-nft   # iptables shim over nftables
-else
-    skip "neither iptables nor nft+iptables-nft available"
-fi
-gate "tool: iptables backend (as $IPT)" ok
-gate_run "ip netns support" ip netns list
-gate_run "kernel conntrack" bash -c \
-    '[ -e /proc/net/nf_conntrack ] || lsmod 2>/dev/null | grep -q nf_conntrack || [ -d /proc/sys/net/netfilter ]'
-gate_run "unshare -n (netns permission)" unshare -n true
-
-echo "== build =="
-if [ ! -e "$ROOT/target/debug/openrusty" ] || [ ! -e "$ROOT/target/debug/examples/echo_upstream" ]; then
-    echo "building gateway + echo_upstream (artifacts missing)..."
-    cargo build -p openrusty-server --bins >/dev/null 2>&1 || skip "gateway build failed"
-    cargo build -p openrusty-server --example echo_upstream >/dev/null 2>&1 \
-        || skip "echo_upstream build failed"
-fi
-gate_run "artifact: target/debug/openrusty" test -e "$ROOT/target/debug/openrusty"
-gate_run "artifact: examples/echo_upstream" test -e "$ROOT/target/debug/examples/echo_upstream"
-
-echo "== topology =="
-NS="orr-m1-$$"
-VH="veth-m1-$$"
-TMP="$(mktemp -d /tmp/openrusty-netns.XXXXXX)"
-mkdir -p "$TMP/plugins" "$TMP/logs"
-# The gateway runs as uid "$GATE_UID" (nobody) via setpriv; mktemp -d is 0700,
-# which would hide the config from it. Open the tree for traversal.
-chmod 0755 "$TMP" "$TMP/plugins" "$TMP/logs"
-if ! ip netns add "$NS" 2>/dev/null; then
-    skip "cannot create netns $NS (needs CAP_SYS_ADMIN + a writable /run/netns)"
-fi
-ip link add "$VH" type veth peer name eth0
-ip link set eth0 netns "$NS"
-ip addr add 10.123.0.1/24 dev "$VH"
-ip link set "$VH" up
-ip -n "$NS" addr add "$APP_IP/24" dev eth0
-ip -n "$NS" link set eth0 up
-ip -n "$NS" link set lo up
-# Outbound-path target: the same app reachable under a second address.
-ip -n "$NS" addr add "$VIP_IP/32" dev lo
+env_gates
+build_artifacts
+netns_up "$APP_IP" "$VIP_IP"
 
 cat > "$TMP/openrusty.toml" <<CONF
 [server]
@@ -302,7 +207,11 @@ check "a0: exactly one hook per builtin chain" test "$(grep -c -- '-j OPENRUSTY_
 # the identical iptables-save (idempotent re-entry).
 check "a0: init preflight passes (exit 0)" ip netns exec "$NS" "$ORR" "${INIT[@]}"
 ip netns exec "$NS" "$SAVE_BIN" -t nat > "$TMP/save2.txt" 2>/dev/null
-check "a0: re-run converges (iptables-save diff empty)" diff -q "$TMP/save1.txt" "$TMP/save2.txt"
+# Compare rule content only: iptables-save prefixes timestamp comment lines,
+# so a byte-identical rule set still diffs when the two saves straddle a
+# second boundary.
+check "a0: re-run converges (iptables-save diff empty)" \
+    diff <(grep -v '^#' "$TMP/save1.txt") <(grep -v '^#' "$TMP/save2.txt")
 echo "interception rules installed via iptables-init (owner UID $GATE_UID exempt)"
 
 echo "== 1. HTTP transparent inbound (PREROUTING REDIRECT -> 4143) =="
