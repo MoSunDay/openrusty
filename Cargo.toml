@@ -7,6 +7,7 @@ members = [
     "crates/openrusty-server",
     "crates/openrusty-sdk",
     "crates/openrusty-macros",
+    "crates/openrusty-k8s",
 ]
 
 [workspace.package]
@@ -39,6 +40,21 @@ arc-swap = "1"
 dashmap = "6"
 thiserror = "2"
 socket2 = { version = "0.6", features = ["all"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
 
 [profile.release]
 lto = "thin"
