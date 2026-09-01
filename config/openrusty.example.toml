@@ -68,6 +68,13 @@ connect_timeout_ms = 2000
   # Passive health check: mark a peer down after `max_fails` failures
   # inside the window; `max_fails = 0` disables passive accounting
   # within `fail_window_s`; the peer recovers after `fail_timeout_s`.
+  # NOTE: for upstreams with no meaningful per-instance health signal
+  # (name prefix `ing-`, e.g. a k8s ClusterIP/Service VIP that always
+  # accepts the TCP dial), keep `max_fails = 0`: failing to count dials
+  # against a virtual IP would otherwise drain every peer permanently.
+  # The ingress renderer already emits this setting for adopted
+  # upstreams; the gateway logs a warning when a manual `ing-*` upstream
+  # enables passive accounting.
   max_fails = 3
   fail_window_s = 10
   fail_timeout_s = 10
@@ -195,6 +202,35 @@ timeout_ms = 30000
 # listen = "127.0.0.1:4140"
 # # http1_only = false
 # # transparent = false
+
+# --- Egress policy ([egress]) ------------------------------------------------
+# How transparently intercepted OUTBOUND connections are disposed of. Only a
+# `transparent = true` outbound listener consults this section; the default
+# (`direct`) reproduces the historical behaviour exactly, so omitting the
+# section changes nothing.
+#
+#   mode = "direct"   - tunnel every connection verbatim to the original
+#                       destination (default).
+#   mode = "gateway"  - forward plain HTTP (sniffed HTTP/1.x or h2c) to a
+#                       central egress gateway, which applies its own routing
+#                       and policy; the stream is forwarded byte-for-byte (no
+#                       Host rewrite). Opaque streams (TLS etc.) and
+#                       destinations on port 443 are REFUSED on this hop: the
+#                       v1 gateway link is plaintext and cannot carry TLS
+#                       purposes. `gateway` must then be set to a resolvable
+#                       `host:port`; an unresolved address fails config load.
+#   mode = "deny"     - refuse every intercepted egress connection
+#                       (locked-down sidecar: only local serving allowed).
+#
+# A gateway dial that fails or exceeds 3 seconds closes the intercepted
+# connection (fail close); every disposition is counted in
+# `openrusty_transparent_conns_total{role="outbound",outcome=...}` on the
+# admin `/openrusty/metrics` endpoint.
+#
+# [egress]
+# mode = "direct"
+# # gateway = "egress-gw.mesh.svc:8180"   # required when mode = "gateway"
+
 #
 # [[server.listeners]]
 # role = "admin"

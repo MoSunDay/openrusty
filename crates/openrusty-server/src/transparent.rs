@@ -20,8 +20,11 @@
 //!    [`PrefixedStream`] that re-injects the sniffed bytes, so nothing the
 //!    probe consumed is lost; opaque streams are tunneled verbatim to the
 //!    original destination.
-//! 4. Outbound: no sniffing - egress is dialed at the original destination
-//!    and tunneled (egress HTTP semantics are a later milestone).
+//! 4. Outbound: the `[egress]` policy decides ([`crate::egress`]) -
+//!    `direct` (default) dials the original destination and tunnels
+//!    without any sniffing, `gateway` sniffs and forwards plaintext HTTP
+//!    to the configured egress gateway, `deny` refuses everything. Every
+//!    disposition increments `openrusty_transparent_conns_total`.
 //!
 //! Failure semantics: on an inbound socket an unrecoverable original
 //! destination degrades to the plain (non-transparent) pipeline -
@@ -31,10 +34,11 @@
 //! degraded path; the sniffed protocol decides the fast path. The routing
 //! table itself is pure ([`route_pre`], [`route_http`]) and unit-tested.
 
-mod prefixed;
+pub(crate) mod prefixed;
 
 use crate::h2c::{ProtoMode, serve_conn};
-use openrusty_core::config::{ListenerConfig, ListenerRole};
+use crate::metrics::{Metrics, OUTCOME_HTTP, OUTCOME_LOOP_REJECTED, OUTCOME_NO_ORIG_DST, OUTCOME_TUNNEL};
+use openrusty_core::config::{EgressConfig, ListenerConfig, ListenerRole};
 use openrusty_proxy as proxy;
 use prefixed::PrefixedStream;
 use std::convert::Infallible;
@@ -112,14 +116,28 @@ pub(crate) fn route_http(protocol: proxy::Protocol) -> HttpStep {
     }
 }
 
+/// Per-listener egress context shared by the intercept loop and every
+/// handled connection: the `[egress]` policy, the pre-resolved gateway
+/// address, and the disposition counters. Cheap to clone per connection.
+#[derive(Clone)]
+pub(crate) struct EgressPlane {
+    pub(crate) egress: EgressConfig,
+    pub(crate) gateway: Option<SocketAddr>,
+    pub(crate) metrics: Arc<Metrics>,
+}
+
+
 /// Accept loop for a transparent listener: per connection, recover the
-/// original destination and split by protocol. Mirrors the shutdown
-/// handling of `h2c::serve_listener` (transient accept errors are logged,
-/// never fatal). `own_ports` is every listener port, all roles included;
-/// `in_flight` counts accepted connections for the drain summary.
+/// original destination and split by role and protocol. Mirrors the
+/// shutdown handling of `h2c::serve_listener` (transient accept errors are
+/// logged, never fatal). `own_ports` is every listener port, all roles
+/// included; `in_flight` counts accepted connections for the drain
+/// summary. `egress`/`gateway` steer intercepted outbound connections (see
+/// `crate::egress`); `metrics` collects the per-disposition counters.
 pub(crate) async fn serve_listener(
     router: axum::Router,
     cfg: ListenerConfig,
+    plane: EgressPlane,
     listener: TcpListener,
     own_ports: Arc<[u16]>,
     mut shutdown: watch::Receiver<bool>,
@@ -161,11 +179,12 @@ pub(crate) async fn serve_listener(
                     let svc = svc.clone();
                     let rx = shutdown.clone();
                     let cfg = cfg.clone();
+                    let plane = plane.clone();
                     let ports = own_ports.clone();
                     in_flight.fetch_add(1, Ordering::Relaxed);
                     let pending = in_flight.clone();
                     tokio::spawn(async move {
-                        handle_conn(svc, stream, remote, cfg, ports, rx).await;
+                        handle_conn(svc, stream, remote, cfg, plane, ports, rx).await;
                         pending.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -179,15 +198,17 @@ pub(crate) async fn serve_listener(
 }
 
 /// One intercepted connection: route it through the stage-1/stage-2
-/// decisions above. Dropping the stream at any point closes the connection.
-/// HTTP branches share the h2c driver and drain on the unified signal; an
-/// established opaque tunnel intentionally keeps serving until either peer
-/// closes - the shutdown grace is what force-closes a stuck one.
+/// decisions above, counting the disposition per connection. Dropping the
+/// stream at any point closes the connection. HTTP branches share the h2c
+/// driver and drain on the unified signal; an established opaque tunnel
+/// intentionally keeps serving until either peer closes - the shutdown
+/// grace is what force-closes a stuck one.
 async fn handle_conn<S>(
     svc: S,
     mut stream: TcpStream,
     remote: SocketAddr,
     cfg: ListenerConfig,
+    plane: EgressPlane,
     own_ports: Arc<[u16]>,
     rx: watch::Receiver<bool>,
 ) where
@@ -205,6 +226,11 @@ async fn handle_conn<S>(
     let orig = proxy::original_dst(&stream).ok();
     match route_pre(cfg.role, orig, &own_ports) {
         Step::Reject(reason) => {
+            let outcome = match reason {
+                RejectReason::Loop => OUTCOME_LOOP_REJECTED,
+                RejectReason::NoOriginalDst => OUTCOME_NO_ORIG_DST,
+            };
+            plane.metrics.record_transparent(cfg.role.as_str(), outcome);
             tracing::warn!(
                 role = cfg.role.as_str(),
                 %remote,
@@ -214,6 +240,8 @@ async fn handle_conn<S>(
             );
         }
         Step::DegradeHttp => {
+            // Degraded or not, the connection ends up served as HTTP.
+            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
             tracing::warn!(
                 role = cfg.role.as_str(),
                 %remote,
@@ -229,7 +257,20 @@ async fn handle_conn<S>(
             )
             .await;
         }
-        Step::Dial(dst) => tunnel_to(stream, dst, remote).await,
+        // Egress is the outbound role's business ([egress] policy); the
+        // inbound sniff branch is not.
+        Step::Dial(dst) => {
+            crate::egress::run_outbound(
+                stream,
+                dst,
+                remote,
+                &plane.egress,
+                plane.gateway,
+                Duration::from_millis(cfg.detect_timeout_ms),
+                &plane.metrics,
+            )
+            .await;
+        }
         Step::Sniff(dst) => {
             let budget = Duration::from_millis(cfg.detect_timeout_ms);
             match proxy::detect(&mut stream, budget).await {
@@ -240,9 +281,20 @@ async fn handle_conn<S>(
                     let io = PrefixedStream::new(prefix, stream);
                     match route_http(protocol) {
                         HttpStep::ServeHttp(mode) => {
+                            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
+                            tracing::info!(
+                                role = cfg.role.as_str(),
+                                %remote,
+                                %dst,
+                                protocol = ?protocol,
+                                "transparent HTTP intercepted; serving via pipeline"
+                            );
                             serve_conn(svc, io, remote, mode, rx, timeouts).await;
                         }
-                        HttpStep::Tunnel => tunnel_to(io, dst, remote).await,
+                        HttpStep::Tunnel => {
+                            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_TUNNEL);
+                            tunnel_to(io, dst, remote).await;
+                        }
                     }
                 }
                 // EOF before the prefix settled: the peer gave up first.
@@ -262,7 +314,8 @@ async fn handle_conn<S>(
 /// Dials the original destination and shovels bytes verbatim between it and
 /// the intercepted connection until both ends are done. `client` is the
 /// (possibly prefix-reinjecting) client side of the intercepted connection.
-async fn tunnel_to<S>(client: S, dst: SocketAddr, remote: SocketAddr)
+/// Shared with the egress runtime (`direct` mode dials exactly this way).
+pub(crate) async fn tunnel_to<S>(client: S, dst: SocketAddr, remote: SocketAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {

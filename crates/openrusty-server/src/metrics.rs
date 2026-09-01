@@ -40,6 +40,18 @@ pub const KIND_TIMEOUT: &str = "timeout";
 #[allow(dead_code)]
 pub const KIND_BAD_CODE: &str = "bad_code";
 
+/// `outcome` label values for `openrusty_transparent_conns_total{role,outcome}`:
+/// one per disposition a transparently intercepted connection can take.
+/// `role` reuses `config::ListenerRole::as_str` ("inbound"/"outbound").
+pub const OUTCOME_HTTP: &str = "http";
+pub const OUTCOME_TUNNEL: &str = "tunnel";
+pub const OUTCOME_LOOP_REJECTED: &str = "loop_rejected";
+pub const OUTCOME_NO_ORIG_DST: &str = "no_orig_dst";
+pub const OUTCOME_EGRESS_DIRECT: &str = "egress_direct";
+pub const OUTCOME_EGRESS_DENY: &str = "egress_deny";
+pub const OUTCOME_EGRESS_GATEWAY_OK: &str = "egress_gateway_ok";
+pub const OUTCOME_EGRESS_GATEWAY_FAIL: &str = "egress_gateway_fail";
+
 /// Mutable collector state behind the [`Metrics`] mutex.
 struct MetricsState {
     /// `openrusty_requests_total{route,code}`.
@@ -48,6 +60,8 @@ struct MetricsState {
     attempts: HashMap<(String, String), u64>,
     /// `openrusty_plugin_errors_total{plugin,kind}`.
     plugin_errors: HashMap<(String, String), u64>,
+    /// `openrusty_transparent_conns_total{role,outcome}`.
+    transparent: HashMap<(String, String), u64>,
     /// Cumulative per-bucket counts: `buckets[i]` counts observations
     /// `<= DURATION_BUCKETS[i]`. Length always matches the constant.
     buckets: Vec<u64>,
@@ -63,6 +77,7 @@ impl MetricsState {
             requests: HashMap::new(),
             attempts: HashMap::new(),
             plugin_errors: HashMap::new(),
+            transparent: HashMap::new(),
             buckets: vec![0; DURATION_BUCKETS.len()],
             count: 0,
             sum: 0.0,
@@ -149,6 +164,18 @@ impl Metrics {
             .or_insert(0) += 1;
     }
 
+    /// Count one transparent-intercept disposition: `role` is the listener
+    /// role (`ListenerRole::as_str`), `outcome` one of the
+    /// [`OUTCOME_*`](self) constants. Called once per intercepted
+    /// connection, at the point its fate is decided (see
+    /// `crate::transparent` and `crate::egress`).
+    pub fn record_transparent(&self, role: &str, outcome: &str) {
+        let mut s = self.state.lock().unwrap();
+        *s.transparent
+            .entry((role.to_string(), outcome.to_string()))
+            .or_insert(0) += 1;
+    }
+
     /// Cheap clone of all state for rendering. The caller can keep the
     /// snapshot while the collector keeps recording.
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -157,6 +184,7 @@ impl Metrics {
             requests: s.requests.clone(),
             attempts: s.attempts.clone(),
             plugin_errors: s.plugin_errors.clone(),
+            transparent: s.transparent.clone(),
             buckets: s.buckets.clone(),
             count: s.count,
             sum: s.sum,
@@ -180,6 +208,8 @@ pub struct MetricsSnapshot {
     pub attempts: HashMap<(String, String), u64>,
     /// `openrusty_plugin_errors_total{plugin,kind}` -> count.
     pub plugin_errors: HashMap<(String, String), u64>,
+    /// `openrusty_transparent_conns_total{role,outcome}` -> count.
+    pub transparent: HashMap<(String, String), u64>,
     /// Cumulative per-bucket counts, aligned with [`DURATION_BUCKETS`].
     pub buckets: Vec<u64>,
     /// `openrusty_request_duration_seconds_count`.

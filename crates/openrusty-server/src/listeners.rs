@@ -16,22 +16,29 @@
 
 use crate::app;
 use crate::h2c;
+use crate::metrics;
 use crate::shutdown::ShutdownSignal;
 use crate::state::AppState;
 use crate::tls::{self, TlsPlan};
 use crate::transparent;
-use openrusty_core::config::{ListenerConfig, ListenerRole};
+use openrusty_core::config::{EgressConfig, ListenerConfig, ListenerRole};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 /// One listener with its mounted router: the pure decision output of
 /// [`mounts`], consumed by [`serve`]. `tls` carries the TLS plan (shared
 /// resolver + classified certificate sources) for `tls = true` listeners;
-/// `None` elsewhere.
+/// `None` elsewhere. `metrics`/`egress` feed the transparent intercept
+/// loop (disposition counters + `[egress]` policy); they are inert for
+/// plain and TLS listeners.
 pub struct Mount {
     pub listener: ListenerConfig,
     pub router: axum::Router,
     pub(crate) tls: Option<TlsPlan>,
+    pub(crate) metrics: Arc<metrics::Metrics>,
+    pub(crate) egress: EgressConfig,
+    pub(crate) gateway: Option<SocketAddr>,
 }
 
 /// Pure mounting decision: pair every effective listener with the router its
@@ -63,6 +70,9 @@ pub fn mounts(state: &Arc<AppState>, listeners: &[ListenerConfig]) -> Vec<Mount>
                     ),
                 },
             ),
+            metrics: state.metrics.clone(),
+            egress: state.static_config.egress.clone(),
+            gateway: openrusty_core::config::resolve_gateway(&state.static_config.egress),
         })
         .collect()
 }
@@ -142,8 +152,20 @@ pub async fn spawn(
                         .await
                 }
                 None if transparent => {
-                    transparent::serve_listener(m.router, m.listener, listener, ports, rx, in_flight)
-                        .await
+                    transparent::serve_listener(
+                        m.router,
+                        m.listener,
+                        crate::transparent::EgressPlane {
+                            egress: m.egress,
+                            gateway: m.gateway,
+                            metrics: m.metrics,
+                        },
+                        listener,
+                        ports,
+                        rx,
+                        in_flight,
+                    )
+                    .await
                 }
                 None => {
                     h2c::serve_listener(
