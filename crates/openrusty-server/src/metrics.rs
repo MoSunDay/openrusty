@@ -62,6 +62,8 @@ struct MetricsState {
     plugin_errors: HashMap<(String, String), u64>,
     /// `openrusty_transparent_conns_total{role,outcome}`.
     transparent: HashMap<(String, String), u64>,
+    /// `openrusty_dynamic_requests_total{module,code}`.
+    dynamic: HashMap<(String, u16), u64>,
     /// Cumulative per-bucket counts: `buckets[i]` counts observations
     /// `<= DURATION_BUCKETS[i]`. Length always matches the constant.
     buckets: Vec<u64>,
@@ -78,6 +80,7 @@ impl MetricsState {
             attempts: HashMap::new(),
             plugin_errors: HashMap::new(),
             transparent: HashMap::new(),
+            dynamic: HashMap::new(),
             buckets: vec![0; DURATION_BUCKETS.len()],
             count: 0,
             sum: 0.0,
@@ -107,7 +110,7 @@ impl Metrics {
     /// tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_request(&self, route: &str, code: u16) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *s.requests.entry((route.to_string(), code)).or_insert(0) += 1;
     }
 
@@ -118,7 +121,7 @@ impl Metrics {
     /// exercised by unit tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_duration(&self, seconds: f64) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.count += 1;
         s.sum += seconds;
         if let Some(i) = bucket_index(seconds) {
@@ -131,7 +134,7 @@ impl Metrics {
     /// Count one HTTP request and fold its duration into the histogram under
     /// a single critical section (request counter + `_count`/`_sum`/buckets).
     pub fn record_request_timed(&self, route: &str, code: u16, seconds: f64) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *s.requests.entry((route.to_string(), code)).or_insert(0) += 1;
         s.count += 1;
         s.sum += seconds;
@@ -144,7 +147,7 @@ impl Metrics {
 
     /// Count one upstream attempt by upstream name and result label.
     pub fn record_attempt(&self, upstream: &str, result: &str) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *s.attempts
             .entry((upstream.to_string(), result.to_string()))
             .or_insert(0) += 1;
@@ -158,7 +161,7 @@ impl Metrics {
     /// kept for API completeness and exercised by the render tests.
     #[allow(dead_code)]
     pub fn record_plugin_error(&self, plugin: &str, kind: &str) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *s.plugin_errors
             .entry((plugin.to_string(), kind.to_string()))
             .or_insert(0) += 1;
@@ -170,21 +173,33 @@ impl Metrics {
     /// connection, at the point its fate is decided (see
     /// `crate::transparent` and `crate::egress`).
     pub fn record_transparent(&self, role: &str, outcome: &str) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *s.transparent
             .entry((role.to_string(), outcome.to_string()))
             .or_insert(0) += 1;
     }
 
+    /// Count one dynamic-API module invocation by module name and the
+    /// outcome status. Called once per `POST /api/v1/dynamic/<name>`
+    /// with the status the client saw (module status, or 400/404/413/500
+    /// from name resolution and the body cap). Deliberately a plain
+    /// counter only: dynamic latency is governed by the module's own
+    /// timeout policy, so the request histogram stays proxy-only.
+    pub fn record_dynamic(&self, module: &str, code: u16) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *s.dynamic.entry((module.to_string(), code)).or_insert(0) += 1;
+    }
+
     /// Cheap clone of all state for rendering. The caller can keep the
     /// snapshot while the collector keeps recording.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         MetricsSnapshot {
             requests: s.requests.clone(),
             attempts: s.attempts.clone(),
             plugin_errors: s.plugin_errors.clone(),
             transparent: s.transparent.clone(),
+            dynamic: s.dynamic.clone(),
             buckets: s.buckets.clone(),
             count: s.count,
             sum: s.sum,
@@ -210,6 +225,8 @@ pub struct MetricsSnapshot {
     pub plugin_errors: HashMap<(String, String), u64>,
     /// `openrusty_transparent_conns_total{role,outcome}` -> count.
     pub transparent: HashMap<(String, String), u64>,
+    /// `openrusty_dynamic_requests_total{module,code}` -> count.
+    pub dynamic: HashMap<(String, u16), u64>,
     /// Cumulative per-bucket counts, aligned with [`DURATION_BUCKETS`].
     pub buckets: Vec<u64>,
     /// `openrusty_request_duration_seconds_count`.
@@ -271,6 +288,9 @@ mod tests {
         m.record_plugin_error("sched", KIND_TIMEOUT);
         m.record_plugin_error("sched", KIND_TIMEOUT);
         m.record_plugin_error("sched", KIND_BAD_CODE);
+        m.record_dynamic("echo", 200);
+        m.record_dynamic("echo", 200);
+        m.record_dynamic("echo", 404);
         let s = m.snapshot();
         assert_eq!(s.requests[&("/v1".to_string(), 200u16)], 2);
         assert_eq!(s.requests[&("/v1".to_string(), 500u16)], 1);
@@ -290,6 +310,8 @@ mod tests {
             s.plugin_errors[&("sched".to_string(), KIND_BAD_CODE.to_string())],
             1
         );
+        assert_eq!(s.dynamic[&("echo".to_string(), 200u16)], 2);
+        assert_eq!(s.dynamic[&("echo".to_string(), 404u16)], 1);
     }
 
     #[test]

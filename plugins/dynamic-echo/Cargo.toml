@@ -1,0 +1,21 @@
+[package]
+name = "dynamic-echo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone workspace: plugins are built separately (wasm32 target) and are
+# not members of the root gateway workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+openrusty-sdk = { path = "../../crates/openrusty-sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

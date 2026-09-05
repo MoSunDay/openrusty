@@ -67,6 +67,7 @@ fn cfg(dir: &str) -> Config {
         routes: Vec::new(),
         ingress: Default::default(),
         egress: Default::default(),
+        dynamic: None,
     }
 }
 

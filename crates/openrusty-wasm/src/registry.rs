@@ -279,6 +279,7 @@ mod tests {
             routes: Vec::new(),
             ingress: Default::default(),
             egress: Default::default(),
+            dynamic: None,
         }
     }
 

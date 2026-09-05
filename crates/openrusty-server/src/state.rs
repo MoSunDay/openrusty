@@ -7,7 +7,7 @@
 use crate::metrics;
 use openrusty_core::config::{Config, RouteConfig};
 use openrusty_proxy as proxy;
-use openrusty_wasm::PluginRegistry;
+use openrusty_wasm::{DynamicRegistry, PluginRegistry};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,6 +57,13 @@ pub struct AppState {
     /// rendered secrets into it. Rotation swaps resolver tables and
     /// never disturbs established connections.
     pub tls_resolver: Option<Arc<crate::tls::DynamicCertResolver>>,
+    /// Dynamic-API module registry (`POST /api/v1/dynamic/<name>`);
+    /// `None` while the `[dynamic]` config section is absent. Rebuilt
+    /// only when that section CHANGES on reload (see [`apply_dynamic`]):
+    /// an unchanged section keeps the existing registry so its
+    /// stat-driven compile cache stays warm, and in-flight requests
+    /// keep their own `Arc` through the swap.
+    pub dynamic: arc_swap::ArcSwap<Option<Arc<DynamicRegistry>>>,
     pub started_at: std::time::Instant,
     /// Handle of the active-probe task; cancelled and replaced on reload.
     pub probe_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -107,6 +114,13 @@ pub fn from_config(
         .iter()
         .any(crate::tls::uses_tls)
         .then(|| Arc::new(crate::tls::DynamicCertResolver::new()));
+    // Built before `registry` moves into the state: the dynamic registry
+    // shares the plugin registry's engine (same epoch ticker) and linker
+    // (same import whitelist), so both must be cloned out of it first.
+    let dynamic = cfg
+        .dynamic
+        .as_ref()
+        .map(|d| DynamicRegistry::new(registry.engine().clone(), registry.linker().clone(), d));
     let state = Arc::new(AppState {
         registry,
         health: Arc::new(proxy::new()),
@@ -117,6 +131,7 @@ pub fn from_config(
         static_config: cfg,
         ingress: arc_swap::ArcSwap::from_pointee(crate::ingress::WatchStatus::default()),
         tls_resolver,
+        dynamic: arc_swap::ArcSwap::from_pointee(dynamic),
         started_at: std::time::Instant::now(),
         probe_task: Mutex::new(None),
         reload_gate: tokio::sync::Mutex::new(()),
@@ -235,5 +250,44 @@ pub fn apply_runtime(
         routes = cfg.routes.len(),
         upstreams = cfg.upstreams.len(),
         "runtime snapshot published"
+    );
+}
+
+/// Swap the dynamic-API registry when - and only when - the new config's
+/// `[dynamic]` section differs from the one the current registry was
+/// built from (`DynamicConfig: PartialEq`, so a dir or settings change
+/// forces a rebuild with a fresh compile cache; stale modules from the
+/// old dir must never keep serving). An unchanged section leaves the
+/// existing registry in place, keeping its stat-driven cache warm.
+///
+/// Kept as a sibling of [`apply_runtime`] rather than folded into it:
+/// the runtime snapshot is rebuilt on EVERY reload, the dynamic registry
+/// must not be, and the initial registry is built inline by
+/// [`AppState::from_config`] - so the reload paths call this separately
+/// (from `reload::publish`, covering both the file-based and in-memory
+/// reload entry points) after `apply_runtime`.
+///
+/// Note the asymmetry with route mounting (`app`): a reload that disables
+/// the section swaps in `None` and in-flight requests drain on their own
+/// `Arc`, but a reload that ENABLES the section cannot mount routes into
+/// an already-built router - enabling the API requires a restart of the
+/// listener (or a rebuild of the router).
+pub fn apply_dynamic(state: &AppState, cfg: &Config) {
+    let current = state.dynamic.load_full();
+    let changed = match (current.as_ref(), cfg.dynamic.as_ref()) {
+        (Some(prev), Some(next)) => prev.config() != next,
+        (None, None) => false,
+        _ => true,
+    };
+    if !changed {
+        return;
+    }
+    let next = cfg.dynamic.as_ref().map(|d| {
+        DynamicRegistry::new(state.registry.engine().clone(), state.registry.linker().clone(), d)
+    });
+    state.dynamic.store(Arc::new(next));
+    tracing::info!(
+        dir = cfg.dynamic.as_ref().map(|d| d.dir.as_str()).unwrap_or(""),
+        "dynamic module registry swapped"
     );
 }

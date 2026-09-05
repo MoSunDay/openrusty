@@ -94,9 +94,9 @@ impl TlsSources {
 /// One TLS listener's assembly plan: the shared resolver plus the
 /// classified sources (pure output of `listeners::mounts`, consumed by
 /// `listeners::spawn`).
-pub(crate) struct TlsPlan {
-    pub(crate) resolver: Arc<DynamicCertResolver>,
-    pub(crate) sources: TlsSources,
+pub struct TlsPlan {
+    pub resolver: Arc<DynamicCertResolver>,
+    pub sources: TlsSources,
 }
 
 /// Read the PEM material named by `sources` and build the rustls server

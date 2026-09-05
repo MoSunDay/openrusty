@@ -11,8 +11,11 @@
 # retry_on_timeout, kv-probe balancer phase + resp header get/del +
 # req_meta probes, the /openrusty/metrics endpoint shape, ws handshake
 # header passthrough, ip_hash dead-node failover, the concurrent
-# reload race (in-flight reloads are rejected with 409), and upstream
-# TLS (https peers: CA pinning, wrong-CA rejection, insecure skip).
+# reload race (in-flight reloads are rejected with 409), the dynamic
+# WASM API (POST /api/v1/dynamic/{name}: settings plumbing, module
+# headers, error codes, body cap, replace-without-reload, warm cache
+# across reloads), and upstream TLS (https peers: CA pinning,
+# wrong-CA rejection, insecure skip).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -131,6 +134,10 @@ PY
 node_of() { curl -s --max-time 5 "$GATE/echo?task=$1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["node"])' 2>/dev/null || true; }
 post_body_check() { curl -s --max-time 5 -d 'hello-body' "$GATE/echo" | grep -q '"body_len":10'; }
 
+# §31 (dynamic wasm API) lives in its own library so this script stays
+# under the size cap; it shares the check/GATE/TMP/ROOT globals above.
+. "$(dirname "$0")/lib-dynamic-drill.sh"
+
 echo "== build =="
 if ! bash scripts/build-plugins.sh; then
     echo "FATAL: plugin build failed" >&2
@@ -149,7 +156,9 @@ fi
 for artifact in "$ROOT/target/debug/openrusty" \
                 "$ROOT/target/debug/examples/echo_upstream" \
                 "$ROOT/build/plugins/vllm-kv-scheduler.wasm" \
-                "$ROOT/build/plugins/kv-probe.wasm"; do
+                "$ROOT/build/plugins/kv-probe.wasm" \
+                "$ROOT/build/plugins/dynamic-echo.wasm" \
+                "$ROOT/build/plugins/dynamic-reverse.wasm"; do
     if [ ! -e "$artifact" ]; then
         echo "FATAL: missing build artifact: $artifact" >&2
         exit 1
@@ -157,8 +166,12 @@ for artifact in "$ROOT/target/debug/openrusty" \
 done
 
 echo "== setup =="
-mkdir -p "$TMP/plugins" "$TMP/logs"
+mkdir -p "$TMP/plugins" "$TMP/dynamic" "$TMP/logs"
 cp build/plugins/vllm-kv-scheduler.wasm "$TMP/plugins/"
+# Dynamic-API modules live in their own dir (never build/plugins: the
+# endpoint must not serve the pipeline plugins).
+cp build/plugins/dynamic-echo.wasm "$TMP/dynamic/echo.wasm"
+cp build/plugins/dynamic-reverse.wasm "$TMP/dynamic/reverse.wasm"
 
 cat > "$TMP/openrusty.toml" <<CONF
 [server]
@@ -176,6 +189,17 @@ on_failure = "fail_open"
 extract = "query:task"
 affinity_ttl_s = "6"
 max_tasks_per_node = "0"
+
+# Dynamic single-module execution API (POST /api/v1/dynamic/<name>).
+# Routes are mounted at boot because the config is final here; the
+# timeout is raised above the default 50ms to stay safe under the
+# concurrency check below.
+[dynamic]
+dir = "$TMP/dynamic"
+timeout_ms = 100
+
+[dynamic.settings.echo]
+greeting = "hi"
 
 [[upstreams]]
 name = "vllm"
@@ -672,7 +696,13 @@ RACE_GEN_AFTER="$(gen_of)"
 check "reload race: generation advanced exactly once per success" test "$RACE_GEN_AFTER" -gt "$RACE_GEN_BEFORE"
 check "reload race: gateway still proxies" bash -c "curl -s --max-time 5 $GATE/echo | grep -q node"
 
-echo "== 31. upstream TLS (https peers, CA pinning, insecure) =="
+echo "== 31. dynamic wasm API (POST /api/v1/dynamic/{name}) =="
+# Boot config enabled [dynamic] with dir=$TMP/dynamic (echo.wasm +
+# reverse.wasm copied at setup) and [dynamic.settings.echo] greeting.
+# The drill lives in lib-dynamic-drill.sh (keeps this file in size cap).
+dynamic_drill
+
+echo "== 32. upstream TLS (https peers, CA pinning, insecure) =="
 # A private CA signs a leaf for localhost/127.0.0.1; a second CA exists
 # only to prove pinning rejects it. The https upstream is python's
 # http.server wrapped in an ssl context (stdlib-only echo).

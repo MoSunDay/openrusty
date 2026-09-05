@@ -29,7 +29,7 @@ orr_on_phase(phase: i32, ctx: i32) -> i32
 |------|---------|
 | `0` | NGX_OK – handled, continue chain |
 | `-5` | NGX_DECLINED – pass, continue chain |
-| `-4` | NGX_DONE – stop the phase chain; short-circuit with an empty 204 (from `content`: no body, no proxy attempt) |
+| `-4` | NGX_DONE – stop the phase chain; short-circuit with an empty 204, upgraded to `200 + resp_body_set` body when the plugin wrote one (from `content`: no proxy attempt) |
 | `100..=599` | deny: abort the request with this HTTP status |
 | anything else | protocol error – treated per `on_failure` policy |
 
@@ -121,6 +121,23 @@ reclaimed automatically, so a guest that abandons a scan cannot leak it.
 resp_header_get(name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32) -> i32
 resp_header_set(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32) -> i32
 resp_header_del(name_ptr: i32, name_len: i32) -> i32
+resp_body_set(ptr: i32, len: i32) -> i32
+  # writes the response body for a short-circuited response; >= 0 = bytes
+  # accepted (== len), -1 = refused (over the 1 MiB cap or unreadable
+  # pointer). Effects: Decision::Done + body -> 200 + body (instead of the
+  # empty 204); Decision::Deny(s) + body -> s + body. Replaces any body
+  # written earlier in the same request. Usable in any phase. This is
+  # also the response channel of the dynamic execution API (see below).
+
+Chain and late-write semantics: the body is carried per request across the
+plugin chain, and a plugin that writes no body preserves one written by an
+earlier plugin (an explicit write replaces it; last writer wins). A body
+written after the terminal decision was taken (`header_filter`/`log` in
+the dynamic API, `log` in the pipeline short-circuits) still upgrades the
+would-be empty 204 to `200 + body` on both paths, because the response is
+assembled after the log phase; the pipeline's access-log status for a
+`Done` short-circuit is sampled before the log phase and therefore logs
+204 in that edge.
 
 body_chunk(out_ptr: i32, out_cap: i32) -> i32   # body_filter: current chunk
   returns bytes written; 0 = no data (final empty chunk call); negative = error
@@ -166,3 +183,33 @@ the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
   the snapshot generation by exactly one. A reload that loses the publish
   race rebuilds against the fresh snapshot (3 attempts) and then fails with
   a conflict error, leaving the previous snapshot untouched.
+
+## Dynamic execution API
+
+`[dynamic]` config section (absent = disabled) serves
+`POST /api/v1/dynamic/<name>` by running `<dynamic.dir>/<name>.wasm` as a
+synthesized single-plugin pipeline: post_read -> rewrite -> access ->
+content -> header_filter -> log (no balancer, no body_filter, no proxy).
+Module names must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` (else 400); a
+missing file answers 404.
+
+- Decision mapping: `Done` + `resp_body_set` body -> 200 + body (module
+  headers verbatim except content-length; default
+  `content-type: text/plain; charset=utf-8` when a body exists and the
+  module set none); `Done` without a body -> empty 204; `Deny(s)` -> s
+  with the body when one was set; no terminal response produced -> 500.
+  A body written as late as `header_filter`/`log` still upgrades a
+  body-less `Done` from 204 to 200 (the outcome is assembled after
+  `log`).
+- The module cache is stat-driven: entries are keyed by the file's
+  `(mtime, size)`, compiled singleflight per name, so replacing a module
+  takes effect on the next request with no reload. Per-name host state
+  (`HostState`: KV + error counters) survives module replacement.
+- Config keys: `dir` (overridable via the `OPENRUSTY_DYNAMIC_DIR` env),
+  `timeout_ms`, `max_memory_mb`, `on_failure`, `max_body_bytes` (POST
+  cap, 413 above), and `[dynamic.settings.<name>]` free-form settings
+  readable via `cfg_get`. Route mounting is boot-time; reload rebuilds
+  the registry when the section changes but cannot mount/unmount routes.
+- Example modules: `plugins/dynamic-echo` (settings + module headers) and
+  `plugins/dynamic-reverse` (used to demo replace-without-reload).
+

@@ -32,6 +32,7 @@ extern "C" {
     pub fn resp_header_get(np: i32, nl: i32, op: i32, oc: i32) -> i32;
     pub fn resp_header_set(np: i32, nl: i32, vp: i32, vl: i32) -> i32;
     pub fn resp_header_del(np: i32, nl: i32) -> i32;
+    pub fn resp_body_set(ptr: i32, len: i32) -> i32;
 
     pub fn body_chunk(op: i32, oc: i32) -> i32;
     pub fn body_is_last() -> i32;
@@ -127,6 +128,14 @@ pub unsafe fn resp_header_set(_np: i32, _nl: i32, _vp: i32, _vl: i32) -> i32 {
 #[allow(unused)]
 pub unsafe fn resp_header_del(_np: i32, _nl: i32) -> i32 {
     0
+}
+
+// The stub mirrors the success contract (`ret == len`) so host-side
+// logic tests behave like the gateway.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+pub unsafe fn resp_body_set(_ptr: i32, len: i32) -> i32 {
+    len
 }
 
 #[cfg(not(target_arch = "wasm32"))]

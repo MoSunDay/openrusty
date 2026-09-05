@@ -78,11 +78,11 @@ the units so freshly built binaries are picked up. Logs live in journald
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
 bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
-bash scripts/integration.sh   # end-to-end drill: 106 checks, sections 1-31
+bash scripts/integration.sh   # end-to-end drill: 119 checks, sections 1-32
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports
-(18080/191xx) and walks through `scripts/integration.sh` sections 1-31:
+(18080/191xx) and walks through `scripts/integration.sh` sections 1-32:
 basic proxy, SSE, h2c, WebSocket, sticky scheduling with TTL release, hot
 reload (SIGHUP / POST, in-flight requests, KV survival, atomic rejection of
 broken plugins, reload under load with zero 5xx), passive health checks,
@@ -101,9 +101,12 @@ the `OPENRUSTY_CONFIG` environment variable, and verify request-body
 (probe-only peer down detection and recovery), `retry_on_timeout` semantics
 against a deterministic hanging peer, the `kv-probe` balancer phase with
 `set_peer`/peer-view and resp-header/req_meta probes, and the
-`/openrusty/metrics` Prometheus exposition shape. Sections 30-31 close out
+`/openrusty/metrics` Prometheus exposition shape. Sections 30-32 close out
 the concurrent-reload race gate (in-flight reloads rejected with 409 while
-exactly one swap lands) and upstream TLS: https peers forwarded through a
+exactly one swap lands), the dynamic WASM execution API
+(POST /openrusty/dynamic/{plugin}: settings plumbing, module headers,
+peer/balancer overrides, chain-style body hand-off, replace-without-reload),
+and upstream TLS: https peers forwarded through a
 CA-pinned rustls client, a wrong CA rejected with the gateway's own 502,
 and `insecure_skip_verify` forwarding without an anchor.
 fallback to the default balancer when the field is missing).

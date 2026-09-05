@@ -102,7 +102,7 @@ fn swrr_pick(up_rt: &UpstreamRt, healthy: &[usize]) -> Option<usize> {
     if healthy.is_empty() {
         return None;
     }
-    let mut cur = up_rt.swrr.lock().unwrap();
+    let mut cur = up_rt.swrr.lock().unwrap_or_else(|e| e.into_inner());
     if cur.len() != up_rt.up.peers.len() {
         cur.resize(up_rt.up.peers.len(), 0);
     }

@@ -18,6 +18,7 @@
 //!   normal graceful drain; the bounded wait for the listeners runs in
 //!   `shutdown::run`, driven by the binary (or an embedder).
 
+use crate::dynamic_api;
 use crate::metrics;
 use crate::pipeline::{handle_request, text_response};
 use crate::reload;
@@ -58,17 +59,37 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
     admin_routes().with_state(state)
 }
 
-/// Data-plane router without the admin plane: everything falls through to
-/// the proxy pipeline.
-pub fn data_router(state: Arc<AppState>) -> Router {
-    Router::new().fallback(fallback).with_state(state)
+/// Mount the dynamic-API routes (`POST /api/v1/dynamic/{name}`) onto a
+/// router when the `[dynamic]` config section is enabled. Pure decision
+/// made once at router-build time: while the feature is off nothing is
+/// merged at all (zero routing cost). A later reload swaps the registry
+/// the handlers read per request, but cannot mount routes into an
+/// already-built router - enabling the API needs a rebuilt router
+/// (`state::apply_dynamic` documents the same asymmetry).
+fn with_dynamic_routes(router: Router<Arc<AppState>>, state: &AppState) -> Router<Arc<AppState>> {
+    if state.dynamic.load_full().is_some() {
+        router.merge(dynamic_api::routes())
+    } else {
+        router
+    }
 }
 
-/// Combined gateway router: management routes first, everything else falls
-/// through to the proxy pipeline. This is the single-socket shape used when
-/// no dedicated admin listener is configured (and by embedders/tests).
+/// Data-plane router without the admin plane: the dynamic API (when
+/// enabled) plus everything else falling through to the proxy pipeline.
+pub fn data_router(state: Arc<AppState>) -> Router {
+    with_dynamic_routes(Router::new(), &state)
+        .fallback(fallback)
+        .with_state(state)
+}
+
+/// Combined gateway router: management routes first, the dynamic API
+/// (when enabled), everything else falls through to the proxy pipeline.
+/// This is the single-socket shape used when no dedicated admin listener
+/// is configured (and by embedders/tests).
 pub fn router(state: Arc<AppState>) -> Router {
-    admin_routes().fallback(fallback).with_state(state)
+    with_dynamic_routes(admin_routes(), &state)
+        .fallback(fallback)
+        .with_state(state)
 }
 
 /// Proxy fallback; ConnectInfo is inserted per request by `h2c::serve`.
@@ -240,7 +261,7 @@ async fn shutdown_endpoint(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{boot_state, TmpDir};
+    use crate::testutil::{boot_state, TmpDir, OK_WAT};
     use tower::ServiceExt;
 
     fn request(method: &str, uri: &str, remote: &str) -> axum::extract::Request {
@@ -513,5 +534,104 @@ mod tests {
         // The metrics request itself must not be instrumented: a counted
         // scrape would show up as route="unknown" (no route matches).
         assert!(!body.contains("route=\"unknown\""), "body: {body}");
+    }
+
+    /// Standard config plus a `[dynamic]` section pointing at `<dir>/dyn`
+    /// with one module: content-phase Done, body + explicit content-type.
+    const DYN_MOD: &str = r#"(module
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (import "openrusty" "resp_header_set" (func $hdr (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "dynamic!")
+  (data (i32.const 32) "content-type")
+  (data (i32.const 48) "application/json")
+  (func (export "orr_on_phase") (param $phase i32) (param $aux i32) (result i32)
+    (if (i32.eq (local.get $phase) (i32.const 3))
+      (then
+        (drop (call $set (i32.const 0) (i32.const 8)))
+        (drop (call $hdr (i32.const 32) (i32.const 12) (i32.const 48) (i32.const 16)))
+        (return (i32.const -4))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))"#;
+
+    /// With `[dynamic]` enabled: the POST endpoint answers through the
+    /// mounted route AND every other path still reaches the proxy
+    /// fallback (the dynamic routes must not shadow the pipeline).
+    #[tokio::test]
+    async fn dynamic_route_answers_while_fallback_survives() {
+        let dir = TmpDir::new("dyn-on");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        let dyn_dir = dir.0.join("dyn");
+        std::fs::create_dir_all(&dyn_dir).unwrap();
+        std::fs::write(dyn_dir.join("echo.wasm"), DYN_MOD.as_bytes()).unwrap();
+        // Deterministic upstream failure: the single peer port is free.
+        let free_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        dir.write_config(&format!(
+            "{}\n[dynamic]\ndir = \"{}\"\n",
+            dir.standard_config()
+                .replace("127.0.0.1:9001", &format!("127.0.0.1:{free_port}")),
+            dyn_dir.display()
+        ));
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        // The dynamic endpoint is served by its own route.
+        let resp = svc
+            .clone()
+            .oneshot(request("POST", "/api/v1/dynamic/echo", "127.0.0.1:40011"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "dynamic!");
+
+        // Other paths still go through the proxy fallback: the catch-all
+        // route matches, the free port refuses, the pipeline answers 502.
+        let resp = svc
+            .clone()
+            .oneshot(request("GET", "/api/hello", "127.0.0.1:40012"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502);
+
+        // The scrape shows the dynamic family next to the proxy families.
+        let resp = svc
+            .oneshot(request("GET", "/openrusty/metrics", "127.0.0.1:40013"))
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("openrusty_dynamic_requests_total{module=\"echo\",code=\"200\"} 1"),
+            "body: {body}"
+        );
+    }
+
+    /// With `[dynamic]` absent nothing is mounted: a POST to the endpoint
+    /// path falls through to the proxy pipeline (here: the no-route 404),
+    /// proving the dynamic handler is not involved.
+    #[tokio::test]
+    async fn dynamic_disabled_falls_through_to_the_pipeline() {
+        let dir = TmpDir::new("dyn-off");
+        dir.write_plugin("p.wasm", OK_WAT.as_bytes());
+        // One route matching nothing, so the endpoint path exercises the
+        // pipeline's no-route 404 branch (not the proxy, not dynamic).
+        dir.write_config(
+            &dir.standard_config()
+                .replace("path_prefix = \"/\"", "path_prefix = \"/nomatch\""),
+        );
+        let state = boot_state(&dir);
+        let svc = router(state.clone()).into_service::<axum::body::Body>();
+
+        let resp = svc
+            .oneshot(request("POST", "/api/v1/dynamic/echo", "127.0.0.1:40014"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // The pipeline's 404 text, not the dynamic handler's: the request
+        // never reached the dynamic API.
+        assert_eq!(body_string(resp).await, "404 not found\n");
+        assert!(state.metrics.snapshot().dynamic.is_empty());
     }
 }

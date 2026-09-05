@@ -26,6 +26,9 @@ pub struct RequestSession {
     /// Current response headers, pushed before each call and pulled back
     /// after (resp_header_set/del mutate them).
     resp_headers: Vec<(String, String)>,
+    /// Response body written by a plugin via `resp_body_set`, pulled back
+    /// after each call; consumed when a phase short-circuits.
+    resp_body: Option<Bytes>,
     /// Buffered request body, pushed into each instance before its call.
     /// Empty until the server seeds it (content phase onward).
     req_body: Bytes,
@@ -38,10 +41,22 @@ impl RequestSession {
         ctx: ReqCtx,
         peers: Vec<PeerView>,
     ) -> Self {
+        Self::for_parts(reg.engine().clone(), reg.linker().clone(), snap, ctx, peers)
+    }
+
+    /// [`RequestSession::new`] for callers that already hold the engine
+    /// and linker (e.g. embedders sharing one registry's runtime).
+    pub fn for_parts(
+        engine: Engine,
+        linker: Linker<HostData>,
+        snap: Arc<PluginSnapshot>,
+        ctx: ReqCtx,
+        peers: Vec<PeerView>,
+    ) -> Self {
         let rts = snap.plugins.iter().map(|_| None).collect();
         RequestSession {
-            engine: reg.engine().clone(),
-            linker: reg.linker().clone(),
+            engine,
+            linker,
             snap,
             ctx,
             peers,
@@ -49,6 +64,7 @@ impl RequestSession {
             body_chunk: Bytes::new(),
             body_last: false,
             resp_headers: Vec::new(),
+            resp_body: None,
             req_body: Bytes::new(),
         }
     }
@@ -85,6 +101,23 @@ impl RequestSession {
     /// (seed with [`Self::set_resp_headers`] before running the phase).
     pub fn resp_headers(&self) -> &[(String, String)] {
         &self.resp_headers
+    }
+
+    /// Response body written by a plugin via `resp_body_set`, if any
+    /// (`None` = no body carried by a short-circuit).
+    pub fn resp_body(&self) -> Option<&Bytes> {
+        self.resp_body.as_ref()
+    }
+
+    /// Drain the buffered response body written by plugins so far,
+    /// clearing both the session copy and every instance's host data.
+    /// Returns `None` when unset or empty (an empty body is "no body").
+    pub fn take_resp_body(&mut self) -> Option<Bytes> {
+        let buffered = self.resp_body.take();
+        for rt in self.rts.iter_mut().flatten() {
+            rt.host_data_mut().resp_body = None;
+        }
+        buffered.filter(|b| !b.is_empty())
     }
 
     /// Drain all header edits recorded by plugins so far.
@@ -145,6 +178,13 @@ impl RequestSession {
             let hd = rt.host_data();
             self.ctx = hd.ctx.clone();
             self.resp_headers = hd.resp_headers.clone();
+            // Host data is not seeded with the session's body, so a
+            // plugin that writes none must not clobber a body written by
+            // an earlier plugin in the chain (last writer wins; an
+            // untouched `None` preserves what is already carried).
+            if hd.resp_body.is_some() {
+                self.resp_body = hd.resp_body.clone();
+            }
 
             last = decision;
             if decision.is_terminal() && !is_log {
@@ -232,6 +272,17 @@ mod tests {
   (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
 "#;
 
+    const BODY_DONE_MOD: &str = r#"
+(module
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "served by plugin")
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (drop (call $set (i32.const 0) (i32.const 16)))
+    i32.const -4)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+
     fn test_cfg(dir: &str, order: &[&str]) -> Config {
         Config {
             server: ServerConfig {
@@ -252,6 +303,7 @@ mod tests {
             routes: Vec::new(),
             ingress: Default::default(),
             egress: Default::default(),
+            dynamic: None,
         }
     }
 
@@ -343,6 +395,59 @@ mod tests {
         );
         // Edits are drained now.
         assert!(sess.take_header_edits().is_empty());
+    }
+
+    /// Content-phase module: writes a body but returns Ok (non-terminal).
+    const CHAIN_BODY_OK_MOD: &str = r#"
+(module
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "from-first")
+  (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+    (if (i32.eq (local.get $phase) (i32.const 3))
+      (then
+        (drop (call $set (i32.const 0) (i32.const 10)))
+        (return (i32.const 0))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+
+    /// Content-phase module: returns Done without touching the body.
+    const CHAIN_DONE_MOD: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+    (if (i32.eq (local.get $phase) (i32.const 3))
+      (then (return (i32.const -4))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+
+    #[tokio::test]
+    async fn chain_body_survives_later_done_plugin() {
+        let dir = TmpDir::new("respchain");
+        dir.write("first.wasm", CHAIN_BODY_OK_MOD);
+        dir.write("second.wasm", CHAIN_DONE_MOD);
+        let cfg = test_cfg(dir.0.to_str().unwrap(), &["first", "second"]);
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        assert_eq!(sess.run_phase(Phase::Content), Decision::Done);
+        // first wrote a body and returned Ok; second's Done must not
+        // clobber it with second's untouched (empty) host-data copy.
+        assert_eq!(sess.take_resp_body().as_deref(), Some(&b"from-first"[..]));
+    }
+
+    #[tokio::test]
+    async fn done_short_circuit_carries_body() {
+        let dir = TmpDir::new("respbody");
+        dir.write("body.wasm", BODY_DONE_MOD);
+        let cfg = test_cfg(dir.0.to_str().unwrap(), &[]);
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        assert_eq!(sess.run_phase(Phase::Content), Decision::Done);
+        assert_eq!(sess.take_resp_body().as_deref(), Some(&b"served by plugin"[..]));
+        // The body is drained (session copy and instance host data).
+        assert!(sess.take_resp_body().is_none());
     }
 
     #[tokio::test]

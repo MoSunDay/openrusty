@@ -10,6 +10,7 @@ use crate::instance::{new_host_data, HeaderEdit, HostData};
 use crate::linker_kv;
 use crate::linker_req;
 use crate::mem;
+use bytes::Bytes;
 use openrusty_core::ReqCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,10 @@ use wasmtime::{Caller, Engine, Linker, Module, Store, StoreLimitsBuilder, Trap};
 /// start section loops forever must fail validation instead of hanging
 /// the reload.
 const PROBE_INSTANTIATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling for a single `resp_body_set` write (1 MiB). Larger bodies are
+/// refused with `-1` and the previously written body (if any) survives.
+pub const RESP_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 /// ABI validation failure.
 #[derive(Debug, Error)]
@@ -135,6 +140,22 @@ pub fn build_linker(engine: &Engine) -> Result<Linker<HostData>, wasmtime::Error
             d.resp_headers
                 .retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
             0
+        },
+    )?;
+
+    linker.func_wrap(
+        abi::NS,
+        abi::RESP_BODY_SET,
+        |mut caller: Caller<'_, HostData>, ptr: i32, len: i32| -> i32 {
+            if len < 0 || len as usize > RESP_BODY_MAX_BYTES {
+                return -1;
+            }
+            let Some(bytes) = mem::read_guest(&mut caller, ptr, len) else {
+                return -1;
+            };
+            // Last write wins: a repeated call replaces the previous body.
+            caller.data_mut().resp_body = Some(Bytes::from(bytes));
+            len
         },
     )?;
 
@@ -260,7 +281,24 @@ fn probe_host_data() -> HostData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner;
+    use openrusty_core::config::FailPolicy;
+    use openrusty_core::phase::{Decision, Phase};
     use std::time::{Duration, Instant};
+
+    const CALM: Duration = Duration::from_secs(60);
+
+    /// One instantiated plugin on an epoch-enabled engine (registry-style:
+    /// the ticker stays alive for the instance's lifetime so phase runs
+    /// can use epoch deadlines).
+    fn rt_on(src: &str) -> (crate::epoch::EpochTicker, crate::runner::PluginRt) {
+        let ticker = crate::registry::new_engine().unwrap();
+        let engine = ticker.engine();
+        let linker = build_linker(engine).unwrap();
+        let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
+        let rt = runner::instantiate(engine, &linker, &module, probe_host_data(), 16).unwrap();
+        (ticker, rt)
+    }
 
     const GOOD: &str = r#"
 (module
@@ -307,6 +345,58 @@ mod tests {
             validate_module(&engine, &linker, &module),
             Err(AbiError::Instantiate(_))
         ));
+    }
+
+    /// `resp_body_set` copies guest bytes into the host data; a repeated
+    /// call replaces the previous body (last write wins).
+    #[test]
+    fn resp_body_set_stores_and_replaces() {
+        const BODY_MOD: &str = r#"
+(module
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "hello")
+  (data (i32.const 8) "hi")
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (drop (call $set (i32.const 0) (i32.const 5)))
+    (drop (call $set (i32.const 8) (i32.const 2)))
+    i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+        let (_ticker, mut rt) = rt_on(BODY_MOD);
+        assert_eq!(
+            runner::run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::Content),
+            Decision::Ok
+        );
+        assert_eq!(rt.host_data().resp_body.as_deref(), Some(&b"hi"[..]));
+    }
+
+    /// A body over the 1 MiB cap is refused with `-1` and leaves the
+    /// store's body unset. The 17-page memory (1.0625 MiB) is large
+    /// enough for the read itself, so only the cap can explain the
+    /// refusal; the guest maps refusal to `Declined`, acceptance to
+    /// `Deny(100)`, so a wrong verdict cannot slip through as `Ok`.
+    #[test]
+    fn resp_body_set_rejects_over_limit() {
+        const OVER_MOD: &str = r#"
+(module
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (memory (export "memory") 17)
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (local $r i32)
+    (local.set $r (call $set (i32.const 0) (i32.const 1048577)))
+    (if (i32.eq (local.get $r) (i32.const -1))
+      (then (return (i32.const -5)))
+      (else (return (i32.const 100))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+        let (_ticker, mut rt) = rt_on(OVER_MOD);
+        assert_eq!(
+            runner::run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::Content),
+            Decision::Declined
+        );
+        assert!(rt.host_data().resp_body.is_none());
     }
 
     /// Regression: a module whose start section loops forever must fail

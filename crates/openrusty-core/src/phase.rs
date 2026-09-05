@@ -70,7 +70,8 @@ pub enum Decision {
     /// NGX_DECLINED: the plugin passed; continue the chain.
     Declined,
     /// NGX_DONE: stop the phase chain. In `content` this short-circuits the
-    /// response (v1: empty 204); in `body_filter` it marks the end of stream.
+    /// response (empty 204, or 200 + the body written via `resp_body_set`);
+    /// in `body_filter` it marks the end of stream.
     Done,
     /// Short-circuit with an HTTP error status (nginx style: phases return a
     /// status code to abort).

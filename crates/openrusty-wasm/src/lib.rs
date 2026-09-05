@@ -4,6 +4,7 @@
 //! The ABI contract lives in docs/wasm-abi.md.
 
 pub mod abi;
+pub mod dynamic;
 pub mod epoch;
 pub mod host_state;
 pub mod instance;
@@ -17,6 +18,7 @@ mod linker_kv;
 mod linker_req;
 mod registry_validate;
 
+pub use dynamic::{DynOutcome, DynamicRegistry, ResolveError};
 pub use epoch::{ticks_for, EpochTicker, TICK_MS};
 pub use host_state::HostState;
 pub use instance::{new_host_data, HeaderEdit, HostData, PeerView};

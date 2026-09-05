@@ -120,10 +120,10 @@ pub(crate) fn route_http(protocol: proxy::Protocol) -> HttpStep {
 /// handled connection: the `[egress]` policy, the pre-resolved gateway
 /// address, and the disposition counters. Cheap to clone per connection.
 #[derive(Clone)]
-pub(crate) struct EgressPlane {
-    pub(crate) egress: EgressConfig,
-    pub(crate) gateway: Option<SocketAddr>,
-    pub(crate) metrics: Arc<Metrics>,
+pub struct EgressPlane {
+    pub egress: EgressConfig,
+    pub gateway: Option<SocketAddr>,
+    pub metrics: Arc<Metrics>,
 }
 
 
