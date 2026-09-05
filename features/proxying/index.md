@@ -1,10 +1,11 @@
-Commit: 08a95ba
+Commit: abe419f
 # 代理转发与流式协议
 
 ## 能力概述
 - 客户端在同一端口上同时获得 HTTP/1.1 与 h2c（prior-knowledge HTTP/2）服务。
 - 请求按路由转发到 upstream；WebSocket 连接端到端透传；SSE 与分块响应逐块流式回传（同时流经插件 `body_filter` 阶段）。
 - 转发请求自动追加 `X-Forwarded-For`（保留并合并上游已有值）。
+- 上游可选出向 TLS（`[[upstreams]] tls` 节，对齐 nginx `proxy_pass https://` + `proxy_ssl_*`）：peer 连接升级为 TLS，SNI 与证书校验名取 `server_name`（与拨号地址解耦），支持 CA 锚定、mTLS 客户端证书对与 `insecure_skip_verify`（仅开发用）。
 
 ## 触发方式
 - 任何命中 `[[routes]]` 中 `path_prefix` 的请求；路由按最长前缀匹配，未命中返回 404。
@@ -19,6 +20,7 @@ Commit: 08a95ba
 - 可选主动健康检查：在 `[upstreams.health.active]` 配置（`interval_ms` 默认 1000、`timeout_ms` 默认 1000、`path` 默认 `/`、`unhealthy_threshold` 默认 2、`healthy_threshold` 默认 2），存在该表即启用。探测为对每个 peer 的 `path` 发起短 HTTP GET，非 2xx 计为失败；连续失败 `unhealthy_threshold` 次标记为不健康，连续成功 `healthy_threshold` 次恢复。最终 peer 健康 = 被动失败状态 ∧ 主动探测结果；`/openrusty/status` 按 upstream 报告主动探测状态。
 - h2c 与 HTTP/1.1 复用同一监听端口，无需分别配置；`[server] http1_only = true` 可跳过 h2c 探测仅服务 HTTP/1.1（默认 false）。
 - 建连受 `connect_timeout_ms` 约束；池内空闲 keep-alive 连接超过 `pool_idle_timeout_ms`（默认 60000）被回收。
+- TLS 上游：证书材料在 boot/reload **发布前**统一构建（`state::build_tls_plans`），坏材料 = reload 整体拒绝、boot fail-fast；TLS 握手失败按连接级错误归类（可换 peer 重试），CA 不匹配时网关回自身 502；https 客户端按 `(peer 地址, TLS 配置键)` 池化，同配置 reload 复用暖池，换信任锚/身份即开新池；ALPN 仅 `http/1.1`，转发的 Host 头保持 peer 地址。注意池键按配置路径：同路径下轮换证书文件**不会**因 reload 生效（需改配置路径或重启）。
 
 ## 关键状态与异常
 - 状态：路由匹配结果、所选 peer、重试计数。

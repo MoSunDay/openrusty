@@ -1,4 +1,4 @@
-Commit: 08a95ba
+Commit: abe419f
 # 负载均衡与健康检查
 
 ## 能力概述
@@ -12,7 +12,7 @@ Commit: 08a95ba
 - `swrr`：平滑加权轮询，按 `[[upstreams.peers]].weight` 分配，避免突发集中。
 - `ip_hash`：按客户端 IP 取模，将同一客户端固定到健康集合中的同一 peer。
 - 被动健康：`fail_window_s` 窗口内累计 `max_fails` 次失败即将该 peer 标记 down；`fail_timeout_s` 后放行试探请求，成功则恢复。
-- 主动健康：upstream 配置 `[upstreams.health.active]`（`interval_ms`/`timeout_ms`/`path`/`unhealthy_threshold`/`healthy_threshold`）后，网关探测任务周期性 GET `path`；连续失败达阈值标 down、连续成功达阈值恢复。阈值只门控状态迁移：成功探测不把健康 peer 标脏，失败探测不治愈脏 peer。
+- 主动健康：upstream 配置 `[upstreams.health.active]`（`interval_ms`/`timeout_ms`/`path`/`unhealthy_threshold`/`healthy_threshold`）后，网关探测任务周期性 GET `path`；连续失败达阈值标 down、连续成功达阈值恢复。阈值只门控状态迁移：成功探测不把健康 peer 标脏，失败探测不治愈脏 peer。https 上游的探测连接同样按该 upstream 的 TLS plan 发起（SNI/校验名取 `[upstreams.tls]`）。
 - 选择始终在健康集合内进行；`GET /openrusty/status` 报告每个 upstream 的 `peers` 与 `healthy` 计数。
 
 ## 关键状态与异常
