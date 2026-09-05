@@ -753,7 +753,7 @@ mod tests {
         ));
         let cfg = openrusty_core::load_config(&dir.config_path()).unwrap();
         let gen = state.registry.snapshot().generation + 1;
-        crate::state::apply_runtime(&state, &cfg, gen);
+        crate::state::apply_runtime(&state, &cfg, gen, &std::collections::HashMap::new());
 
         // Old path now 404s (recorded as "unknown", not as some stale or
         // current route name).
