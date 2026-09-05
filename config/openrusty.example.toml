@@ -88,6 +88,21 @@ connect_timeout_ms = 2000
   # unhealthy_threshold = 2
   # healthy_threshold = 2
 
+  # Outbound (upstream) TLS: uncomment to forward every peer of this
+  # upstream over HTTPS. `server_name` is used for SNI and certificate
+  # verification; `ca_cert` anchors it (system roots are NOT used, so a
+  # private CA must be given). Either `ca_cert` or `insecure_skip_verify`
+  # is required; both together is a config error, as is a client cert
+  # without its key.
+  # [upstreams.tls]
+  # server_name = "llm-internal.example.com"
+  # ca_cert = "certs/internal-ca.pem"
+  # # Client certificate pair for mTLS (both lines or neither).
+  # # client_cert = "certs/gateway-client.pem"
+  # # client_key = "certs/gateway-client.key"
+  # # Trust any server certificate (development only; no CA needed).
+  # # insecure_skip_verify = true
+
 [[routes]]
 # Requests whose path starts with this prefix are forwarded to `upstream`.
 path_prefix = "/v1"

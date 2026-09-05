@@ -94,6 +94,11 @@ pub fn from_config(
     cfg: Config,
     config_path: PathBuf,
 ) -> Result<Arc<AppState>, openrusty_wasm::ReloadError> {
+    // Fail fast on unreadable/invalid upstream TLS material, before any
+    // plugin is compiled; the plans are threaded into `apply_runtime` so
+    // the first snapshot is ready to serve https peers.
+    let tls_plans =
+        build_tls_plans(&cfg).map_err(openrusty_wasm::ReloadError::Io)?;
     let registry = PluginRegistry::bootstrap(&cfg)?;
     // One shared SNI resolver whenever any listener terminates TLS; the
     // material itself is loaded later, in the listener bind phase (so a
@@ -118,8 +123,27 @@ pub fn from_config(
         shutdown: crate::shutdown::new_signal(),
     });
     let generation = state.registry.snapshot().generation;
-    apply_runtime(&state, &state.static_config, generation);
+    apply_runtime(&state, &state.static_config, generation, &tls_plans);
     Ok(state)
+}
+
+/// Build the outbound TLS material for every upstream that declares an
+/// `[upstreams.tls]` section, keyed by upstream name. Fallible on purpose:
+/// certificate files are read and parsed here, once per boot/reload, so
+/// the request path only ever sees ready-to-use [`proxy::tls::UpstreamTls`]
+/// and a bad anchor aborts the swap before anything is published.
+pub fn build_tls_plans(
+    cfg: &Config,
+) -> Result<HashMap<String, proxy::tls::UpstreamTls>, String> {
+    let mut plans = HashMap::new();
+    for uc in &cfg.upstreams {
+        if let Some(tc) = &uc.tls {
+            let tls = proxy::tls::build(tc)
+                .map_err(|detail| format!("upstream '{}': {}", uc.name, detail))?;
+            plans.insert(uc.name.clone(), tls);
+        }
+    }
+    Ok(plans)
 }
 
 /// Log non-fatal health advisories for upstreams whose passive-health
@@ -148,34 +172,58 @@ fn log_health_advisories(cfg: &Config) {
 /// via `health::register`, which remaps peer state by ADDRESS: a peer whose
 /// address existed before keeps its counters/down state whatever its new
 /// index, new addresses start fresh, removed addresses are dropped. The
-/// pooled-client cache is pruned to the configured addresses so clients of
-/// removed peers cannot linger. Called only after the plugin registry
-/// published a new snapshot, so config and plugins never disagree.
-pub fn apply_runtime(state: &AppState, cfg: &Config, generation: u64) {
+/// pooled-client cache is pruned to the configured clients (address for
+/// http, address + TLS identity for https) so clients of removed peers or
+/// of a changed TLS identity cannot linger. Called only after the plugin
+/// registry published a new snapshot, so config and plugins never disagree.
+///
+/// `tls_plans` carries the pre-built outbound TLS material (see
+/// [`build_tls_plans`]); upstreams without an entry stay plaintext.
+pub fn apply_runtime(
+    state: &AppState,
+    cfg: &Config,
+    generation: u64,
+    tls_plans: &HashMap<String, proxy::tls::UpstreamTls>,
+) {
     log_health_advisories(cfg);
     let mut upstreams = HashMap::new();
-    let mut live_addrs: Vec<SocketAddr> = Vec::new();
+    let mut live_keys: Vec<proxy::PoolKey> = Vec::new();
     for uc in &cfg.upstreams {
-        let up = proxy::from_config(uc);
+        let up = proxy::from_config(uc, tls_plans.get(&uc.name).cloned());
         let peer_addrs: Vec<SocketAddr> = up.peers.iter().map(|p| p.addr).collect();
         proxy::register(&state.health, &up.name, &peer_addrs);
-        live_addrs.extend(peer_addrs.iter().copied());
         for p in &up.peers {
             // Pre-create the pooled client so the request path never pays
             // client construction (and connects through a warm keep-alive
             // pool). Must run before `up` moves into `UpstreamRt`.
-            proxy::get(
-                &state.pool,
-                p.addr,
-                up.connect_timeout,
-                up.pool_idle_timeout,
-            );
+            match &up.tls {
+                Some(tls) => {
+                    proxy::get_tls(
+                        &state.pool,
+                        p.addr,
+                        tls,
+                        up.connect_timeout,
+                        up.pool_idle_timeout,
+                    );
+                    live_keys.push(proxy::PoolKey::Https(p.addr, tls.key.clone()));
+                }
+                None => {
+                    proxy::get(
+                        &state.pool,
+                        p.addr,
+                        up.connect_timeout,
+                        up.pool_idle_timeout,
+                    );
+                    live_keys.push(proxy::PoolKey::Http(p.addr));
+                }
+            }
         }
         let swrr = Mutex::new(vec![0i64; up.peers.len()]);
         upstreams.insert(up.name.clone(), Arc::new(UpstreamRt { up, swrr }));
     }
-    // Drop pooled clients for addresses that left the configuration.
-    proxy::evict_except(&state.pool, &live_addrs);
+    // Drop pooled clients for addresses that left the configuration (or
+    // whose TLS identity changed and therefore got a new pool slot).
+    proxy::evict_except(&state.pool, &live_keys);
     let snap = RuntimeSnapshot {
         generation,
         routes: cfg.routes.clone(),

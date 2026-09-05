@@ -48,6 +48,12 @@ impl std::error::Error for ReloadError {}
 /// snapshot, so any failure (compile, ABI) leaves both the old plugin
 /// snapshot and the old runtime untouched.
 async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError> {
+    // Build the upstream TLS plans first: a bad certificate must abort the
+    // swap before the plugin registry compiles anything, leaving the old
+    // snapshot and the old runtime untouched.
+    let tls_plans = crate::state::build_tls_plans(cfg)
+        .map_err(|detail| ReloadError::Failed(format!("tls: {detail}")))?;
+
     // Compiles off the request path; Err leaves the old snapshot in place.
     let generation = state
         .registry
@@ -56,8 +62,8 @@ async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError
         .map_err(|e| ReloadError::Failed(format!("plugins: {e}")))?;
 
     // Plugins are already published; now swap the runtime to match, then
-    // re-arm active probing -- both inside the reload gate.
-    apply_runtime(state, cfg, generation);
+    // re-arm active probing -- inside the reload gate.
+    apply_runtime(state, cfg, generation, &tls_plans);
     crate::active_probe::spawn(state);
     Ok(generation)
 }

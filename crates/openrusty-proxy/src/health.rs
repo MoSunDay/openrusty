@@ -55,7 +55,7 @@ pub struct PeerHealth {
 impl Clone for PeerHealth {
     fn clone(&self) -> Self {
         PeerHealth {
-            counters: Mutex::new(self.counters.lock().unwrap().clone()),
+            counters: Mutex::new(self.counters.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             down_until_ms: AtomicU64::new(self.down_until_ms.load(Ordering::Relaxed)),
             active_ok: AtomicBool::new(self.active_ok.load(Ordering::Relaxed)),
         }
@@ -115,7 +115,7 @@ impl Default for HealthRegistry {
 /// the per-index slot so [`is_healthy`] keeps seeing it. An unknown
 /// upstream registers fresh, healthy slots.
 pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
-    let mut map = h.upstreams.lock().unwrap();
+    let mut map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
     // Value-copy the previous per-address state; slots are behind an `Arc`
     // shared with in-flight requests, so they cannot be moved out.
     let previous: HashMap<SocketAddr, PeerHealth> = match map.get(upstream) {
@@ -127,7 +127,7 @@ pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
             .collect(),
         None => HashMap::new(),
     };
-    let active = h.active.lock().unwrap();
+    let active = h.active.lock().unwrap_or_else(|e| e.into_inner());
     let peers = addrs
         .iter()
         .map(|addr| {
@@ -158,7 +158,7 @@ pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
 
 /// Shared handle to one registered peer, if present.
 fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<PeerSlots>> {
-    let map = h.upstreams.lock().unwrap();
+    let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
     map.get(upstream).filter(|slots| idx < slots.peers.len()).cloned()
 }
 
@@ -184,7 +184,7 @@ pub fn healthy_indices(
     peer_count: usize,
     now_ms: u64,
 ) -> Vec<usize> {
-    let map = h.upstreams.lock().unwrap();
+    let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slots) = map.get(upstream) else {
         return (0..peer_count).collect();
     };
@@ -248,7 +248,7 @@ pub fn record_failure(
         return;
     };
     let peer = &peers.peers[idx];
-    let mut counters = peer.counters.lock().unwrap();
+    let mut counters = peer.counters.lock().unwrap_or_else(|e| e.into_inner());
     let window_ms = cfg.fail_window_s.saturating_mul(1000);
     if now_ms.saturating_sub(counters.window_start_ms) > window_ms {
         counters.fails = 0;
@@ -270,7 +270,7 @@ pub fn record_success(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u6
     let Some(peers) = lookup(h, upstream, idx) else {
         return;
     };
-    let mut counters = peers.peers[idx].counters.lock().unwrap();
+    let mut counters = peers.peers[idx].counters.lock().unwrap_or_else(|e| e.into_inner());
     counters.fails = 0;
     counters.window_start_ms = now_ms;
 }
@@ -324,7 +324,7 @@ pub fn record_probe(
     let peer = h
         .active
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(key)
         .or_insert_with(|| {
             Arc::new(ActivePeer {
@@ -357,7 +357,7 @@ pub fn record_probe(
 pub fn is_active_healthy(h: &HealthRegistry, upstream: &str, addr: &str) -> bool {
     h.active
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&(upstream.to_string(), addr.to_string()))
         .is_none_or(|p| p.healthy.load(Ordering::Relaxed))
 }
@@ -368,7 +368,7 @@ pub fn active_peers(h: &HealthRegistry) -> Vec<(String, String, bool)> {
     let mut out: Vec<(String, String, bool)> = h
         .active
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|((upstream, addr), p)| {
             (

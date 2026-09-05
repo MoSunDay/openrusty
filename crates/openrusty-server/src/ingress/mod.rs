@@ -166,7 +166,7 @@ fn fold_slot<T: ResourceMeta + Clone>(
     index: usize,
     incoming: &Snapshot<T>,
 ) -> Snapshot<T> {
-    let mut guard = slots.lock().expect("snapshot slots poisoned");
+    let mut guard = slots.lock().unwrap_or_else(|e| e.into_inner());
     guard[index] = Some(incoming.clone());
     let items: Vec<T> = guard
         .iter()
@@ -344,10 +344,19 @@ fn apply_pair(
         }
     };
     let cfg = build_ingress_config(base, merged_routes, rendered_upstreams, &tls);
+    // Outbound TLS material is built before anything is published; a
+    // failure keeps the previous runtime, like every other render error.
+    let tls_plans = match state::build_tls_plans(&cfg) {
+        Ok(plans) => plans,
+        Err(e) => {
+            tracing::warn!(error = %e, "ingress upstream TLS build failed; keeping previous runtime");
+            return;
+        }
+    };
     // Route hot-swap only: reuse the current plugin snapshot generation so
     // the runtime can never disagree with the compiled plugin set.
     let generation = state.registry.snapshot().generation;
-    state::apply_runtime(state, &cfg, generation);
+    state::apply_runtime(state, &cfg, generation, &tls_plans);
     // TLS: publish the freshly rendered secrets into the shared SNI
     // resolver. Broken entries are skipped inside (one bad Secret must
     // not sink the table), and the swap only affects new handshakes -

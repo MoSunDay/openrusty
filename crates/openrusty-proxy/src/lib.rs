@@ -33,15 +33,19 @@ pub mod forward;
 pub mod health;
 pub mod loop_guard;
 pub mod orig_dst;
+pub mod tls;
 pub mod tunnel;
 pub mod upstream;
 
 pub use balancer::{ip_hash_pick, swrr_next};
-pub use client::{evict_except, get, new_pool, ClientPool, HttpBody, HttpClient};
+pub use client::{
+    evict_except, get, get_tls, new_pool, ClientPool, HttpBody, HttpClient, PoolKey,
+};
 pub use detect::{detect, Protocol};
 pub use forward::{
-    failure_kind, forward, is_idempotent, may_retry, merge_xff, tunnel, FailureKind, ForwardError,
-    ForwardRequest,
+    failure_kind, forward, forward_https, forward_peer, is_idempotent, may_retry, merge_xff,
+    tunnel, FailureKind,
+    ForwardError, ForwardRequest,
 };
 pub use health::{
     active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
@@ -51,6 +55,7 @@ pub use loop_guard::is_loopback;
 pub use orig_dst::original_dst;
 // `tunnel::tunnel` aliased in the flat surface: the name `tunnel` is taken
 // by `forward::tunnel`; the function stays reachable as `tunnel::tunnel`.
+pub use tls::{build as build_tls, HttpsClient, TlsClientKey, UpstreamTls};
 pub use tunnel::tunnel as tcp_tunnel;
 pub use upstream::{
     from_config, is_hop_by_hop, is_websocket_upgrade, strip_hop_by_hop, Peer, Upstream,
