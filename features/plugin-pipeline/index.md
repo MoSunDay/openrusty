@@ -1,4 +1,4 @@
-Commit: d9a7ede
+Commit: 681ad49
 # WASM 插件阶段管线与沙箱
 
 ## 能力概述
@@ -11,7 +11,7 @@ Commit: d9a7ede
 - 插件开发：`openrusty-sdk`（`no_std`）+ `openrusty-macros` 的 `#[phase(...)]`；ABI 契约见 `docs/wasm-abi.md`。
 
 ## 行为与规则
-- Decision 语义（nginx 对齐）：`0`=Ok 已处理继续、`-5`=Declined 放行继续、`-4`=Done 停止阶段链（`content` 中为插件已应答、短路空 204；`body_filter` 中为流结束）、`100..=599`=以该状态码拒绝。
+- Decision 语义（nginx 对齐）：`0`=Ok 已处理继续、`-5`=Declined 放行继续、`-4`=Done 停止阶段链（短路：模块经 `resp_body_set` 写了 body 则 `200 + body`，否则空 204；`body_filter` 中为流结束）、`100..=599`=以该状态码拒绝（可携带 body）。
 - 沙箱：单次阶段调用受 `plugins.timeout_ms` 超时与 `plugins.max_memory_mb` 内存上限约束；越界即被中止，不会拖垮网关。
 - 失败策略 `plugins.on_failure`：`fail_open`（默认）按放行继续，`fail_closed` 按 503 拒绝；每次失败计入该插件错误计数。
 - 插件自由配置经 `[plugins.settings.<name>]` 以字符串键值传入。

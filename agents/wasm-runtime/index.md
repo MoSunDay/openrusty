@@ -1,4 +1,4 @@
-Commit: d9a7ede
+Commit: 681ad49
 # WASM 插件运行时（openrusty-wasm）
 
 ## 职责
@@ -14,6 +14,8 @@ Commit: d9a7ede
 - 沙箱：单次阶段调用受 `plugins.timeout_ms`（wasmtime epoch interruption）与 `plugins.max_memory_mb`（`StoreLimits`）约束；trap/超时/协议错误按 `plugins.on_failure` 降级：`fail_open`（默认）→ `Declined` 放行，`fail_closed` → `Deny(503)`；错误按插件名计数并经 `registry.status()` 暴露。
 - 热重载：`PluginRegistry::reload` 重新读配置、编译并校验全部插件，成功后以 `arc-swap` 原子发布新 `PluginSnapshot`；任一步失败整体拒绝、旧快照保留；`generation` 递增。
 - host KV：键控于插件名（跨重载保留），支持带 TTL 的 `kv_get`/`kv_set`/`kv_del` 与 `kv_scan`；数据经两段式读写（`orr_alloc` 分配、长度不足返回 `-所需长度`）跨边界传递。
+- 响应体写入：第 19 个 import `resp_body_set`（SDK `host::set_resp_body`，1 MiB 上限，同请求覆盖）使 `Done`/`Deny` 短路携带模块写的 body（网关侧映射见 `resp_shortcut.rs`/`dynamic_api.rs`）。
+- 动态执行 API：`DynamicRegistry`（`dynamic.rs`）按 `[dynamic]` 节服务单模块合成管线；编译缓存 stat 驱动（键 `mtime+size`，替换文件下一请求生效、无需 reload）、按名 singleflight、`HostState` 按名跨替换存活；契约见 docs/wasm-abi.md "Dynamic execution API"。
 - guest 侧配套：`openrusty-sdk`（`no_std`：host imports 绑定、guest 分配器、`dispatch!`）与 `openrusty-macros`（`#[phase(...)]`）；一方插件见 `plugins/`。
 
 ## 核心链路
@@ -23,8 +25,8 @@ Commit: d9a7ede
 
 ## 依赖与接口
 - 依赖 wasmtime、arc-swap、dashmap、`openrusty-core`。
-- 对外接口：`PluginRegistry::bootstrap/reload/snapshot/status`、`run_phase`、host KV。
-- 代码锚点：`crates/openrusty-wasm/src/{registry,registry_validate,runner,linker,linker_req,linker_kv,host_state,session,mem}.rs`。
+- 对外接口：`PluginRegistry::bootstrap/reload/snapshot/status`、`run_phase`、host KV、`DynamicRegistry::invoke`。
+- 代码锚点：`crates/openrusty-wasm/src/{registry,registry_validate,runner,linker,linker_req,linker_kv,host_state,session,mem,dynamic}.rs`。
 
 ## 关联模块
 - [网关请求管线](../gateway-pipeline/index.md)
