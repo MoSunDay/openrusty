@@ -24,7 +24,7 @@ Commit: abe419f
 | TLS 构建（缺文件拒绝、insecure 通过、键等值） | `openrusty-proxy/src/tls` 单测 |
 | 池化语义（http/https 同址共存、按键驱逐） | `openrusty-proxy/src/client.rs` 单测 |
 | 转发（两 scheme 共享重试循环） | `openrusty-proxy`/`openrusty-server` 单测 |
-| e2e | `scripts/integration.sh` §30（CA 校验 200、错 CA 502、insecure 200） |
+| e2e | `scripts/integration.sh` §32（CA 校验 200、错 CA 502、insecure 200） |
 
 ## Impact Surface
 - 默认零变化：无 `tls` 节的 upstream 行为与性能不变；新增依赖 rustls/tokio-rustls（workspace 既有，ring provider）。

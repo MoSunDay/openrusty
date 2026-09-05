@@ -14,7 +14,7 @@ Commit: abe419f
 - 主动健康：`record_probe` 记录探测结果，`evaluate_active` 纯函数按 `unhealthy_threshold`/`healthy_threshold` 判定状态迁移；阈值只门控翻转（成功不把健康 peer 标脏、失败不治愈脏 peer）。探测任务本身在 `openrusty-server`（`active_probe.rs`）。
 - 重试语义：幂等方法按 `is_retryable` 重试，非幂等方法仅连接级（`Connect`）失败可重试（nginx 对齐）；每次失败把 peer 地址记入 `ReqCtx::tried`，后续重试与插件 pin 都不会再选已试 peer；上限为 `upstreams.retries`；响应已开始后不重试。
 - 连接：`ClientPool` 按 `PoolKey`（`Http(addr)` / `Https(addr, TlsClientKey)`）池化客户端，建连受 `connect_timeout_ms` 约束；内容寻址的 TLS 键让热重载后同配置复用连接池。
-- 出向 TLS：upstream 配置 `tls` 节（`server_name` + `ca_cert` 或 `insecure_skip_verify`，可选 `client_cert`/`client_key` mTLS 对）启用 https 转发；证书材料在 reload 发布前构建（坏证书 = reload 拒绝、旧 runtime 保留，boot 期 fail-fast）；SNI/校验名取 `server_name`，Host 头仍为 peer 地址（nginx `proxy_pass` 语义）；握手失败归类 `Connect`（可重试）。连接器直拨 peer 地址，不做 DNS。
+- 出向 TLS：upstream 配置 `tls` 节（`server_name` + `ca_cert` 或 `insecure_skip_verify`，可选 `client_cert`/`client_key` mTLS 对）启用 https 转发；证书材料在 reload 发布前构建（坏证书 = reload 拒绝、旧 runtime 保留，boot 期 fail-fast）；SNI/校验名取 `server_name`，Host 头仍为 peer 地址（nginx `proxy_pass` 语义）；握手失败归类 `Connect`（可重试）。连接器直拨 peer 地址，不做 DNS。TLS 键按证书文件路径（而非内容）寻址，同路径换发证书后 reload 沿用旧池，需改路径或重启。
 - 流式：普通转发逐块搬运响应体；WebSocket 升级后 `tunnel` 双向透传字节流。
 
 ## 核心链路
