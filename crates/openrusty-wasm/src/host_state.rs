@@ -345,7 +345,7 @@ impl HostState {
     /// "timeout", "bad_code".
     pub fn record_error(&self, kind: &str) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-        let mut kinds = self.error_kinds.lock().unwrap();
+        let mut kinds = self.error_kinds.lock().unwrap_or_else(|e| e.into_inner());
         *kinds.entry(kind.to_string()).or_insert(0) += 1;
     }
 
@@ -355,7 +355,7 @@ impl HostState {
 
     /// Per-kind error counts as `(kind, count)`, sorted by kind name.
     pub fn error_kinds(&self) -> Vec<(String, u64)> {
-        let kinds = self.error_kinds.lock().unwrap();
+        let kinds = self.error_kinds.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<(String, u64)> = kinds.iter().map(|(k, n)| (k.clone(), *n)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out

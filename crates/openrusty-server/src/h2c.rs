@@ -37,23 +37,23 @@ use crate::shutdown::{self, InFlight};
 /// [`conn_timeouts`] so there is exactly one place to tune them (and one
 /// place tests can override).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ConnTimeouts {
+pub struct ConnTimeouts {
     /// The whole request head must arrive within this window or the
     /// connection is closed (nginx `client_header_timeout` semantics).
     /// Also bounds the idle time before the first byte of a keep-alive
     /// request, so stalled or half-dead clients are reaped.
-    pub(crate) header_read: Duration,
+    pub header_read: Duration,
     /// HTTP/2 PING interval keeping an idle connection alive; `None`
     /// disables HTTP/2 keep-alive entirely.
-    pub(crate) h2_keep_alive_interval: Option<Duration>,
+    pub h2_keep_alive_interval: Option<Duration>,
     /// Close an HTTP/2 connection whose keep-alive PING went unanswered
     /// for this long (half-dead peer detection on the h2 path).
-    pub(crate) h2_keep_alive_timeout: Duration,
+    pub h2_keep_alive_timeout: Duration,
 }
 
 /// Single source of truth for [`ConnTimeouts`]. Pure on purpose: tests call
 /// it, tweak fields, and feed the result into [`serve_conn`] directly.
-pub(crate) fn conn_timeouts() -> ConnTimeouts {
+pub fn conn_timeouts() -> ConnTimeouts {
     ConnTimeouts {
         header_read: Duration::from_secs(60),
         h2_keep_alive_interval: Some(Duration::from_secs(30)),
@@ -123,7 +123,7 @@ where
 /// already classified the stream with `proxy::detect` and re-injects the
 /// sniffed bytes, so re-sniffing would only repeat settled work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProtoMode {
+pub enum ProtoMode {
     /// Sniff per connection (hyper-util auto builder): HTTP/1.1 or h2c.
     Auto,
     /// Plain HTTP/1.1, no sniffing.
@@ -168,7 +168,7 @@ pub async fn serve(
 /// task per bound socket, and so tests can bind port 0, learn the port, and
 /// inject custom timeouts. On the shutdown flip the loop ends; the accepted
 /// connections keep draining (and are counted in `in_flight` until done).
-pub(crate) async fn serve_listener(
+pub async fn serve_listener(
     router: axum::Router,
     listener: tokio::net::TcpListener,
     http1_only: bool,

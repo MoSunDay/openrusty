@@ -17,6 +17,7 @@
 pub mod active_probe;
 pub mod app;
 pub mod body_filter;
+pub mod dynamic_api;
 pub mod egress;
 pub mod h2c;
 pub mod ingress;
@@ -27,6 +28,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod pipeline_peer;
 pub mod reload;
+pub mod resp_shortcut;
 pub mod shutdown;
 pub mod state;
 pub mod tls;

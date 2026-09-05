@@ -35,10 +35,10 @@ use tokio::task::JoinHandle;
 pub struct Mount {
     pub listener: ListenerConfig,
     pub router: axum::Router,
-    pub(crate) tls: Option<TlsPlan>,
-    pub(crate) metrics: Arc<metrics::Metrics>,
-    pub(crate) egress: EgressConfig,
-    pub(crate) gateway: Option<SocketAddr>,
+    pub tls: Option<TlsPlan>,
+    pub metrics: Arc<metrics::Metrics>,
+    pub egress: EgressConfig,
+    pub gateway: Option<SocketAddr>,
 }
 
 /// Pure mounting decision: pair every effective listener with the router its

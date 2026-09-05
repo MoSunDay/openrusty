@@ -271,6 +271,20 @@ pub fn del_resp_header(name: &str) {
     unsafe { ffi::resp_header_del(name.as_ptr() as i32, name.len() as i32) };
 }
 
+/// Write the response body carried by a short-circuited response
+/// (`Done` -> 200 + body, `Deny(status)` -> status + body). Replaces any
+/// previously written body (last write wins). `false` = refused by the
+/// host (body over the 1 MiB cap, or an unreadable pointer); the
+/// previously written body then survives.
+///
+/// An empty slice is accepted (`true`) but means "no body": the host
+/// stores an empty body, which the gateway treats as unset, so the
+/// short-circuit keeps its body-less shape (empty 204 / plain status).
+pub fn set_resp_body(bytes: &[u8]) -> bool {
+    let n = unsafe { ffi::resp_body_set(bytes.as_ptr() as i32, bytes.len() as i32) };
+    n == bytes.len() as i32
+}
+
 /// Current response body chunk and whether it is the final one
 /// (body_filter phase).
 pub fn body_chunk() -> (Vec<u8>, bool) {
@@ -511,5 +525,15 @@ mod tests {
         let ended = Cell::new(0);
         scan_end_if_live(12, |c| ended.set(c));
         assert_eq!(ended.get(), 12);
+    }
+
+    /// Host-build stub mirrors success (`ret == len`), so a normal write
+    /// reports `true`. The over-cap refusal (`ret == -1`) only exists on
+    /// the gateway side and is covered by the openrusty-wasm linker
+    /// tests; an empty write also reports `true` (it means "no body").
+    #[test]
+    fn set_resp_body_reports_acceptance() {
+        assert!(set_resp_body(b"hello"));
+        assert!(set_resp_body(&[]));
     }
 }

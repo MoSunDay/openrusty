@@ -246,6 +246,48 @@ timeout_ms = 30000
 # mode = "direct"
 # # gateway = "egress-gw.mesh.svc:8180"   # required when mode = "gateway"
 
+# --- Dynamic WASM execution API ([dynamic], optional) -----------------------
+# Serves `POST /api/v1/dynamic/<name>` by running `<dir>/<name>.wasm` as a
+# single-module pipeline (post_read -> rewrite -> access -> content ->
+# header_filter -> log; no balancer/body_filter/proxy). Absent section =
+# feature fully disabled (no routes mounted). See docs/wasm-abi.md
+# ("Dynamic execution API") and the example plugins under plugins/.
+#
+# CAVEATS, read before enabling:
+# - Route mounting is BOOT-TIME: the endpoint exists only when this
+#   section (or the OPENRUSTY_DYNAMIC_DIR env var, see below) is set at
+#   startup. Reload rebuilds the registry when this section CHANGES but
+#   cannot mount/unmount routes into a running router.
+# - Trust boundary: whoever can write files in `dir` executes arbitrary
+#   wasm on the gateway (sandboxed, but still your request path). Keep
+#   the directory root-owned and non-group/world-writable.
+# - The module cache is keyed on (mtime, size): replacing a file takes
+#   effect on the next request (no reload); only a replacement with an
+#   identical mtime (nanosecond resolution) AND size would keep serving
+#   the cached module.
+# - The reserved prefix /api/v1/dynamic/ shadows any proxy route with the
+#   same prefix while this section is enabled.
+# - Every outcome is counted in `openrusty_dynamic_requests_total{module,
+#   code}` on /openrusty/metrics.
+#
+# [dynamic]
+# # Directory of <name>.wasm modules. The OPENRUSTY_DYNAMIC_DIR env var
+# # overrides this value and enables the feature even without the section.
+# dir = "build/dynamic"
+# # Hard timeout for one phase invocation (milliseconds). Default 50.
+# # timeout_ms = 50
+# # Per-request memory ceiling (MiB). Default 16.
+# # max_memory_mb = 16
+# # Behavior when a module traps/times out: fail_open | fail_closed.
+# # on_failure = "fail_open"
+# # POST body cap; larger bodies are rejected with 413. Default 1 MiB.
+# # max_body_bytes = 1048576
+#
+# # Free-form per-module settings, readable via cfg_get (keys must match
+# # ^[A-Za-z0-9][A-Za-z0-9._-]*$; values are strings).
+# [dynamic.settings.echo]
+# greeting = "hi"
+
 #
 # [[server.listeners]]
 # role = "admin"

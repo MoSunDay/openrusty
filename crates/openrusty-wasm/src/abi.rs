@@ -20,6 +20,7 @@ pub const KV_SCAN_END: &str = "kv_scan_end";
 pub const RESP_HEADER_GET: &str = "resp_header_get";
 pub const RESP_HEADER_SET: &str = "resp_header_set";
 pub const RESP_HEADER_DEL: &str = "resp_header_del";
+pub const RESP_BODY_SET: &str = "resp_body_set";
 pub const BODY_CHUNK: &str = "body_chunk";
 pub const BODY_IS_LAST: &str = "body_is_last";
 pub const CFG_GET: &str = "cfg_get";

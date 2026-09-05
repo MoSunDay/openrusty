@@ -3,7 +3,7 @@
 //!
 //! Rendering is deterministic: families appear in a fixed order, label
 //! combinations within a family are sorted, bucket lines use the fixed
-//! [`DURATION_BUCKETS`] order. No I/O, no locks — the caller samples the
+//! [`DURATION_BUCKETS`] order. No I/O, no locks - the caller samples the
 //! snapshot and the live gauges first.
 //!
 //! The `openrusty_transparent_conns_total` family is fed purely by the
@@ -44,8 +44,9 @@ fn format_sum(v: f64) -> String {
 /// Render the full exposition text for one snapshot.
 ///
 /// Families appear in a fixed order: request counters, duration histogram,
-/// upstream attempts, plugin errors, transparent connection counters, peer
-/// health gauge, KV gauge. Label
+/// upstream attempts, plugin errors, transparent connection counters,
+/// dynamic module counters (omitted while empty - optional feature),
+/// peer health gauge, KV gauge. Label
 /// combinations within a family are sorted; buckets use the fixed
 /// [`DURATION_BUCKETS`] order with `+Inf` implied by `_count`.
 ///
@@ -53,7 +54,7 @@ fn format_sum(v: f64) -> String {
 /// live plugin KV view `(plugin, entry_count)`; both are gauges sampled at
 /// render time rather than accumulated state. `plugin_errors` is the live
 /// `(plugin, kind, count)` view from the plugin registry (the only real
-/// source of plugin error counts — the wasm crate cannot call back into
+/// source of plugin error counts - the wasm crate cannot call back into
 /// the server), merged with the snapshot's plugin-errors counter map (for
 /// API completeness the counts are added).
 pub fn render(
@@ -149,6 +150,27 @@ pub fn render(
             escape_label(role),
             escape_label(outcome)
         ));
+    }
+
+    // openrusty_dynamic_requests_total -- deliberately the ONE family
+    // that is omitted entirely while empty: it only exists once the
+    // optional `[dynamic]` API answered its first request, so
+    // deployments without the section see zero metric noise. Every other
+    // family above always renders (HELP/TYPE even at zero counts).
+    if !snap.dynamic.is_empty() {
+        out.push_str(
+            "# HELP openrusty_dynamic_requests_total Dynamic module invocations by module name and status code.\n",
+        );
+        out.push_str("# TYPE openrusty_dynamic_requests_total counter\n");
+        let mut dynamic: Vec<_> = snap.dynamic.iter().collect();
+        dynamic.sort_by(|a, b| a.0.cmp(b.0));
+        for ((module, code), n) in dynamic {
+            out.push_str(&format!(
+                "openrusty_dynamic_requests_total{{module=\"{}\",code=\"{}\"}} {n}\n",
+                escape_label(module),
+                code
+            ));
+        }
     }
 
     // openrusty_peer_healthy (gauge, sampled at render time)

@@ -42,6 +42,10 @@ pub struct HostData {
     /// Current response headers; seeded by the server before header_filter
     /// and kept in sync by the resp_header_* imports.
     pub resp_headers: Vec<(String, String)>,
+    /// Response body written by the plugin via `resp_body_set`; consumed
+    /// by the server when a phase short-circuits (`Done`/`Deny`). `None`
+    /// = not set.
+    pub resp_body: Option<Bytes>,
     /// Buffered request body; seeded by the server before the content
     /// phase (empty in earlier phases and for WebSocket upgrades).
     pub req_body: Bytes,
@@ -68,6 +72,7 @@ pub fn new_host_data(
         settings,
         resp_edits: Vec::new(),
         resp_headers: Vec::new(),
+        resp_body: None,
         req_body: Bytes::new(),
         body_chunk: Bytes::new(),
         body_last: false,
@@ -110,6 +115,7 @@ mod tests {
         );
         assert!(d.resp_edits.is_empty());
         assert!(d.resp_headers.is_empty());
+        assert!(d.resp_body.is_none());
         assert!(d.req_body.is_empty());
         assert!(d.body_chunk.is_empty());
         assert!(!d.body_last);

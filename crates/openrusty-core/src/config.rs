@@ -4,6 +4,7 @@
 //! re-exported here, so `openrusty_core::config::ListenerConfig` and friends
 //! keep their historical paths.
 
+mod dynamic;
 mod egress;
 mod ingress;
 mod listeners;
@@ -15,6 +16,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
+pub use dynamic::DynamicConfig;
 pub use egress::{resolve_gateway, EgressConfig, EgressMode};
 pub use ingress::IngressConfig;
 pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
@@ -36,6 +38,11 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// Dynamic single-module execution API (`POST /api/v1/dynamic/<name>`);
+    /// `None` = disabled (no routes). `load_config` also enables/overrides
+    /// it via the `OPENRUSTY_DYNAMIC_DIR` environment variable.
+    #[serde(default)]
+    pub dynamic: Option<DynamicConfig>,
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
@@ -275,11 +282,39 @@ pub struct RouteConfig {
 }
 
 /// Read and parse the TOML configuration file, then validate it.
+///
+/// After parsing, the `OPENRUSTY_DYNAMIC_DIR` environment variable is
+/// applied: set and non-empty, it overrides `dynamic.dir` when the
+/// `[dynamic]` section is present, or enables the feature with defaults
+/// (`DynamicConfig::default()` + the env dir) when it is absent.
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let raw = std::fs::read_to_string(path)?;
-    let cfg: Config = toml::from_str(&raw)?;
+    let mut cfg: Config = toml::from_str(&raw)?;
+    cfg.dynamic = apply_dynamic_dir_env(cfg.dynamic);
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Pure env override for `dynamic.dir` (see [`load_config`]). A missing or
+/// blank value leaves the parsed config untouched.
+fn apply_dynamic_dir_env(dynamic: Option<DynamicConfig>) -> Option<DynamicConfig> {
+    let Ok(dir) = std::env::var("OPENRUSTY_DYNAMIC_DIR") else {
+        return dynamic;
+    };
+    let dir = dir.trim().to_string();
+    if dir.is_empty() {
+        return dynamic;
+    }
+    Some(match dynamic {
+        Some(mut d) => {
+            d.dir = dir;
+            d
+        }
+        None => DynamicConfig {
+            dir,
+            ..Default::default()
+        },
+    })
 }
 
 /// Pure validation: cross-field invariants the deserializer cannot express.
@@ -297,6 +332,9 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
     if cfg.plugins.max_memory_mb == 0 {
         return Err(bad("plugins.max_memory_mb must be > 0"));
+    }
+    if let Some(d) = &cfg.dynamic {
+        dynamic::validate(d)?;
     }
     // Listener-specific invariants (role/address uniqueness, transparency
     // sanity) live with the listener types.
