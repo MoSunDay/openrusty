@@ -143,7 +143,10 @@ netns_up() { # APP_IP VIP_IP
     # tag short. The netns name is just a file under /run/netns - any
     # length is fine there.
     NS="orr-${NET_TAG:-drill}-$$"
-    VH="veth-${NET_TAG:0:3}-$$"
+    # IFNAMSIZ caps interface names at 15 chars; a 7-digit pid would
+    # overflow ("veth-egr-1234567" = 16) and iproute2 rejects it with a
+    # cryptic "Attribute failed policy validation." Truncate to fit.
+    VH="$(printf 'veth-%s-%s' "${NET_TAG:0:3}" "$$" | cut -c1-15)"
     TMP="$(mktemp -d /tmp/openrusty-netns.XXXXXX)"
     mkdir -p "$TMP/plugins" "$TMP/logs"
     # The gateways run as uid GATE_UID via setpriv; mktemp -d is 0700, which
