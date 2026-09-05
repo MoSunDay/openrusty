@@ -94,8 +94,9 @@ pub fn empty_runtime() -> RuntimeSnapshot {
 /// first runtime snapshot. `config_path` is only recorded for the
 /// file-based reload path; in-memory embedders can pass any placeholder.
 ///
-/// The only fallible step is the plugin bootstrap, so the error type is
-/// the registry's own [`openrusty_wasm::ReloadError`]; config parse and
+/// Two steps are fallible: the upstream TLS material build (mapped onto
+/// the `Io` variant) and the plugin bootstrap, so the error type is the
+/// registry's own [`openrusty_wasm::ReloadError`]; config parse and
 /// validation errors surface earlier, from `openrusty_core::load_config`.
 pub fn from_config(
     cfg: Config,
