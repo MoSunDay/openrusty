@@ -1,4 +1,4 @@
-Commit: 08a95ba
+Commit: 681ad49
 # 动态 WASM 执行 API：POST /api/v1/dynamic/{name}
 
 ## Context
@@ -33,7 +33,7 @@ Commit: 08a95ba
 | e2e | scripts/integration.sh §31（13 项：问候拼接、模块头、405/404/400/413、metrics、替换即生效、200 并发、reload 保活缓存、代理面不受影响） |
 | 示例插件 | 两插件各自 host 侧单元测试（build-plugins.sh 一并跑） |
 
-- 全量回归：`cargo test --workspace` → 498 通过；`scripts/build-plugins.sh` → 4 插件；`scripts/integration.sh` → 119/119。
+- 全量回归：`cargo test --workspace` → 497 通过（0 失败；原文误记 498，实测以 result 行求和为准）；`scripts/build-plugins.sh` → 4 插件；`scripts/integration.sh` → 119/119。
 
 ## Impact Surface
 - 默认关闭（无 `[dynamic]` 节 = 零路由成本）；启用后 `/api/v1/dynamic/` 前缀遮蔽同前缀代理路由，`dir` 可写者即网关上的 wasm 执行者（目录权限即信任边界），已在 config/openrusty.example.toml 注释中明示。
@@ -48,3 +48,4 @@ Commit: 08a95ba
 - **P1 · 链式 body 交接**：`session.rs` 回收 HeaderData 时不再无条件覆盖 `resp_body` —— 改为仅当模块本轮真的写了 body 才回填；链上后续插件的 `Done` 不再丢弃前序插件已写出的响应体（新增 `chain_body_survives_later_done_plugin`）。
 - **P2 · Log 期 body 写入的状态语义**：`dynamic.rs` 在 HeaderFilter+Log 收尾时若发现 `status == 204 && body 非空`，升级为 200（新增 `late_body_write_upgrades_204_to_200`）；nginx 对齐语义见 [docs/wasm-abi.md](../../../docs/wasm-abi.md) 新增段落。
 - **P3 · 注释纠偏**：`dynamic_api.rs` 指标归因注释明确禁用态 404 与 router 405 不计入 `openrusty_dynamic_requests_total`。
+- **勘误（commit message）**：`681ad49` 的提交说明误写端点为 `POST /openrusty/dynamic/{plugin}`；实际路由为 `POST /api/v1/dynamic/{name}`（以本文与 [docs/wasm-abi.md](../../../docs/wasm-abi.md) 为准）。

@@ -13,7 +13,7 @@ Commit: 86fac98
 ## 验证门（冻结快照上执行，快照与最终代码面零漂移）
 | 门 | 结果 |
 |----|------|
-| `cargo test --workspace` | 525 passed / 0 failed |
+| `cargo test --workspace` | 497 passed / 0 failed（原文误记 525；实测 workspace 497 + 插件单测 27 = 524，两口径均非 525） |
 | `cargo clippy --all-targets -- -D warnings` | 0 warning |
 | `scripts/build-plugins.sh` | 4 插件构建+单测通过 |
 | `scripts/integration.sh` | 119/119 |

@@ -6,8 +6,10 @@
 //!
 //! The struct is pure data; the certificate files themselves are read by
 //! `openrusty-proxy::tls::build` at runtime-apply time (boot or reload),
-//! so a rotated cert file takes effect on the next reload without a
-//! config change. Validation here only covers the cross-field invariants
+//! but pooled TLS clients are keyed by the config paths
+//! (`openrusty-proxy::tls::TlsClientKey`), so a cert re-issued under
+//! unchanged paths needs a config-visible change or a restart to take
+//! effect. Validation here only covers the cross-field invariants
 //! the deserializer cannot express.
 
 use serde::Deserialize;
