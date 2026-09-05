@@ -157,6 +157,7 @@ fn up(name: &str) -> UpstreamConfig {
         pool_idle_timeout_ms: 60_000,
         peers: Vec::new(),
         endpoints: vec![],
+        tls: None,
         health: Default::default(),
     }
 }

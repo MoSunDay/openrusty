@@ -117,9 +117,17 @@ pub async fn proxy_websocket(
         session.ctx().peer_index = Some(idx as u32);
         let peer = up_rt.up.peers[idx];
 
+        // URI scheme/authority follow the upstream TLS plan (https with
+        // the SNI name), while the `Host` header stays the peer address,
+        // mirroring `proxy::forward_https` for the request path.
+        let peer_addr = peer.addr.to_string();
+        let (scheme, uri_authority) = match &up_rt.up.tls {
+            Some(tls) => ("https", tls.server_name.as_str()),
+            None => ("http", peer_addr.as_str()),
+        };
         let mut out = hyper::Request::builder()
             .method(req.method().clone())
-            .uri(format!("http://{}{}", peer.addr, path_and_query));
+            .uri(format!("{scheme}://{uri_authority}{path_and_query}"));
         let Some(headers) = out.headers_mut() else {
             finish_log(&mut session, 502);
             return text_response(502, "502 bad request\n");
@@ -143,13 +151,25 @@ pub async fn proxy_websocket(
             }
         };
 
-        let client = proxy::get(
-            &state.pool,
-            peer.addr,
-            up_rt.up.connect_timeout,
-            up_rt.up.pool_idle_timeout,
-        );
-        let fut = client.request(outbound);
+        // The legacy-client `ResponseFuture` is not generic over the
+        // connector, so both arms share one future type.
+        let fut = match &up_rt.up.tls {
+            Some(tls) => proxy::get_tls(
+                &state.pool,
+                peer.addr,
+                tls,
+                up_rt.up.connect_timeout,
+                up_rt.up.pool_idle_timeout,
+            )
+            .request(outbound),
+            None => proxy::get(
+                &state.pool,
+                peer.addr,
+                up_rt.up.connect_timeout,
+                up_rt.up.pool_idle_timeout,
+            )
+            .request(outbound),
+        };
         let outcome = match timeout {
             Some(t) => tokio::time::timeout(t, fut).await.ok(),
             None => Some(fut.await),

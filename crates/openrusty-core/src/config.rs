@@ -7,6 +7,7 @@
 mod egress;
 mod ingress;
 mod listeners;
+mod tls;
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -17,6 +18,7 @@ use thiserror::Error;
 pub use egress::{resolve_gateway, EgressConfig, EgressMode};
 pub use ingress::IngressConfig;
 pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
+pub use tls::UpstreamTlsConfig;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -229,6 +231,11 @@ pub struct UpstreamConfig {
     /// the DNAT/load-balancing behind the ClusterIP), never at parse time.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// Outbound TLS: when present, peer connections are upgraded to TLS
+    /// with SNI/verification per this section (nginx `proxy_pass https://`).
+    /// Absent = plaintext HTTP (the historical behaviour).
+    #[serde(default)]
+    pub tls: Option<UpstreamTlsConfig>,
     #[serde(default)]
     pub health: HealthConfig,
 }
@@ -339,6 +346,9 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     up.name
                 )));
             }
+        }
+        if let Some(tls) = &up.tls {
+            tls::validate(&up.name, tls)?;
         }
         if let Some(active) = &up.health.active {
             if active.interval_ms == 0 {

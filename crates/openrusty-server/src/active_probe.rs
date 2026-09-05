@@ -36,7 +36,7 @@ use std::time::Duration;
 pub fn spawn(state: &Arc<AppState>) {
     // A reload may change the interval or drop the last enabled upstream:
     // the old task is always cancelled, the new one reflects the snapshot.
-    if let Some(handle) = state.probe_task.lock().unwrap().take() {
+    if let Some(handle) = state.probe_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
         handle.abort();
     }
     let rt = state.runtime.load();
@@ -54,7 +54,7 @@ pub fn spawn(state: &Arc<AppState>) {
     };
     let st = Arc::clone(state);
     let handle = tokio::spawn(async move { run(st, Duration::from_millis(interval_ms)).await });
-    *state.probe_task.lock().unwrap() = Some(handle);
+    *state.probe_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
 
 /// Probe loop: sleep, sweep every enabled peer, log verdict transitions.
@@ -114,8 +114,10 @@ async fn probe_tick(state: &AppState, prev: &mut HashMap<(String, String), bool>
 
 /// Probe one peer: GET `active.path` through the pooled client, bounded by
 /// `active.timeout_ms`. A 2xx response is a success; errors, timeouts and
-/// non-2xx responses are failures. The verdict is recorded via
-/// [`proxy::record_probe`] and its new healthy state is returned.
+/// non-2xx responses are failures. HTTPS upstreams are probed through
+/// their TLS plan (SNI and verification name from the upstream section).
+/// The verdict is recorded via [`proxy::record_probe`] and its new healthy
+/// state is returned.
 ///
 /// Connection errors during a probe are ordinary failures: they land in
 /// the record_failure path inside `record_probe` (ok = false).
@@ -126,12 +128,6 @@ async fn probe_peer(
     peer: &proxy::Peer,
     active: &ActiveHealthConfig,
 ) -> bool {
-    let client = proxy::get(
-        &state.pool,
-        peer.addr,
-        up.connect_timeout,
-        up.pool_idle_timeout,
-    );
     let req = proxy::ForwardRequest {
         method: hyper::Method::GET,
         path_and_query: active.path.clone(),
@@ -139,9 +135,11 @@ async fn probe_peer(
         body: Default::default(),
         client_ip: "127.0.0.1".to_string(),
     };
+    // The pool picks the plaintext or TLS client per the upstream's plan
+    // (see `proxy::forward_peer`).
     let outcome = tokio::time::timeout(
         Duration::from_millis(active.timeout_ms),
-        proxy::forward(&client, peer, &req),
+        proxy::forward_peer(&state.pool, up, peer, &req),
     )
     .await;
     // Every failure is worth a line: threshold logic stays quiet about the

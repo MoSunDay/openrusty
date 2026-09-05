@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use openrusty_core::config::{BalancerKind, HealthConfig, UpstreamConfig};
 
+use crate::tls::UpstreamTls;
+
 /// One load-balancing target: an address plus a relative weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Peer {
@@ -43,12 +45,19 @@ pub struct Upstream {
     pub pool_idle_timeout: Duration,
     /// The balancing targets, in configuration order.
     pub peers: Vec<Peer>,
+    /// Outbound TLS material; `None` = plaintext HTTP peers.
+    pub tls: Option<UpstreamTls>,
     /// Passive health-check thresholds.
     pub health: HealthConfig,
 }
 
 /// Build an immutable [`Upstream`] snapshot from configuration.
-pub fn from_config(cfg: &UpstreamConfig) -> Upstream {
+///
+/// `tls` is the already-built TLS material for the upstream's
+/// `[upstreams.tls]` section (the caller builds it fallibly beforehand,
+/// keeping this constructor pure and infallible); pass `None` for a
+/// plaintext upstream.
+pub fn from_config(cfg: &UpstreamConfig, tls: Option<UpstreamTls>) -> Upstream {
     Upstream {
         name: cfg.name.clone(),
         kind: cfg.balancer,
@@ -64,6 +73,7 @@ pub fn from_config(cfg: &UpstreamConfig) -> Upstream {
                 weight: p.weight,
             })
             .collect(),
+        tls,
         health: cfg.health.clone(),
     }
 }
@@ -153,13 +163,14 @@ mod tests {
                     weight: 1,
                 },
             ],
+            tls: None,
             health: HealthConfig::default(),
         }
     }
 
     #[test]
     fn from_config_maps_fields() {
-        let up = from_config(&up_cfg());
+        let up = from_config(&up_cfg(), None);
         assert_eq!(up.name, "llm");
         assert_eq!(up.kind, BalancerKind::Swrr);
         assert_eq!(up.retries, 2);
@@ -176,7 +187,7 @@ mod tests {
     fn retry_on_timeout_defaults_to_false() {
         let mut cfg = up_cfg();
         cfg.retry_on_timeout = false;
-        let up = from_config(&cfg);
+        let up = from_config(&cfg, None);
         assert!(!up.retry_on_timeout);
     }
 

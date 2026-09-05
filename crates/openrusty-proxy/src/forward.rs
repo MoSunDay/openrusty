@@ -9,8 +9,9 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::{HeaderName, HeaderValue, HOST};
 
-use crate::client::HttpClient;
-use crate::upstream::{is_hop_by_hop, Peer};
+use crate::client::{get, get_tls, ClientPool, HttpClient};
+use crate::tls::HttpsClient;
+use crate::upstream::{is_hop_by_hop, Peer, Upstream};
 
 /// `X-Forwarded-For` is not in http's standard header constants set.
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -143,18 +144,23 @@ pub fn merge_xff(headers: &[(String, String)], client_ip: &str) -> String {
     parts.join(", ")
 }
 
-/// Send `req` to `peer` through a pooled client.
+/// Build the outbound request shared by the plain and TLS forward paths.
 ///
 /// Header policy: hop-by-hop headers and any `Host` header from the caller
-/// are dropped; `Host` is set to the peer address; `X-Forwarded-For` gets
-/// the client IP appended. Invalid header names/values are skipped rather
-/// than failing the whole request.
-pub async fn forward(
-    client: &HttpClient,
-    peer: &Peer,
+/// are dropped; `Host` is set to `host` (nginx `proxy_pass` semantics: the
+/// Host header does not change with the scheme, only the URI authority
+/// does); `X-Forwarded-For` gets the client IP appended. Invalid header
+/// names/values are skipped rather than failing the whole request.
+/// `uri_authority` is the URI host (peer address for http, the TLS
+/// server_name for https - the TLS connector ignores it, but the URI must
+/// carry the right scheme for any future consumer).
+fn build_outgoing(
+    scheme: &str,
+    uri_authority: &str,
+    host: &str,
     req: &ForwardRequest,
-) -> Result<hyper::Response<hyper::body::Incoming>, ForwardError> {
-    let uri = format!("http://{}{}", peer.addr, req.path_and_query);
+) -> Result<hyper::Request<Full<Bytes>>, ForwardError> {
+    let uri = format!("{scheme}://{uri_authority}{}", req.path_and_query);
     let mut builder = hyper::Request::builder()
         .method(req.method.clone())
         .uri(uri);
@@ -181,14 +187,71 @@ pub async fn forward(
     if let Ok(xff) = HeaderValue::from_str(&merge_xff(&req.headers, &req.client_ip)) {
         headers.append(X_FORWARDED_FOR, xff);
     }
-    let host = HeaderValue::from_str(&peer.addr.to_string())
-        .map_err(|e| ForwardError::Send(e.to_string()))?;
+    let host = HeaderValue::from_str(host).map_err(|e| ForwardError::Send(e.to_string()))?;
     headers.insert(HOST, host);
 
-    let outgoing = builder
+    builder
         .body(Full::new(req.body.clone()))
-        .map_err(|e| ForwardError::Send(e.to_string()))?;
+        .map_err(|e| ForwardError::Send(e.to_string()))
+}
+
+/// Send `req` to `peer` through a pooled plain-TCP client.
+pub async fn forward(
+    client: &HttpClient,
+    peer: &Peer,
+    req: &ForwardRequest,
+) -> Result<hyper::Response<hyper::body::Incoming>, ForwardError> {
+    let outgoing = build_outgoing("http", &peer.addr.to_string(), &peer.addr.to_string(), req)?;
     client.request(outgoing).await.map_err(classify)
+}
+
+/// Send `req` to `peer` through a pooled TLS client.
+///
+/// Same header policy as [`forward`]; the URI authority becomes the TLS
+/// `server_name` (so SNI and the URI agree) while the `Host` header keeps
+/// the nginx `proxy_pass` behaviour of the peer address. TCP connect and
+/// TLS handshake failures surface as [`ForwardError::Connect`]
+/// (retryable), exactly like the plaintext path.
+pub async fn forward_https(
+    client: &HttpsClient,
+    peer: &Peer,
+    server_name: &str,
+    req: &ForwardRequest,
+) -> Result<hyper::Response<hyper::body::Incoming>, ForwardError> {
+    let outgoing = build_outgoing("https", server_name, &peer.addr.to_string(), req)?;
+    client.request(outgoing).await.map_err(classify)
+}
+
+/// Forward one attempt to `peer` through the shared client pool, picking
+/// the plaintext or the TLS client per the upstream's TLS plan. Both arms
+/// resolve to the same result type, so callers keep one retry loop; the
+/// pooled client is borrowed only inside this function, where its
+/// temporary lives across the single `.await`.
+pub async fn forward_peer(
+    pool: &ClientPool,
+    up: &Upstream,
+    peer: &Peer,
+    req: &ForwardRequest,
+) -> Result<hyper::Response<hyper::body::Incoming>, ForwardError> {
+    match &up.tls {
+        Some(tls) => {
+            forward_https(
+                &get_tls(pool, peer.addr, tls, up.connect_timeout, up.pool_idle_timeout),
+                peer,
+                &tls.server_name,
+                req,
+            )
+            .await
+        }
+        None => {
+            forward(
+                &get(pool, peer.addr, up.connect_timeout, up.pool_idle_timeout),
+                peer,
+                req,
+            )
+            .await
+        }
+    }
 }
 
 /// Bidirectionally copy two upgraded streams until either side closes.
@@ -413,6 +476,60 @@ mod tests {
         let peer = Peer { addr, weight: 1 };
 
         let err = forward(&client, &peer, &sample_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForwardError::Connect(_)), "got {err:?}");
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn refused_tls_connection_maps_to_connect_error() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let pool = crate::client::new_pool();
+        let tls = crate::tls::build(&openrusty_core::config::UpstreamTlsConfig {
+            server_name: "localhost".into(),
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            insecure_skip_verify: true,
+        })
+        .unwrap();
+        let client =
+            crate::client::get_tls(&pool, addr, &tls, std::time::Duration::from_millis(500), std::time::Duration::from_secs(30));
+        let peer = Peer { addr, weight: 1 };
+
+        let err = forward_https(&client, &peer, "localhost", &sample_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForwardError::Connect(_)), "got {err:?}");
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_failure_maps_to_connect_error() {
+        // A plaintext HTTP server: the TCP connect succeeds but the TLS
+        // handshake can never complete, so the failure must still be a
+        // retryable Connect error (the peer saw nothing usable).
+        let addr = spawn_echo_server().await;
+        let pool = crate::client::new_pool();
+        let tls = crate::tls::build(&openrusty_core::config::UpstreamTlsConfig {
+            server_name: "localhost".into(),
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            insecure_skip_verify: true,
+        })
+        .unwrap();
+        let client = crate::client::get_tls(
+            &pool,
+            addr,
+            &tls,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(30),
+        );
+        let peer = Peer { addr, weight: 1 };
+
+        let err = forward_https(&client, &peer, "localhost", &sample_request())
             .await
             .unwrap_err();
         assert!(matches!(err, ForwardError::Connect(_)), "got {err:?}");

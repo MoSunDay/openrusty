@@ -159,6 +159,8 @@ fn build_upstream(ns: String, svc: String, port: u32) -> UpstreamConfig {
         pool_idle_timeout_ms: 60_000,
         peers: Vec::new(),
         endpoints: vec![endpoint(&ns, &svc, port)],
+        // ingress-rendered upstreams are always plaintext HTTP
+        tls: None,
         // passive health off: single ClusterIP endpoint semantics
         health: HealthConfig {
             max_fails: 0,
