@@ -3,6 +3,35 @@
     use axum::extract::ConnectInfo;
     use tower::ServiceExt;
 
+    #[test]
+    fn h2_authority_becomes_host_when_absent() {
+        let headers = fold_h2_authority(
+            vec![("content-length".to_string(), "3".to_string())],
+            Some("orr-e2e.example.com:8443"),
+        );
+        assert_eq!(
+            headers.last().unwrap(),
+            &("host".to_string(), "orr-e2e.example.com:8443".to_string())
+        );
+    }
+
+    #[test]
+    fn h2_authority_never_overrides_an_explicit_host() {
+        let headers = fold_h2_authority(
+            vec![("HoSt".to_string(), "explicit.example".to_string())],
+            Some("ignored.example"),
+        );
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].1, "explicit.example");
+    }
+
+    #[test]
+    fn h1_request_without_authority_is_untouched() {
+        let headers =
+            fold_h2_authority(vec![("accept".to_string(), "*/*".to_string())], None);
+        assert_eq!(headers.len(), 1);
+    }
+
     fn route(host: Option<&str>, prefix: &str) -> openrusty_core::config::RouteConfig {
         openrusty_core::config::RouteConfig {
             path_prefix: prefix.to_string(),
