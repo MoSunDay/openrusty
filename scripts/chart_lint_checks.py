@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Shape assertions for `scripts/chart-lint.sh`.
 
-Reads the three helm-template renders plus the `openrusty inject` output
-of the shared fixture and asserts the chart/inject contract: component
-shape, ports, proxy UID, init-container flags, ConfigMaps, and the
-inject-CLI vs chart sidecar consistency. Every check prints PASS/FAIL;
+Reads the six helm-template renders (defaults / demo / nodeport /
+rbac.create=false / rbac.clusterWide=true / explicit watchNamespaces)
+plus the `openrusty inject` output of the shared
+fixture and asserts the chart/inject contract: component shape, ports,
+proxy UID, init-container flags, ConfigMaps, the watch-plane RBAC, and
+the inject-CLI vs chart sidecar consistency. Every check prints PASS/FAIL;
 the script exits non-zero when any check fails.
 """
 
@@ -14,6 +16,12 @@ import yaml
 
 INBOUND, OUTBOUND, ADMIN = 4143, 4140, 4191
 PROXY_UID = 511
+WATCH_RULES = [
+    {"apiGroups": [""], "resources": ["secrets"],
+     "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses"],
+     "verbs": ["get", "list", "watch"]},
+]
 PASS = 0
 FAIL = 0
 
@@ -58,7 +66,7 @@ def toml_text(configmap):
     return configmap["data"]["openrusty.toml"]
 
 
-def assert_shared(defaults, demo, nodeport, injected):
+def assert_shared(defaults, demo, nodeport, rbacoff, wide, watchns, injected):
     # --- default release: ingress + egress-gateway, no demo ---
     cm = one(defaults, "ConfigMap", "-ingress-config")
     check("default: ingress ConfigMap rendered", cm is not None)
@@ -68,6 +76,9 @@ def assert_shared(defaults, demo, nodeport, injected):
               'enabled = true' in body and 'ingress_class = "openrusty"' in body)
         check("default: edge listener plain (tls = false)",
               "tls = false" in body)
+        check("default: [ingress] watch scoped to the release namespace",
+              'namespaces = ["default"]' in body,
+              body.split("\n[ingress]")[-1][:80] if "[ingress]" in body else "no [ingress]")
 
     dep = one(defaults, "Deployment", "-ingress")
     check("default: ingress Deployment rendered", dep is not None)
@@ -79,6 +90,52 @@ def assert_shared(defaults, demo, nodeport, injected):
               str(port_numbers(gw) if gw else "missing"))
         check("default: ingress config volume mounted",
               gw is not None and gw["volumeMounts"][0]["mountPath"] == "/etc/openrusty")
+
+    # --- watch-plane RBAC: SA + namespaced least-privilege Role, bound ---
+    sa = one(defaults, "ServiceAccount", "-ingress")
+    role = one(defaults, "Role", "-ingress")
+    binding = one(defaults, "RoleBinding", "-ingress")
+    check("default: SA + Role + RoleBinding with the exact watch rules",
+          sa is not None and role is not None and binding is not None
+          and role["rules"] == WATCH_RULES
+          and binding["roleRef"]["kind"] == "Role"
+          and binding["roleRef"]["name"] == role["metadata"]["name"]
+          and binding["subjects"][0]["kind"] == "ServiceAccount"
+          and binding["subjects"][0]["name"] == sa["metadata"]["name"]
+          and dep is not None
+          and dep["spec"]["template"]["spec"].get("serviceAccountName")
+          == sa["metadata"]["name"],
+          str(role["rules"] if role else "no Role"))
+
+    # --- rbac.create=false: the identity plane is rendered nowhere ---
+    roff = one(rbacoff, "Deployment", "-ingress")
+    check("rbac.create=false: no SA/Role/RoleBinding rendered",
+          one(rbacoff, "ServiceAccount", "") is None
+          and one(rbacoff, "Role", "") is None
+          and one(rbacoff, "RoleBinding", "") is None
+          and roff is not None
+          and "serviceAccountName" not in roff["spec"]["template"]["spec"])
+
+    # --- rbac.clusterWide: cluster-scoped watch plane, TOML stays wide ---
+    crole = one(wide, "ClusterRole", "-ingress")
+    cbinding = one(wide, "ClusterRoleBinding", "-ingress")
+    wcm = one(wide, "ConfigMap", "-ingress-config")
+    check("clusterWide: ClusterRole + ClusterRoleBinding, no namespaced Role",
+          crole is not None and cbinding is not None
+          and crole["rules"] == WATCH_RULES
+          and one(wide, "Role", "-ingress") is None
+          and one(wide, "RoleBinding", "-ingress") is None
+          and cbinding["roleRef"]["kind"] == "ClusterRole"
+          and cbinding["subjects"][0]["namespace"] == "default",
+          "missing cluster-scope objects" if crole is None else "shape drift")
+    check("clusterWide: TOML leaves [ingress].namespaces unset (cluster-wide)",
+          wcm is not None and "namespaces =" not in toml_text(wcm))
+
+    # --- explicit watchNamespaces: rendered verbatim into the TOML ---
+    ncm = one(watchns, "ConfigMap", "-ingress-config")
+    check("watchNamespaces: explicit list rendered into the TOML",
+          ncm is not None and 'namespaces = ["alpha", "beta"' in toml_text(ncm),
+          toml_text(ncm).split("\n[ingress]")[-1][:80] if ncm else "no ConfigMap")
 
     svc = one(defaults, "Service", "-ingress")
     check("default: ingress Service LoadBalancer on 8443",
@@ -165,9 +222,12 @@ def assert_shared(defaults, demo, nodeport, injected):
 
 def main(argv):
     global PASS, FAIL
-    paths = dict(zip(("defaults", "demo", "nodeport", "injected"), argv))
+    paths = dict(zip(("defaults", "demo", "nodeport", "rbacoff", "wide",
+                      "watchns", "injected"), argv))
     assert_shared(docs(paths["defaults"]), docs(paths["demo"]),
-                  docs(paths["nodeport"]), docs(paths["injected"]))
+                  docs(paths["nodeport"]), docs(paths["rbacoff"]),
+                  docs(paths["wide"]), docs(paths["watchns"]),
+                  docs(paths["injected"]))
     print(f"chart-lint: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

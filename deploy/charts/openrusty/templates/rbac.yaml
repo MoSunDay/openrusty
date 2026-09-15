@@ -1,0 +1,47 @@
+{{- if .Values.rbac.create }}
+{{/* Namespaced least-privilege watch plane (see docs/sidecar.md
+     "Security boundaries"): read-only Ingress + Secret access, bound to
+     the ingress ServiceAccount. Secrets are TLS material; grant the Role
+     only in namespaces where TLS adoption is expected. */}}
+{{- $name := include "openrusty.ingressName" . }}
+{{- $roleKind := ternary "ClusterRole" "Role" .Values.rbac.clusterWide }}
+{{- $bindingKind := ternary "ClusterRoleBinding" "RoleBinding" .Values.rbac.clusterWide }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $roleKind }}
+metadata:
+  name: {{ $name }}
+  {{- if .Values.rbac.clusterWide }}
+  {{- /* cluster-scoped objects carry no namespace */}}
+  {{- else }}
+  namespace: {{ .Release.Namespace }}
+  {{- end }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $bindingKind }}
+metadata:
+  name: {{ $name }}
+  {{- if not .Values.rbac.clusterWide }}
+  namespace: {{ .Release.Namespace }}
+  {{- end }}
+  labels:
+    {{- include "openrusty.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ $roleKind }}
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openrusty.ingressServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

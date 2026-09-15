@@ -29,6 +29,16 @@ ingressClass: openrusty
 ingress:
   replicas: 2
   logLevel: warn
+  serviceAccount:
+    # Renders (and is bound by the Role) only when rbac.create is true.
+    create: true
+    # Default: <fullname>-ingress (openrusty.ingressName).
+    name: ""
+  # Namespaces the ingress form watches ([ingress].namespaces). Empty
+  # (default) = the release namespace only, matching the namespaced Role
+  # rbac.create renders; set explicit namespaces (RBAC there is yours to
+  # grant) or flip rbac.clusterWide for the cluster-wide watch plane.
+  watchNamespaces: []
   service:
     type: LoadBalancer
     # Edge data port. Non-transparent, TLS off in v1 (plain HTTP/1.1+h2c):
@@ -45,3 +55,15 @@ egressGateway:
 # (tests/fixtures/inject/deployment.yaml | openrusty inject).
 demo:
   enabled: false
+  # App-container image (not the sidecar, which uses `image` above).
+  # Placeholder channel: override for real workloads.
+  image: ghcr.io/openrusty/echo:0.0.0-placeholder
+
+# Namespaced RBAC for the ingress watch plane: ServiceAccount + Role
+# (get/list/watch on ingresses + secrets) + RoleBinding. Set false to
+# bring your own identities.
+rbac:
+  create: true
+  # true = ClusterRole + ClusterRoleBinding and (with watchNamespaces
+  # empty) a cluster-wide watch. Default false: namespaced Role only.
+  clusterWide: false
