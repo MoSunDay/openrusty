@@ -111,6 +111,23 @@ fn host_matches(route_host: Option<&str>, req_host: Option<&str>) -> bool {
     }
 }
 
+/// HTTP/2 carries the request host as the `:authority` pseudo-header,
+/// which axum surfaces on the URI instead of a `host` header. Fold it in
+/// at the pipeline boundary so routing, plugins and forwarding all see
+/// one consistent host regardless of protocol version (nginx semantics:
+/// host-based routing must not depend on the wire encoding). Pure.
+pub(crate) fn fold_h2_authority(
+    mut headers: Vec<(String, String)>,
+    authority: Option<&str>,
+) -> Vec<(String, String)> {
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        if let Some(authority) = authority {
+            headers.push(("host".to_string(), authority.to_string()));
+        }
+    }
+    headers
+}
+
 /// Normalized request host for route matching: the `Host` header value
 /// (hyper exposes the HTTP/2 `:authority` pseudo-header as `Host`),
 /// trimmed, lowercased and with the port stripped (`example.com:8443` and
@@ -199,7 +216,7 @@ pub async fn handle_request(
         _ => "HTTP/1.1",
     }
     .to_string();
-    let headers: Vec<(String, String)> = req
+    let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
         .filter_map(|(k, v)| {
@@ -208,6 +225,7 @@ pub async fn handle_request(
                 .map(|s| (k.as_str().to_string(), s.to_string()))
         })
         .collect();
+    headers = fold_h2_authority(headers, req.uri().authority().map(|a| a.as_str()));
 
     // 3. Route match: host class first (host-specific routes win over
     // catch-alls), then longest prefix, first wins on ties.
