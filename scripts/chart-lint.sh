@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # chart-lint: helm-render deploy/charts/openrusty and assert the shape.
 #
-# Three releases (default values / demo.enabled=true / ingress Service
-# type=NodePort) are templated and checked by chart_lint_checks.py, plus
+# Six releases (default values / demo.enabled=true / ingress Service
+# type=NodePort / rbac.create=false / rbac.clusterWide=true / explicit
+# watchNamespaces) are templated and checked by
+# chart_lint_checks.py, plus
 # an inject-CLI consistency drill: `openrusty inject` runs over the
 # shared fixture and the output must match the chart's static sidecar
 # shape (ports, proxy UID, init flags, config mounts, TOML body).
@@ -45,6 +47,9 @@ render() { # name set-args...
 render defaults
 render demo --set demo.enabled=true
 render nodeport --set ingress.service.type=NodePort
+render rbacoff --set rbac.create=false
+render wide --set rbac.clusterWide=true
+render watchns --set 'ingress.watchNamespaces={alpha,beta}'
 
 # The consistency drill needs the inject CLI; build it once if absent.
 if [ ! -x "$BIN" ]; then
@@ -58,13 +63,15 @@ fi
 run_checks() {
     if python3 -c 'import yaml' 2>/dev/null; then
         python3 scripts/chart_lint_checks.py "$TMP/defaults.yaml" \
-            "$TMP/demo.yaml" "$TMP/nodeport.yaml" "$TMP/injected.yaml"
+            "$TMP/demo.yaml" "$TMP/nodeport.yaml" "$TMP/rbacoff.yaml" \
+            "$TMP/wide.yaml" "$TMP/watchns.yaml" "$TMP/injected.yaml"
         return
     fi
     echo "chart-lint: pyyaml missing; trying pip install"
     if pip3 install --quiet pyyaml 2>/dev/null && python3 -c 'import yaml' 2>/dev/null; then
         python3 scripts/chart_lint_checks.py "$TMP/defaults.yaml" \
-            "$TMP/demo.yaml" "$TMP/nodeport.yaml" "$TMP/injected.yaml"
+            "$TMP/demo.yaml" "$TMP/nodeport.yaml" "$TMP/rbacoff.yaml" \
+            "$TMP/wide.yaml" "$TMP/watchns.yaml" "$TMP/injected.yaml"
         return
     fi
     echo "chart-lint: no pyyaml; grep fallback (shape-only)"
@@ -86,6 +93,7 @@ grep_fallback() {
         expect "$f" "name: .*-egress-gateway-config"
     done
     expect "$TMP/defaults.yaml" "type: LoadBalancer"
+    expect "$TMP/defaults.yaml" "kind: Role"
     expect "$TMP/nodeport.yaml" "type: NodePort"
     expect "$TMP/demo.yaml" 'config.openrusty.io/skip-inbound-ports: "9090,15002"'
     expect "$TMP/injected.yaml" "name: echo-openrusty-config"

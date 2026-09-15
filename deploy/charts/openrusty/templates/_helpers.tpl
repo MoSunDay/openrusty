@@ -37,6 +37,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "openrusty.fullname" . }}-echo
 {{- end -}}
 
+{{/* Ingress watch ServiceAccount: explicit name or the component default. */}}
+{{- define "openrusty.ingressServiceAccountName" -}}
+{{- .Values.ingress.serviceAccount.name | default (include "openrusty.ingressName" .) -}}
+{{- end -}}
+
 {{/* Image reference shared by every openrusty container. */}}
 {{- define "openrusty.image" -}}
 {{- printf "%s:%s" .Values.image.repository .Values.image.tag -}}

@@ -29,6 +29,14 @@ data:
     [ingress]
     enabled = true
     ingress_class = "{{ .Values.ingressClass }}"
+{{- $watch := .Values.ingress.watchNamespaces }}
+{{- if and .Values.rbac.clusterWide (not $watch) }}
+{{- /* cluster-wide: omit namespaces (empty = cluster-wide list/watch) */}}
+{{- else if not $watch }}
+    namespaces = ["{{ .Release.Namespace }}"]
+{{- else }}
+    namespaces = [{{ range $watch }}"{{ . }}", {{ end }}]
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -49,6 +57,9 @@ spec:
         {{- include "openrusty.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: ingress
     spec:
+      {{- if and .Values.rbac.create .Values.ingress.serviceAccount.create }}
+      serviceAccountName: {{ include "openrusty.ingressServiceAccountName" . }}
+      {{- end }}
       containers:
         - name: openrusty
           image: {{ include "openrusty.image" . }}
