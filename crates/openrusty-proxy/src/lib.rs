@@ -33,6 +33,7 @@ pub mod forward;
 pub mod health;
 pub mod loop_guard;
 pub mod orig_dst;
+pub mod resolve;
 pub mod tls;
 pub mod tunnel;
 pub mod upstream;

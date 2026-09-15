@@ -179,7 +179,7 @@ async fn route_conflict_keeps_previous_runtime() {
 
     // defaultBackend renders host=None path="/", the static route's key
     let pair = (snap::<Ingress>(CATCH_ALL, "9"), Snapshot::<Secret>::new());
-    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair).await;
 
     assert_eq!(state.runtime.load().generation, gen_before);
     assert_eq!(route_keys(&state.runtime.load().routes), routes_before);
@@ -193,7 +193,7 @@ async fn missing_tls_secret_keeps_previous_runtime() {
 
     // the referenced secret `absent` is not in the (empty) snapshot
     let pair = (snap::<Ingress>(TLS_RULE, "12"), Snapshot::<Secret>::new());
-    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair).await;
 
     assert_eq!(route_keys(&state.runtime.load().routes), routes_before);
 }
@@ -204,7 +204,7 @@ async fn apply_publishes_merged_runtime_at_plugin_generation() {
     let base = state.static_config.clone();
 
     let pair = (snap::<Ingress>(API_RULE, "11"), Snapshot::<Secret>::new());
-    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair).await;
 
     let rt = state.runtime.load();
     assert_eq!(rt.routes.len(), 2);
@@ -212,7 +212,7 @@ async fn apply_publishes_merged_runtime_at_plugin_generation() {
     assert_eq!(rt.routes[1].path_prefix, "/api");
     assert_eq!(rt.routes[1].host.as_deref(), Some("app.example.com"));
     let up = rt.upstreams.get("ing-shop-web-80").expect("rendered upstream");
-    assert!(up.up.peers.is_empty(), "ClusterIP upstream dials endpoints, no peers");
+    assert!(up.up.peers.is_empty(), "unresolvable endpoint: apply-time DNS lookup yields no peers");
     assert_eq!(up.up.health.max_fails, 0, "passive health off for single ClusterIP");
     // route-only swap: the plugin snapshot generation is carried over
     assert_eq!(rt.generation, state.registry.snapshot().generation);
@@ -242,7 +242,7 @@ async fn apply_publishes_rendered_tls_into_the_sni_resolver() {
         snap::<Ingress>(&tls_rule, "12"),
         snap::<Secret>(&secret, "50"),
     );
-    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair).await;
 
     // Routes applied AND material published in the same apply.
     assert!(
@@ -272,7 +272,7 @@ async fn apply_without_tls_listeners_needs_no_resolver() {
     assert!(state.tls_resolver.is_none());
     let base = state.static_config.clone();
     let pair = (snap::<Ingress>(API_RULE, "11"), Snapshot::<Secret>::new());
-    apply_pair(&state, &base, &base.routes, "openrusty", &pair);
+    apply_pair(&state, &base, &base.routes, "openrusty", &pair).await;
     assert_eq!(state.runtime.load().routes.len(), 2);
 }
 
