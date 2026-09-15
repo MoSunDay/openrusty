@@ -1,6 +1,6 @@
 # 集群侧生产就绪（P0–P5）：k3s 实测收敛到全绿
 
-范围：cluster-e2e 七组断言在单节点 k3s（v1.36.4+k3s1）上首次全绿（61 PASS / 0 FAIL / 1 deliberate SKIP，2min 快速窗）；次日以最终镜像按 **M4 验收形态（默认 10min 窗）复跑：63/0/1 全绿**（新增 3 项断言见下）。
+范围：cluster-e2e 七组断言在单节点 k3s（v1.36.4+k3s1）上首次全绿（61 PASS / 0 FAIL / 1 deliberate SKIP，2min 快速窗）；次日以最终镜像按 **M4 验收形态（默认 10min 窗）复跑：63/0/1 全绿**（新增 2 项计数断言 + 1 个未计数守卫路径见下）。
 
 ## 产品修复（均带回归测试）
 - k8s client HTTPS：`HttpConnector` 未 `enforce_http(false)` 导致 https URI 报 "invalid URL, scheme is not http"（hyper_util legacy Display 会吞 source，须打印 error chain）。`crates/openrusty-k8s/src/connector.rs`。
