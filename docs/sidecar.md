@@ -170,6 +170,10 @@ config.
   exponential backoff (100 ms, x2, capped at 30 s; any successful LIST
   resets it). A second 200 ms window folds Ingress and Secret hand-overs
   into one render+apply.
+- Periodic resync: every 30 s the loop restarts the LIST->WATCH cycle even
+  if the stream looks healthy, so a silently dead stream (half-open TCP)
+  cannot pin staleness; a re-list whose resourceVersion is unchanged skips
+  the hand-over.
 - **Stale-serve is the contract**: the apply side always holds an
   immutable snapshot that is only ever replaced by a fresher one - never
   cleared. While the apiserver is unreachable the gateway keeps serving
@@ -226,9 +230,17 @@ transparent listeners (linkerd `proxy-init` parameter surface). Custom
 chains `OPENRUSTY_IN` (hooked from PREROUTING) and `OPENRUSTY_OUT` (from
 OUTPUT); every rule is tagged with the `openrusty-init` comment.
 
+Loopback is exempt before anything else in both chains
+(`-i lo` RETURN inbound, `-o lo` RETURN outbound): pod-local traffic -
+the app talking to its sidecar's admin listener on `127.0.0.1:4191`, or
+any other localhost hop inside the pod - must never be hijacked. The
+gateway's loop guard rejects a redirected localhost hit (the pre-NAT
+destination is one of its own ports), so without this exemption our own
+rules would break localhost entirely.
+
 | flag | meaning | default |
 |------|---------|---------|
-| `--proxy-uid <UID>` | proxy UID, exempted on OUTPUT (**first rule** of the OUT chain - the proxy must never loop into itself) | required |
+| `--proxy-uid <UID>` | proxy UID, exempted on OUTPUT (first rule after the loopback RETURN - the proxy must never loop into itself) | required |
 | `--inbound-port <PORT>` | inbound REDIRECT target | `4143` |
 | `--outbound-port <PORT>` | outbound REDIRECT target | `4140` |
 | `--ignore-inbound-ports <LIST>` | inbound ports RETURNed before REDIRECT | `4191` |
@@ -263,6 +275,7 @@ metadata):
 | `proxy-log-level` | `trace`/`debug`/`info`/`warn`/`error` | `warn` |
 | `egress-mode` | `direct` / `gateway` / `deny` | `direct` |
 | `egress-gateway` | gateway `host:port`, required in gateway mode | none |
+| `app-port` | app port rendered as a pod-local `app` upstream (`127.0.0.1:<port>`) plus a catch-all `path_prefix = "/"` route; v1 models a single app port | none |
 
 Three pieces are injected: the `openrusty-init` initContainer (running
 `iptables-init` with the flags above), the `openrusty-proxy` sidecar
@@ -272,8 +285,16 @@ and that ConfigMap - a minimal validated config with transparent inbound +
 outbound listeners, an admin listener, `[egress]` from the annotations,
 `[ingress] enabled = false`, and `[plugins] dir = "/dev/null-plugins"`
 (a missing plugin dir means "no plugins", so no plugins volume is needed).
+With `app-port` set it also carries a pod-local `app` upstream
+(`127.0.0.1:<port>`) and a catch-all route, so transparently intercepted
+inbound HTTP reaches the app instead of a router 404.
 v1 input contract: exactly one YAML document, injectable kinds only
 (Pod + pod-template workloads), re-injection refused.
+
+Both injected containers share one image ref (the init container's
+`iptables-init` entry point lives in the same binary): the placeholder
+`ghcr.io/openrusty/openrusty:0.0.0-placeholder` by default, overridable
+with `--image REF` / `--image=REF` when a real registry channel exists.
 
 ### Helm chart (`deploy/charts/openrusty`)
 
@@ -283,7 +304,16 @@ v1 input contract: exactly one YAML document, injectable kinds only
 | `egress-gateway` | Deployment (pause container + statically baked `openrusty-proxy` sidecar, transparent inbound 4143, `[egress] mode = "deny"` fail-closed until gateway policy lands) + Service exposing data 4143 and admin/probe 4191; identity annotations `config.openrusty.io/egress-gateway: "true"` and `inject: "disabled"` (re-inject can never double-inject) |
 | `demo` | shared fixture workload with its injection result written out statically; `demo.enabled=false` by default |
 
-`scripts/chart-lint.sh` helm-templates three releases and asserts the
+Two value knobs land with the identity plane: `rbac.create` (default
+`true`) renders the ingress watch ServiceAccount plus a namespace-scoped
+Role (`get`/`list`/`watch` on `secrets` and `networking.k8s.io`
+`ingresses`) and its RoleBinding - set it to `false` to bring your own
+identities (`ingress.serviceAccount.name` overrides the default
+`<fullname>-ingress` name). `demo.image` is the demo *app* container's
+image (the sidecar keeps using `image`), placeholder-tagged like the
+gateway image; override it for real workloads.
+
+`scripts/chart-lint.sh` helm-templates four releases and asserts the
 rendered sidecar matches the `openrusty inject` CLI output (ports, UID,
 init flags, mounts, TOML body). No cluster or kubeconfig involved.
 
@@ -336,10 +366,10 @@ When `[ingress]` is configured the status JSON carries an `ingress` node:
 |-------|---------|
 | `enabled` | mirrors the config switch |
 | `watching` | loops actually running (client built) |
-| `ingresses.generation` | 1-based ordinal of the last hand-over; `0` before the first successful LIST |
-| `ingresses.last_rv` | resource version of the snapshot being served |
-| `ingresses.reconnects` | watch streams that ended abnormally (410, EOF, error) |
-| `ingresses.last_success_age_ms` | ms since the last successful LIST; `null` before the first |
+| `ingress.generation` | 1-based ordinal of the last hand-over; `0` before the first successful LIST |
+| `ingress.last_rv` | resource version of the snapshot being served |
+| `ingress.reconnects` | watch streams that ended abnormally (410, EOF, error) |
+| `ingress.last_success_age_ms` | ms since the last successful LIST or resync; `null` before the first |
 | `secrets` | the same counter shape for the TLS Secret loop(s) |
 
 These are scrape-time gauges, not counter series: the watch plane is
@@ -355,16 +385,20 @@ families on `/openrusty/metrics`.
   default posture: the gateway renders only what it can read. Reading a
   TLS Secret is reading the private key, so Secret access is the
   privilege - grant it only where TLS adoption is expected. (The chart
-  does not render RBAC objects yet; they land with the real image
-  channel.)
+  renders exactly that Role + RoleBinding behind `rbac.create`, bound to
+  the ingress ServiceAccount, and scopes `[ingress].namespaces` to the
+  release namespace by default; `ingress.watchNamespaces` overrides the
+  list and `rbac.clusterWide=true` swaps in a ClusterRole with a
+  cluster-wide watch. Bring your own identities by turning `rbac.create`
+  off.)
 - **Credentials.** A kubeconfig path is the only credential-shaped config
   field; secrets travel via mounted files or env (`$KUBECONFIG`), never
   inside `openrusty.toml`. In-cluster mode uses the mounted service
   account token. Basic-auth kubeconfig users are parsed but rejected.
-- **Init privileges.** The injected init container runs with
-  `privileged: true` because iptables needs it; `NET_ADMIN` would
-  suffice, and dropping to a dedicated capability is the planned
-  narrowing. `--dry-run` prints the plan without touching the kernel.
+- **Init privileges.** The injected init container runs as UID 0 with
+  `NET_ADMIN` + `NET_RAW` only (never `privileged: true`): iptables nat
+  rule programming needs exactly those capabilities. `--dry-run` prints
+  the plan without touching the kernel.
 
 ## Local drills
 
@@ -372,7 +406,7 @@ families on `/openrusty/metrics`.
 |--------|--------|
 | `scripts/local-netns-test.sh` | full transparent inbound/outbound path under a real iptables REDIRECT inside a throwaway netns: orig_dst recovery, opaque byte-faithful tunnel, loop guard, iptables-init idempotence, graceful shutdown (26 checks) |
 | `scripts/local-egress-test.sh` | egress tri-mode over a netns topology: direct/deny/gateway phases with the `openrusty_transparent_conns_total` contract as the assertion surface, XFF injection, opaque refusal (21 checks) |
-| `scripts/chart-lint.sh` | helm-render the chart (3 releases) plus the inject-CLI vs chart sidecar consistency drill (24 checks) |
+| `scripts/chart-lint.sh` | helm-render the chart (4 releases) plus the inject-CLI vs chart sidecar consistency drill (26 checks) |
 | `scripts/cluster-e2e.sh` | M4 cluster e2e, seven assertion groups: preflight (RBAC/version/image, gaps named), deploy + reach (LB with recorded NodePort fallback), routes + TLS handshake, watch resilience (stale-serve blackout), conflict red lines, removal rollback, 10-min observation window; `--preflight` runs without a cluster |
 
 The three local drills gate their environment up front and print a
