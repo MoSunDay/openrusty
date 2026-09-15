@@ -28,6 +28,7 @@
 //! | `proxy-log-level`    | `trace..error`                       | `warn`    |
 //! | `egress-mode`        | `direct` / `gateway` / `deny`        | `direct`  |
 //! | `egress-gateway`     | gateway `host:port` (gateway mode)   | none      |
+//! | `app-port`           | app port served via an app upstream  | none      |
 //!
 //! `disabled` passes the input through byte-for-byte (no output docs added).
 //! Unknown `config.openrusty.io/*` annotations warn on stderr and never
@@ -36,10 +37,14 @@
 //!
 //! # What gets injected (three pieces; see [`render`])
 //!
-//! 1. initContainer `openrusty-init` - iptables redirection, privileged.
+//! 1. initContainer `openrusty-init` - iptables redirection, run as UID 0
+//!    with NET_ADMIN+NET_RAW (rule programming only, not privileged).
 //! 2. sidecar `openrusty-proxy` - runs as the proxy UID, ports
 //!    4143/4140/4191, config from a ConfigMap volume mount.
 //! 3. `ConfigMap <name>-openrusty-config` - the sidecar's minimal TOML.
+//!
+//! Both containers share one image ref: [`IMAGE`] by default (a registry
+//! placeholder), overridable with the `--image REF` flag (see [`USAGE`]).
 //!
 //! `opaque-ports` is env passthrough only in v1: it does not change the
 //! iptables surface (a later version adds per-port handling).
@@ -79,6 +84,16 @@ pub const ADMIN_IGNORE_PORT: u16 = ADMIN_PORT;
 pub const DEFAULT_PROXY_UID: u32 = 511;
 pub const DEFAULT_LOG_LEVEL: &str = "warn";
 pub const IMAGE: &str = "ghcr.io/openrusty/openrusty:0.0.0-placeholder";
+
+const USAGE: &str = "openrusty inject: add the openrusty sidecar pieces to a workload manifest
+
+usage: openrusty inject [--image REF] < workload.yaml > injected.yaml
+
+flags:
+  --image REF    image of the init + sidecar containers (both share it;
+                 default ghcr.io/openrusty/openrusty:0.0.0-placeholder)
+  -h, --help     this text
+";
 /// Sidecar env carrying the `opaque-ports` annotation (v1: passthrough
 /// only, no rule-surface change - see the module docs).
 pub const OPAQUE_PORTS_ENV: &str = "OPENRUSTY_OPAQUE_PORTS";
@@ -100,6 +115,11 @@ pub struct InjectParams {
     pub log_level: String,
     pub egress_mode: EgressMode,
     pub egress_gateway: String,
+    /// App port for the pod-local upstream contract (v1: single port;
+    /// ports beyond it are not modeled). Rendered as an `app` upstream
+    /// (`127.0.0.1:<port>`) plus a catch-all route so transparently
+    /// intercepted inbound HTTP reaches the app instead of a router 404.
+    pub app_port: Option<u16>,
 }
 
 impl Default for InjectParams {
@@ -112,19 +132,67 @@ impl Default for InjectParams {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             egress_mode: EgressMode::Direct,
             egress_gateway: String::new(),
+            app_port: None,
         }
     }
 }
 
-/// Process entry: reads the workload from `input`, writes the injected
-/// YAML (or the untouched passthrough) to `output`. Returns the exit code.
-pub fn run_cli(mut input: impl Read, mut output: impl Write) -> i32 {
+/// Parsed CLI flags (pure data; `IMAGE` is the image default).
+#[derive(Debug, Default)]
+pub struct CliOptions {
+    pub image: Option<String>,
+}
+
+/// Parses the subcommand argv (`--flag value` and `--flag=value` forms),
+/// mirroring [`crate::init::parse_args`].
+pub fn parse_cli_args(argv: &[String]) -> Result<CliOptions, String> {
+    let mut opts = CliOptions::default();
+    let mut i = 0;
+    while i < argv.len() {
+        let (flag, inline) = match argv[i].split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (argv[i].clone(), None),
+        };
+        let mut next = |what: &str| -> Result<String, String> {
+            match inline.clone() {
+                Some(v) => Ok(v),
+                None => {
+                    i += 1;
+                    argv.get(i).cloned().ok_or_else(|| format!("{what} needs a value"))
+                }
+            }
+        };
+        match flag.as_str() {
+            "--image" => opts.image = Some(next("--image")?),
+            other => return Err(format!("unknown flag '{other}' (see --help)")),
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
+/// Process entry: parses `argv`, reads the workload from `input`, writes
+/// the injected YAML (or the untouched passthrough) to `output`. Returns
+/// the exit code (same convention as `iptables-init`: 0 ok / 1 render
+/// error / 2 bad flags).
+pub fn run_cli(argv: &[String], mut input: impl Read, mut output: impl Write) -> i32 {
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return 0;
+    }
+    let image = match parse_cli_args(argv) {
+        Ok(opts) => opts.image.unwrap_or_else(|| IMAGE.to_string()),
+        Err(e) => {
+            eprintln!("openrusty {SUBCOMMAND}: {e}\nrun with --help for usage");
+            return 2;
+        }
+    };
     let mut raw = String::new();
     if input.read_to_string(&mut raw).is_err() {
         eprintln!("openrusty {SUBCOMMAND}: stdin is not valid UTF-8");
         return 1;
     }
-    match run(&raw) {
+    match run_with_image(&raw, &image) {
         Ok(rendered) => {
             if write!(output, "{rendered}").is_err() {
                 eprintln!("openrusty {SUBCOMMAND}: cannot write to stdout");
@@ -139,8 +207,14 @@ pub fn run_cli(mut input: impl Read, mut output: impl Write) -> i32 {
     }
 }
 
-/// Pure core of the command: manifest text in, injected manifest out.
+/// Pure core of the command: manifest text in, injected manifest out
+/// (both injected containers carry the default [`IMAGE`] ref).
 pub fn run(raw: &str) -> Result<String, String> {
+    run_with_image(raw, IMAGE)
+}
+
+/// [`run`] with an explicit image ref for the init container and sidecar.
+pub fn run_with_image(raw: &str, image: &str) -> Result<String, String> {
     if raw.trim().is_empty() {
         return Err("empty input: expected exactly one workload YAML document on stdin".into());
     }
@@ -164,7 +238,7 @@ pub fn run(raw: &str) -> Result<String, String> {
     let name = render::workload_name(&doc)?;
     let cm_name = format!("{name}-openrusty-config");
     let pod_spec = pod_spec(&mut doc)?;
-    render::inject_pod_spec(pod_spec, &params, &cm_name)?;
+    render::inject_pod_spec(pod_spec, &params, image, &cm_name)?;
     let config_map = render_config_map(&name, render::namespace_of(&doc), &params)?;
     let workload_yaml = serde_yaml::to_string(&doc)
         .map_err(|e| format!("cannot re-render the workload: {e}"))?;
@@ -242,6 +316,14 @@ pub fn parse_annotations(annotations: &BTreeMap<String, String>) -> Result<Injec
                 }
             }
             "egress-gateway" => p.egress_gateway = value.trim().to_string(),
+            "app-port" => {
+                p.app_port = Some(
+                    value
+                        .trim()
+                        .parse::<u16>()
+                        .map_err(|_| invalid(name, value, "a port number"))?,
+                )
+            }
             other => warn_unknown(other),
         }
     }
