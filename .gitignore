@@ -58,5 +58,8 @@ target-clean/
 
 *.log
 
-# WASM plugin artifacts
-build/
+# WASM plugin artifacts (build/plugins) and docker-save tars
+# (scripts/build-image.sh); the image definition itself stays tracked.
+build/*
+!build/image/
+build/image/*.tar

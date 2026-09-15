@@ -1,0 +1,14 @@
+# Keep the docker build context at the workspace sources only (see
+# build/image/Dockerfile): target/ alone is several GB.
+/target
+/build
+/plugins
+/link_repos
+/.git
+/docs
+/features
+/agents
+/tests
+/deploy
+/scripts
+/config
