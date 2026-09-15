@@ -116,7 +116,10 @@ status_field() { # path under the status JSON "ingress" node (no jq assumed); he
 }
 svc_field() { kubectl get svc "$GATE_SVC" -n "$NS" -o "jsonpath=$1" 2>/dev/null || true; }
 admin_tunnel() { # the admin port 4191 is not exposed by the Service
-    [ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true
+    if [ -n "$TUNNEL_PID" ]; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        wait "$TUNNEL_PID" 2>/dev/null || true # reap: port released before rebind
+    fi
     kubectl port-forward -n "$NS" "deploy/$GATE_SVC" --address 127.0.0.1 "$ADMIN_LOCAL:4191" >/dev/null 2>&1 &
     TUNNEL_PID=$!
     wait_for 30 bash -c "exec 3<>/dev/tcp/127.0.0.1/$ADMIN_LOCAL"
@@ -136,7 +139,10 @@ pod_tunnel() { # pod - per-pod admin tunnel on its assigned local port
     if [ -z "$port" ]; then
         POD_PORT_BASE=$((POD_PORT_BASE + 1)); port="$POD_PORT_BASE"; POD_TUNNEL_PORTS[$pod]="$port"
     fi
-    [ -n "${POD_TUNNEL_PIDS[$pod]:-}" ] && kill "${POD_TUNNEL_PIDS[$pod]}" 2>/dev/null || true
+    if [ -n "${POD_TUNNEL_PIDS[$pod]:-}" ]; then
+        kill "${POD_TUNNEL_PIDS[$pod]}" 2>/dev/null || true
+        wait "${POD_TUNNEL_PIDS[$pod]}" 2>/dev/null || true # reap: port released before rebind
+    fi
     kubectl port-forward -n "$NS" "pod/$pod" --address 127.0.0.1 "$port:4191" >/dev/null 2>&1 &
     POD_TUNNEL_PIDS[$pod]=$!
     wait_for 30 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port"
