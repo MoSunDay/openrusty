@@ -6,6 +6,10 @@
 //! flag - SIGTERM/SIGINT (binary) and `POST /openrusty/shutdown` (admin
 //! plane) are strictly equivalent - and every path converges on [`run`]:
 //!
+//! SIGQUIT is the one deliberate exception: nginx QUIT maps to
+//! [`run_fast`] - quick shutdown with the drain skipped, in-flight
+//! requests are not waited on.
+//!
 //! 1. Flag to `true`: every accept loop (`h2c`, `transparent`) stops and
 //!    closes its socket; already accepted connections drain through hyper's
 //!    graceful shutdown (`h2c::GracefulDrain`), established opaque tunnels
@@ -104,16 +108,8 @@ pub async fn run(
     let mut task_errors = 0usize;
     let wait = async {
         for t in tasks {
-            match t.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    task_errors += 1;
-                    tracing::error!(error = %e, "accept task failed during drain");
-                }
-                Err(e) => {
-                    task_errors += 1;
-                    tracing::error!(error = %e, "accept task panicked during drain");
-                }
+            if !settle(t, "drain").await {
+                task_errors += 1;
             }
         }
         until_drained(&in_flight).await;
@@ -145,6 +141,72 @@ pub async fn run(
         "shutdown: complete"
     );
     report
+}
+
+/// nginx QUIT semantics: quick shutdown, no drain.
+///
+/// Phase 1 is identical to [`run`] - flip the stop flag so every accept
+/// loop closes its socket - but the in-flight connections are NOT waited
+/// on: whatever is still open counts as force-closed and is torn down by
+/// the caller's process exit. The accept task handles are still awaited
+/// (they end on the flag, so the wait is bounded) and their failures
+/// counted the same way, keeping the exit-code semantics identical.
+pub async fn run_fast(
+    tx: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<std::io::Result<()>>>,
+    in_flight: InFlight,
+) -> ShutdownReport {
+    let started = Instant::now();
+    let at_signal = in_flight.load(Ordering::Relaxed);
+
+    // Phase 1: identical to `run` - stop accepting.
+    let _ = tx.send(true);
+    tracing::info!(in_flight = at_signal, "shutdown: fast (SIGQUIT) - skipping drain");
+
+    // Phase 2 (fast): await only the accept tasks; the in-flight counter
+    // is deliberately never polled - that wait is the drain being skipped.
+    let mut task_errors = 0usize;
+    for t in tasks {
+        if !settle(t, "fast shutdown").await {
+            task_errors += 1;
+        }
+    }
+
+    // Phase 3: summary. Everything still open is force-closed by the exit;
+    // there is no grace window here, so `timed_out` is always false.
+    let remaining = in_flight.load(Ordering::Relaxed);
+    let report = ShutdownReport {
+        drained: at_signal.saturating_sub(remaining),
+        forced: remaining,
+        elapsed: started.elapsed(),
+        timed_out: false,
+        task_errors,
+    };
+    tracing::info!(
+        drained = report.drained,
+        forced = report.forced,
+        elapsed_ms = report.elapsed.as_millis() as u64,
+        "shutdown: complete"
+    );
+    report
+}
+
+/// Await one accept-task handle, counting failures the way both shutdown
+/// modes do: accept tasks end on the stop flag themselves, anything else
+/// (error or panic) is logged and counted for the exit code. `mode` only
+/// labels the log line ("drain" vs. "fast shutdown").
+async fn settle(task: JoinHandle<std::io::Result<()>>, mode: &str) -> bool {
+    match task.await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, mode, "accept task failed");
+            false
+        }
+        Err(e) => {
+            tracing::error!(error = %e, mode, "accept task panicked");
+            false
+        }
+    }
 }
 
 /// Resolves when every accepted connection has finished. Polls the plain
@@ -212,6 +274,27 @@ mod tests {
         assert_eq!(report.forced, 1);
         assert_eq!(report.drained, 0);
         assert!(report.elapsed >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn fast_shutdown_skips_the_drain() {
+        let sig = new_signal();
+        // A connection that never finishes: `run` would sit on it for the
+        // whole grace window, `run_fast` must not wait for it at all.
+        sig.in_flight.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let report =
+            run_fast(sig.tx.clone(), vec![accept_task(sig.rx.clone())], sig.in_flight.clone())
+                .await;
+        // Generous margin: the accept task ends on the flag (awaited to
+        // completion inside `run_fast`, hence task_errors == 0), the
+        // marker is simply left behind.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(is_draining(&sig.rx), "stop flag must be flipped");
+        assert_eq!(report.forced, 1);
+        assert_eq!(report.drained, 0);
+        assert!(!report.timed_out, "no grace window to expire");
+        assert_eq!(report.task_errors, 0);
     }
 
     #[tokio::test]

@@ -9,6 +9,11 @@ listen = "127.0.0.1:8180"
 # The default is warn (quiet); deployments that need the per-request access
 # log must set log_level = "info" explicitly.
 log_level = "warn"
+# Log to this file (append) instead of stdout, nginx style. When set, the
+# gateway stops writing to stdout/journal and SIGUSR1 re-opens the path
+# after external rotation (see /etc/logrotate.d snippet in
+# scripts/install-service.sh output).
+# log_file = "logs/openrusty.log"
 # Set to true to serve plain HTTP/1.1 only and skip the h2c preface sniffing
 # (each connection then runs the cheaper http/1 code path).
 # http1_only = false

@@ -10,18 +10,25 @@
 //!   on it only while no dedicated admin listener exists (see
 //!   [`app::admin_routes`] for the mounting rule).
 //!
-//! Binding is fail-fast: every socket is bound up front and any bind error
+//! Sockets are acquired inherit-or-bind, fail-fast: when the process is
+//! socket-activated (`LISTEN_FDS`/`LISTEN_PID`, e.g. a systemd
+//! `openrusty.socket` unit or a future exec-based upgrade), the inherited
+//! listener fds are adopted instead of binding - [`sd_listen::adopt`]
+//! port-matches them against the configured addresses first - otherwise
+//! every socket is bound up front. Either way, any acquisition error
 //! aborts before a single request is served, matching the historical
 //! single-listener behaviour where a failed bind exits the process.
 
 use crate::app;
 use crate::h2c;
 use crate::metrics;
+use crate::sd_listen;
 use crate::shutdown::ShutdownSignal;
 use crate::state::AppState;
 use crate::tls::{self, TlsPlan};
 use crate::transparent;
 use openrusty_core::config::{EgressConfig, ListenerConfig, ListenerRole};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -98,10 +105,11 @@ pub(crate) fn own_ports<'a>(
     ports.into()
 }
 
-/// Bind every listener, then spawn one accept task per bound socket.
+/// Inherit or bind every listener, then spawn one accept task per socket.
 ///
-/// Bind failures propagate before any serving starts (fail-fast); the
-/// returned handles end when the unified shutdown signal fires (see
+/// Socket acquisition failures (a socket-activation mismatch or a bind
+/// error) propagate before any serving starts (fail-fast); the returned
+/// handles end when the unified shutdown signal fires (see
 /// `shutdown::run`, which awaits them inside the grace window) - their
 /// accepted connections drain through the existing per-connection graceful
 /// shutdown. The signal is passed by reference so every accept task clones
@@ -110,26 +118,49 @@ pub async fn spawn(
     mounts: Vec<Mount>,
     signal: &ShutdownSignal,
 ) -> std::io::Result<Vec<JoinHandle<std::io::Result<()>>>> {
-    // Phase 1: bind everything up front, and read each TLS listener's
+    // Phase 1: acquire every socket up front, and read each TLS listener's
     // static certificate material exactly once (fail-fast: an unreadable
     // file aborts before a single request is served; reloads never
-    // re-read it - the dynamic rotation path is ingress-driven).
+    // re-read it - the dynamic rotation path is ingress-driven). Under
+    // socket activation the whole set is inherited (adopt() ports-matches
+    // the fds to the configured addresses, in order, or fails); adoption
+    // is all-or-nothing, so the queue either empties across this loop or
+    // was never created.
+    let expected: Vec<SocketAddr> = mounts.iter().map(|m| m.listener.listen).collect();
+    let mut inherited = sd_listen::adopt(&expected)?
+        .map(|listeners| listeners.into_iter().collect::<VecDeque<_>>());
     let mut bound = Vec::with_capacity(mounts.len());
     let mut tls_cfgs = Vec::with_capacity(mounts.len());
     for m in &mounts {
-        let listener = tokio::net::TcpListener::bind(m.listener.listen).await?;
+        let inherited_listener = inherited.as_mut().and_then(|queue| queue.pop_front());
+        let from_activation = inherited_listener.is_some();
+        let listener = match inherited_listener {
+            Some(l) => l,
+            None => tokio::net::TcpListener::bind(m.listener.listen).await?,
+        };
         let tls_cfg = match &m.tls {
             Some(plan) => Some(tls::boot(plan, m.listener.http1_only)?),
             None => None,
         };
-        tracing::info!(
-            role = m.listener.role.as_str(),
-            addr = %m.listener.listen,
-            http1_only = m.listener.http1_only,
-            transparent = m.listener.transparent,
-            tls = tls_cfg.is_some(),
-            "listener bound"
-        );
+        if from_activation {
+            tracing::info!(
+                role = m.listener.role.as_str(),
+                addr = %m.listener.listen,
+                http1_only = m.listener.http1_only,
+                transparent = m.listener.transparent,
+                tls = tls_cfg.is_some(),
+                "listener inherited (socket activation)"
+            );
+        } else {
+            tracing::info!(
+                role = m.listener.role.as_str(),
+                addr = %m.listener.listen,
+                http1_only = m.listener.http1_only,
+                transparent = m.listener.transparent,
+                tls = tls_cfg.is_some(),
+                "listener bound"
+            );
+        }
         bound.push(listener);
         tls_cfgs.push(tls_cfg);
     }
