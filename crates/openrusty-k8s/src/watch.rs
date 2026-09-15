@@ -14,7 +14,11 @@
 //!    snapshot hand-over;
 //! 4. on 410 Gone, stream end (clean EOF or error), malformed line or
 //!    transport error: reconnect, i.e. go back to step 1 with exponential
-//!    backoff (100ms, x2, capped at 30s; any successful LIST resets it).
+//!    backoff (100ms, x2, capped at 30s; any successful LIST resets it);
+//! 5. resync: every [`WatchOptions::resync`] the cycle restarts at step 1
+//!    so a silently dead (half-open) stream cannot serve a stale snapshot
+//!    longer than one interval; a re-list at an unchanged resource version
+//!    skips the hand-over (quiet clusters do not churn generations).
 //!
 //! # Stale-serve semantics (explicit, not a degradation)
 //!
@@ -43,6 +47,9 @@ pub const BACKOFF_BASE: Duration = Duration::from_millis(100);
 pub const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Default debounce window (nginx-style reload pacing).
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Default periodic re-LIST bound (the staleness watchdog; see
+/// [`WatchOptions::resync`]).
+pub const DEFAULT_RESYNC: Duration = Duration::from_secs(30);
 
 /// Async face of the API server: exactly what [`watch_loop`] needs.
 ///
@@ -78,6 +85,12 @@ pub struct WatchOptions {
     pub debounce: Duration,
     /// Ingress class the caller renders routes for.
     pub ingress_class: String,
+    /// Staleness watchdog: restart the LIST→WATCH cycle this often so a
+    /// silently dead (half-open) stream can never serve a stale snapshot
+    /// longer than one interval. A re-LIST with an unchanged resource
+    /// version skips the hand-over, so quiet clusters do not churn
+    /// generations. `None` disables it (only errors re-list).
+    pub resync: Option<Duration>,
 }
 
 impl WatchOptions {
@@ -85,6 +98,7 @@ impl WatchOptions {
         Self {
             debounce: DEFAULT_DEBOUNCE,
             ingress_class: ingress_class.into(),
+            resync: Some(DEFAULT_RESYNC),
         }
     }
 }
@@ -136,6 +150,7 @@ where
     let mut backoff = BACKOFF_BASE;
     let mut stats = WatchStats::default();
     let mut snap: Snapshot<T>;
+    let mut restart_rv: Option<String> = None;
     'outer: loop {
         // ---- LIST phase (retried with backoff until it succeeds) ----
         let list: K8sList<T> = loop {
@@ -166,12 +181,20 @@ where
         stats.last_rv = snap.resource_version().to_string();
         // Hand the fresh snapshot over after a quiet window; events racing
         // in while it is open collapse into the same hand-over.
-        let mut dirty = true;
+        // A resync restart re-lists at the rv it left; an unchanged rv means
+        // nothing was missed, so no hand-over (no generation churn). Error
+        // restarts always hand over.
+        let mut dirty = restart_rv
+            .take()
+            .as_deref()
+            .map_or(true, |rv| snap.resource_version() != rv);
         let mut deadline: Option<Pin<Box<Sleep>>> =
             Some(Box::pin(tokio::time::sleep(opts.debounce)));
 
         // ---- WATCH phase ----
         let mut body: Option<ByteStream> = None;
+        let mut resync_at: Option<Pin<Box<Sleep>>> =
+            opts.resync.map(|d| Box::pin(tokio::time::sleep(d)));
         let mut buf: Vec<u8> = Vec::new();
         loop {
             if body.is_none() {
@@ -246,6 +269,11 @@ where
                         dirty = false;
                     }
                     deadline = None;
+                }
+                _ = async { resync_at.as_mut().expect("resync guarded").as_mut().await }, if resync_at.is_some() => {
+                    tracing::debug!(path, "resync tick; re-listing");
+                    restart_rv = Some(snap.resource_version().to_string());
+                    continue 'outer;
                 }
             }
             if reconnect {

@@ -81,6 +81,11 @@ impl HttpsConnector {
     pub fn new(tls: Arc<rustls::ClientConfig>) -> Self {
         let mut http = HttpConnector::new();
         http.set_connect_timeout(Some(crate::client::CONNECT_TIMEOUT));
+        // The TLS upgrade happens in this layer, after hyper hands back the
+        // TCP stream; without this the inner connector rejects `https` URIs
+        // with "invalid URL, scheme is not http" before ever dialing
+        // (hyper-rustls's own connector does the same).
+        http.enforce_http(false);
         Self { http, tls }
     }
 }
@@ -116,5 +121,38 @@ impl Service<Uri> for HttpsConnector {
             let stream = tls.connect(server_name, TokioIo::new(tcp)).await?;
             Ok(TlsStream(TokioIo::new(stream)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the inner `HttpConnector` rejects `https` URIs ("invalid
+    /// URL, scheme is not http") unless `enforce_http(false)` is set, which
+    /// would break every apiserver dial. Dialing an https URI must fail with
+    /// a TCP-level error (closed local port), never the scheme rejection.
+    #[tokio::test]
+    async fn https_uris_pass_the_inner_connector() {
+        let tls = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let mut connector = HttpsConnector::new(tls);
+        let uri = "https://127.0.0.1:1/".parse::<Uri>().unwrap();
+        let err = tower::ServiceExt::oneshot(&mut connector, uri)
+            .await
+            .err()
+            .expect("closed port must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("scheme is not http"),
+            "inner connector still enforces http scheme: {msg}"
+        );
     }
 }
