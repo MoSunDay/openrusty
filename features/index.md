@@ -9,6 +9,7 @@ Commit: 86fac98
 - [vllm-kv-scheduler 亲和调度](./vllm-kv-scheduler/index.md) —— vLLM 风格 KV-cache 亲和：task key 粘滞、最少任务选择、TTL 释放
 - 动态 WASM 执行 API —— `[dynamic]` 节启用 `POST /api/v1/dynamic/{name}`：单模块合成管线、stat 驱动换模块即生效（[changelog 2026-09-05](./changelog/2026-09-05/dynamic-wasm-api.md)）
 - Upstream TLS —— `[[upstreams]] tls` 节：https 上游（CA/mTLS/SNI，reload 前置校验），mesh mTLS 的出向底座（[changelog 2026-09-05](./changelog/2026-09-05/upstream-tls.md)）
+- 生命周期（`-t` 干跑 / 日志轮转 / socket activation 热重启 / 信号语义）—— 详见 [运维与部署](./ops/index.md) 与 [changelog 2026-09-15](./changelog/2026-09-15/lifecycle.md)
 - [运维与部署](./ops/index.md) —— `/openrusty/status`、systemd 开机自启、配置加载、三层验证
 - [K8s 三形态](./k8s-forms/index.md) —— sidecar 透明拦截、ingress watch+TLS、egress 三态；iptables-init/inject/chart 部署面
 

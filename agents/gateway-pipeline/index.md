@@ -36,7 +36,7 @@ Commit: 681ad49
 ## 依赖与接口
 - 依赖 `openrusty-core`（config/context/Decision）、`openrusty-wasm`（`PluginRegistry` 快照）、`openrusty-proxy`（forward/tunnel/health）。
 - 对外接口：监听端口上的全部网关行为 + `GET /openrusty/status` + `POST /openrusty/reload` + `GET /openrusty/metrics` + `GET /openrusty/ready` + `GET /openrusty/live` + `POST /openrusty/shutdown` + `POST /api/v1/dynamic/{name}`（`dynamic_api.rs`，`[dynamic]` 启用时）+ 一次性子命令 `openrusty iptables-init`、`openrusty inject`。
-- 代码锚点：`crates/openrusty-server/src/{main,h2c,app,pipeline,ws,body_filter,reload,active_probe,metrics,dynamic_api,resp_shortcut}.rs`；本批次新增 `{listeners,transparent,egress,shutdown}.rs` 与 `{tls,ingress,init,inject}/` 子模块、`crates/openrusty-k8s/`（被消费库）。
+- 代码锚点：`crates/openrusty-server/src/{main,h2c,app,pipeline,ws,body_filter,reload,active_probe,metrics,dynamic_api,resp_shortcut}.rs`；`{listeners,transparent,egress,shutdown,sd_listen,check,logging}.rs`（sd_listen=socket activation fd 继承、check=`-t` 干跑、logging=文件日志+USR1 reopen） 与 `{tls,ingress,init,inject}/` 子模块、`crates/openrusty-k8s/`（被消费库）。
 
 ## 关联模块
 - [WASM 插件运行时](../wasm-runtime/index.md)

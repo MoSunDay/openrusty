@@ -8,7 +8,9 @@
 //! compiled modules and serve the gateway in-process.
 
 use openrusty_core::load_config;
-use openrusty_server::{active_probe, ingress, inject, init, listeners, reload, shutdown, state};
+use openrusty_server::{
+    active_probe, check, ingress, inject, init, listeners, logging, reload, shutdown, state,
+};
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,9 +25,14 @@ fn arg_is(name: &str) -> bool {
 }
 
 fn resolve_config_path() -> PathBuf {
-    std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("OPENRUSTY_CONFIG").ok())
+    config_from(std::env::args().nth(1))
+}
+
+/// Config path from an explicit CLI argument, else `OPENRUSTY_CONFIG`, else
+/// the documented default. Shared by the serve path (arg 1) and the `-t`
+/// dry run (arg 2).
+fn config_from(arg: Option<String>) -> PathBuf {
+    arg.or_else(|| std::env::var("OPENRUSTY_CONFIG").ok())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config/openrusty.toml"))
 }
@@ -43,10 +50,27 @@ async fn main() {
             std::io::stdout().lock(),
         ));
     }
+    // `openrusty -t [CONFIG]` (also `--test`): nginx-style dry run. Parse +
+    // validate the config and compile every plugin, print the report,
+    // exit. Runs before any tracing setup or listener work, so it never
+    // serves.
+    if arg_is("-t") || arg_is("--test") {
+        let path = config_from(std::env::args().nth(2));
+        match check::run(&path) {
+            Ok(summary) => {
+                summary.print();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("openrusty: configuration test failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let config_path = resolve_config_path();
     if !config_path.is_file() {
         eprintln!(
-            "openrusty: config file not found: {}\nusage: openrusty [CONFIG] (or set OPENRUSTY_CONFIG)",
+            "openrusty: config file not found: {}\nusage: openrusty [CONFIG] | openrusty -t [CONFIG] to test it (or set OPENRUSTY_CONFIG)",
             config_path.display()
         );
         std::process::exit(1);
@@ -61,10 +85,19 @@ async fn main() {
 
     let filter =
         EnvFilter::try_new(&cfg.server.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Log sink: stdout by default (journald captures it), or the file named
+    // by `server.log_file`. An unopenable file is fatal here - tracing is
+    // not up yet, so the error goes to stderr where boot problems belong.
+    let (log_writer, log_guard, reopen_handle) = match logging::init(&cfg.server) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("openrusty: cannot open log file: {e}");
+            std::process::exit(1);
+        }
+    };
     // Non-blocking writer: log calls hand formatted output to a dedicated
     // thread; the guard must outlive every log call, so main holds it and the
     // buffer is flushed when it drops at shutdown.
-    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(log_writer)
@@ -139,6 +172,38 @@ async fn main() {
         });
     }
 
+    // SIGUSR1: reopen `server.log_file` after external rotation renamed it
+    // (nginx semantics). The handler is installed in BOTH logging modes:
+    // with the stdout sink an innocent `systemctl kill -s USR1` must not
+    // fall through to the default disposition (terminate) and kill the
+    // gateway. Without a log file there is nothing to reopen, so the recv
+    // loop is a debug-level no-op. A failed reopen keeps the old
+    // descriptor and is logged, never fatal.
+    tokio::spawn(async move {
+        let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        else {
+            tracing::warn!("could not install SIGUSR1 handler");
+            return;
+        };
+        match reopen_handle {
+            Some(writer) => {
+                while sig.recv().await.is_some() {
+                    tracing::info!("SIGUSR1 received; reopening log file");
+                    if let Err(e) = logging::reopen(&writer) {
+                        tracing::error!(error = %e, "log reopen failed; continuing on old file");
+                    }
+                }
+            }
+            None => {
+                tracing::debug!("SIGUSR1 handler active; logging to stdout, no file to reopen");
+                while sig.recv().await.is_some() {
+                    tracing::debug!("USR1 ignored: logging to stdout, no file to reopen");
+                }
+            }
+        }
+    });
+
     // Role-based multi-listener: `[[server.listeners]]` entries are authoritative
     // when written, otherwise a single inbound listener is derived from
     // `server.listen` (which keeps the historical single-socket shape).
@@ -164,6 +229,10 @@ async fn main() {
     // Shutdown trigger: SIGTERM, SIGINT and POST /openrusty/shutdown are
     // three doors into the same room - all of them are answered by the one
     // three-phase sequence below (stop accepting, bounded drain, summary).
+    // SIGQUIT is the nginx fast-shutdown door: same stop-accepting phase,
+    // drain skipped. `fast` picks between the two entry points; everything
+    // after the branch (report handling, exit code) is shared.
+    let mut fast = false;
     tokio::select! {
         _ = wait_signal(SignalKind::terminate()) => {
             tracing::info!("SIGTERM received; shutting down");
@@ -171,25 +240,39 @@ async fn main() {
         _ = wait_signal(SignalKind::interrupt()) => {
             tracing::info!("SIGINT received; shutting down");
         }
+        _ = wait_signal(SignalKind::quit()) => {
+            tracing::info!("SIGQUIT received; fast shutdown (skipping drain)");
+            fast = true;
+        }
         _ = shutdown::wait_for_shutdown(state.shutdown.rx.clone()) => {
             tracing::info!("shutdown endpoint triggered; shutting down");
         }
     }
 
-    let grace = Duration::from_millis(cfg.server.shutdown_grace_ms);
-    let report = shutdown::run(
-        state.shutdown.tx.clone(),
-        tasks,
-        state.shutdown.in_flight.clone(),
-        grace,
-    )
-    .await;
+    let report = if fast {
+        shutdown::run_fast(
+            state.shutdown.tx.clone(),
+            tasks,
+            state.shutdown.in_flight.clone(),
+        )
+        .await
+    } else {
+        let grace = Duration::from_millis(cfg.server.shutdown_grace_ms);
+        shutdown::run(state.shutdown.tx.clone(), tasks, state.shutdown.in_flight.clone(), grace)
+            .await
+    };
     if report.task_errors > 0 {
         tracing::error!(errors = report.task_errors, "accept tasks failed during drain");
+        // process::exit skips destructors; drop the guard first so the
+        // error line reaches the sink before the process goes away.
+        drop(log_guard);
         std::process::exit(1);
     }
     // Exit 0 in both outcomes; an expired grace is already logged as a warn
     // with the force-closed connection count.
+    // Dropping the guard drains the non-blocking log buffer: the final
+    // flush of the shutdown summary happens here, at the end of main.
+    drop(log_guard);
 }
 
 /// Resolves on the given unix signal. If the handler cannot be installed
