@@ -24,10 +24,11 @@ spec:
         config.openrusty.io/inject: "enabled"
         config.openrusty.io/skip-inbound-ports: "9090,15002"
         config.openrusty.io/opaque-ports: "8443"
+        config.openrusty.io/app-port: "80"
     spec:
       containers:
         - name: echo
           image: ghcr.io/openrusty/echo:0.0.0-placeholder
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: 80

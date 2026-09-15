@@ -12,7 +12,9 @@ kubectl get deploy echo -o yaml | openrusty inject | kubectl apply -f -
 The command is a pure renderer: no kubeconfig, no API server, no gateway
 config file, no serving runtime (same one-shot contract as
 `openrusty iptables-init`, whose rules the injected init container
-installs).
+installs). Both injected containers share one image ref, the placeholder
+`ghcr.io/openrusty/openrusty:0.0.0-placeholder` by default; pass
+`--image REF` (or `--image=REF`) to point at a real registry channel.
 
 ## Input contract (v1)
 
@@ -41,6 +43,7 @@ read `metadata.annotations`.
 | `proxy-log-level`                   | `trace` / `debug` / `info` / `warn` / `error`  | `warn`    |
 | `egress-mode`                       | `direct` / `gateway` / `deny`                  | `direct`  |
 | `egress-gateway`                    | gateway `host:port`, required in gateway mode  | none      |
+| `app-port`                          | app port served via a pod-local `app` upstream + catch-all route; v1 is single-port | none      |
 
 - Running the command at all means "inject", so an explicit
   `inject: "disabled"` is what opts a workload out: the input is passed
@@ -51,6 +54,9 @@ read `metadata.annotations`.
 - **`opaque-ports` is a v1 boundary**: it is only recorded as the
   `OPENRUSTY_OPAQUE_PORTS` env var on the sidecar for later versions to
   act on. It does not change the iptables rule surface.
+- **`app-port` is single-port in v1**: it renders one `app` upstream
+  (`127.0.0.1:<port>`) plus a catch-all route (`path_prefix = "/"`) into
+  the sidecar config; ports beyond it are not modeled.
 - Unknown `config.openrusty.io/*` annotations produce a stderr warning and
   are ignored (forward compatibility with newer controllers). Malformed
   values of *known* annotations fail with exit 1 - a typo must not inject
@@ -61,8 +67,9 @@ read `metadata.annotations`.
 1. **initContainer `openrusty-init`**
    `openrusty iptables-init --proxy-uid <uid> --inbound-port 4143
    --outbound-port 4140 --ignore-inbound-ports 4191[,<skip-inbound-ports>]`
-   with `securityContext.privileged: true`. iptables needs the privilege
-   (NET_ADMIN would suffice; v1 keeps it simple and narrowable later).
+   with `runAsUser: 0` and `capabilities: {add: [NET_ADMIN, NET_RAW]}` -
+   the narrow envelope iptables rule programming needs, not
+   `privileged: true`.
 2. **sidecar `openrusty-proxy`** - `runAsUser: <proxy-uid>`, ports
    4143 (inbound) / 4140 (outbound) / 4191 (admin), config mounted from a
    ConfigMap at `/etc/openrusty/openrusty.toml` (the path is the only
@@ -70,7 +77,9 @@ read `metadata.annotations`.
 3. **ConfigMap `<name>-openrusty-config`** - key `openrusty.toml`, a
    minimal config the renderer validates before emitting: transparent
    inbound + outbound listeners, admin listener, `[egress]` from the
-   annotations, `[ingress] enabled = false`, no routes/upstreams.
+   annotations, `[ingress] enabled = false`, and routes/upstreams only
+   when `app-port` is set (a pod-local `app` upstream on
+   `127.0.0.1:<port>` plus a catch-all route).
    `[plugins] dir` points at `/dev/null-plugins`, a path that does not
    exist in the container on purpose: the plugin registry treats a
    missing/empty plugin dir as "no plugins" (warn, generation 0) and never
@@ -99,8 +108,9 @@ The chart renders the two cluster roles around the injected sidecar:
 - `demo` (`demo.enabled=false` by default) - the shared fixture workload
   with its injection result written out statically.
 
-`scripts/chart-lint.sh` helm-templates three releases (defaults /
-`demo.enabled=true` / `ingress.service.type=NodePort`), runs the inject
+`scripts/chart-lint.sh` helm-templates four releases (defaults /
+`demo.enabled=true` / `ingress.service.type=NodePort` /
+`rbac.create=false`), runs the inject
 CLI over `tests/fixtures/inject/deployment.yaml` and asserts the rendered
 chart sidecar matches the CLI output (ports, UID, init flags, mounts,
 TOML body). No cluster or kubeconfig involved.

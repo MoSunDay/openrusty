@@ -7,10 +7,14 @@
 
 use super::{
     ignore_inbound_ports, InjectParams, ADMIN_PORT, CONFIG_MOUNT, CONFIG_PATH, CONFIG_VOLUME,
-    IMAGE, INBOUND_PORT, INIT_NAME, OUTBOUND_PORT, OPAQUE_PORTS_ENV, SIDECAR_NAME,
+    INBOUND_PORT, INIT_NAME, OUTBOUND_PORT, OPAQUE_PORTS_ENV, SIDECAR_NAME,
 };
 use serde::Serialize;
 use serde_yaml::Value;
+
+/// Capabilities the init container needs to program iptables: NET_ADMIN
+/// (rule writes) + NET_RAW (socket matchers), nothing more.
+const INIT_CAPS: &[&str] = &["NET_ADMIN", "NET_RAW"];
 
 /// Pod-spec location per kind (v1 surface).
 const POD: &[&str] = &["spec"];
@@ -113,8 +117,13 @@ fn get_mut<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
 // ---------------------------------------------------------------------------
 
 /// Inserts the init container, the sidecar and the config volume into the
-/// pod spec. Refuses to double-inject.
-pub fn inject_pod_spec(spec: &mut Value, p: &InjectParams, cm_name: &str) -> Result<(), String> {
+/// pod spec; both containers carry `image`. Refuses to double-inject.
+pub fn inject_pod_spec(
+    spec: &mut Value,
+    p: &InjectParams,
+    image: &str,
+    cm_name: &str,
+) -> Result<(), String> {
     if container_names(spec, "initContainers").contains(&INIT_NAME.to_string())
         || container_names(spec, "containers").contains(&SIDECAR_NAME.to_string())
     {
@@ -125,13 +134,18 @@ pub fn inject_pod_spec(spec: &mut Value, p: &InjectParams, cm_name: &str) -> Res
     }
     let init = to_value(&InitContainer {
         name: INIT_NAME,
-        image: IMAGE,
+        image: image.to_string(),
         command: init_command(p),
-        security_context: InitSecurity { privileged: true },
+        security_context: InitSecurity {
+            run_as_user: 0,
+            capabilities: InitCapabilities {
+                add: INIT_CAPS.to_vec(),
+            },
+        },
     })?;
     let sidecar = to_value(&Sidecar {
         name: SIDECAR_NAME,
-        image: IMAGE,
+        image: image.to_string(),
         args: vec![CONFIG_PATH.to_string()],
         env: opaque_env(p),
         ports: vec![
@@ -236,21 +250,30 @@ pub(super) fn to_value<T: Serialize>(value: &T) -> Result<Value, String> {
 #[serde(rename_all = "camelCase")]
 struct InitContainer {
     name: &'static str,
-    image: &'static str,
+    image: String,
     command: Vec<String>,
     security_context: InitSecurity,
 }
 
+/// UID 0 + NET_ADMIN/NET_RAW: the narrow privilege envelope for nat-rule
+/// programming (no `privileged: true`).
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct InitSecurity {
-    privileged: bool,
+    run_as_user: u32,
+    capabilities: InitCapabilities,
+}
+
+#[derive(Serialize)]
+struct InitCapabilities {
+    add: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Sidecar {
     name: &'static str,
-    image: &'static str,
+    image: String,
     args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     env: Option<Vec<EnvVar>>,

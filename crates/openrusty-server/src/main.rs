@@ -28,6 +28,17 @@ fn resolve_config_path() -> PathBuf {
     config_from(std::env::args().nth(1))
 }
 
+/// One-screen pointer to the subcommands (the image sanity check exercises
+/// this exit-0 path, so it must work without a config file).
+const USAGE: &str = "openrusty: an nginx-like WASM-extensible gateway
+
+usage: openrusty [CONFIG]                          serve (default config/openrusty.toml)
+       openrusty -t | --test [CONFIG]              validate the config and exit
+       openrusty iptables-init --proxy-uid <UID>   install the sidecar traffic hijack
+       openrusty inject [--image REF]              inject the sidecar into a workload manifest
+       openrusty -h | --help                       this text
+";
+
 /// Config path from an explicit CLI argument, else `OPENRUSTY_CONFIG`, else
 /// the documented default. Shared by the serve path (arg 1) and the `-t`
 /// dry run (arg 2).
@@ -46,9 +57,15 @@ async fn main() {
     // (linkerd-inject shape); same one-shot contract, no config, no runtime.
     if arg_is(inject::SUBCOMMAND) {
         std::process::exit(inject::run_cli(
+            &std::env::args().skip(2).collect::<Vec<_>>(),
             std::io::stdin().lock(),
             std::io::stdout().lock(),
         ));
+    }
+    // `openrusty -h|--help`: exit-0 pointer without touching any config.
+    if arg_is("-h") || arg_is("--help") {
+        print!("{USAGE}");
+        return;
     }
     // `openrusty -t [CONFIG]` (also `--test`): nginx-style dry run. Parse +
     // validate the config and compile every plugin, print the report,

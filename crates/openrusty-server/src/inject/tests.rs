@@ -80,6 +80,51 @@ fn uid_log_level_and_egress_parse() {
 }
 
 #[test]
+fn app_port_parses_into_params() {
+    let p = params_from(&[(&format!("{PREFIX}app-port"), "8080")]).unwrap();
+    assert_eq!(p.app_port, Some(8080));
+    assert_eq!(InjectParams::default().app_port, None);
+    let err = params_from(&[(&format!("{PREFIX}app-port"), "http")]).unwrap_err();
+    assert!(err.contains("app-port") && err.contains("port number"), "got: {err}");
+}
+
+#[test]
+fn app_port_renders_pod_local_upstream_and_catch_all_route() {
+    // With the annotation: the app upstream (127.0.0.1:<port>) plus the
+    // catch-all route land between [egress] and [ingress] - and the
+    // rendered TOML still boots through the real load_config.
+    let p = InjectParams { app_port: Some(8080), ..InjectParams::default() };
+    let src = config::render_config_toml(&p).expect("renders");
+    assert!(src.contains("name = \"app\"\n"), "upstream named app: {src}");
+    assert!(src.contains("addr = \"127.0.0.1:8080\"\n"), "pod-local peer: {src}");
+    assert!(src.contains("path_prefix = \"/\"\nupstream = \"app\"\n"), "catch-all route: {src}");
+    let egress = src.find("[egress]").expect("egress section");
+    let app = src.find("[[upstreams]]").expect("upstreams section");
+    let ingress = src.find("[ingress]").expect("ingress section");
+    assert!(egress < app && app < ingress, "block sits between egress and ingress");
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("openrusty-inject-appport-{}.toml", std::process::id()));
+    std::fs::write(&path, &src).unwrap();
+    let cfg = load_config(&path).unwrap_or_else(|e| panic!("app-port config boots: {e}"));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(cfg.upstreams.len(), 1);
+    assert_eq!(cfg.upstreams[0].name, "app");
+    assert_eq!(cfg.upstreams[0].peers[0].addr.to_string(), "127.0.0.1:8080");
+    assert_eq!(cfg.routes.len(), 1);
+    assert_eq!(cfg.routes[0].path_prefix, "/");
+    assert_eq!(cfg.routes[0].upstream, "app");
+}
+
+#[test]
+fn no_app_port_renders_no_upstreams_or_routes() {
+    // Without the annotation today's shape is preserved: no upstreams,
+    // no routes - the router stays untouched.
+    let src = config::render_config_toml(&InjectParams::default()).expect("renders");
+    assert!(!src.contains("[[upstreams]]"), "no upstreams block: {src}");
+    assert!(!src.contains("[[routes]]"), "no routes block: {src}");
+}
+
+#[test]
 fn ignore_inbound_ports_unions_admin_and_sorts() {
     let p = params_from(&[(&format!("{PREFIX}skip-inbound-ports"), "15002,9090")]).unwrap();
     assert_eq!(ignore_inbound_ports(&p), "4191,9090,15002");
@@ -165,7 +210,17 @@ fn e2e_fixture_deployment_gets_three_pieces() {
     assert_eq!(cmd[flag("--inbound-port") + 1], "4143");
     assert_eq!(cmd[flag("--outbound-port") + 1], "4140");
     assert_eq!(cmd[flag("--ignore-inbound-ports") + 1], "4191,9090,15002");
-    assert_eq!(init["securityContext"]["privileged"].as_bool(), Some(true));
+    // Narrowed init privilege envelope: root + NET_ADMIN/NET_RAW, never
+    // `privileged`.
+    assert_eq!(init["securityContext"]["runAsUser"].as_u64(), Some(0));
+    let caps: Vec<&str> = init["securityContext"]["capabilities"]["add"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(caps, vec!["NET_ADMIN", "NET_RAW"]);
+    assert!(init["securityContext"].get("privileged").is_none());
 
     // b. sidecar: uid, three ports, config mount, opaque env passthrough.
     let sidecars: Vec<&serde_yaml::Value> = spec["containers"]
@@ -261,8 +316,50 @@ fn bare_pod_injects_at_spec() {
 
 #[test]
 fn run_cli_exit_codes() {
-    assert_eq!(run_cli(fixture().as_bytes(), std::io::sink()), 0);
-    assert_eq!(run_cli("kind: Service\n".as_bytes(), std::io::sink()), 1);
-    assert_eq!(run_cli("".as_bytes(), std::io::sink()), 1);
-    assert_eq!(run_cli("a: [1,\n".as_bytes(), std::io::sink()), 1);
+    let no_args: Vec<String> = Vec::new();
+    assert_eq!(run_cli(&no_args, fixture().as_bytes(), std::io::sink()), 0);
+    assert_eq!(run_cli(&no_args, "kind: Service\n".as_bytes(), std::io::sink()), 1);
+    assert_eq!(run_cli(&no_args, "".as_bytes(), std::io::sink()), 1);
+    assert_eq!(run_cli(&no_args, "a: [1,\n".as_bytes(), std::io::sink()), 1);
+    // Bad flags exit 2 (iptables-init convention); -h prints usage, exit 0.
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(run_cli(&argv(&["--bogus"]), "".as_bytes(), std::io::sink()), 2);
+    assert_eq!(run_cli(&argv(&["--image"]), "".as_bytes(), std::io::sink()), 2);
+    assert_eq!(run_cli(&argv(&["-h"]), "".as_bytes(), std::io::sink()), 0);
+}
+
+#[test]
+fn image_flag_overrides_both_containers() {
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // a. --image REF: both the init container and the sidecar carry it.
+    let opts = parse_cli_args(&argv(&["--image", "reg.example/openrusty:1.2.3"])).unwrap();
+    assert_eq!(opts.image.as_deref(), Some("reg.example/openrusty:1.2.3"));
+    let out = run_with_image(&fixture(), "reg.example/openrusty:1.2.3").unwrap();
+    let workload: serde_yaml::Value =
+        serde_yaml::from_str(out.split("\n---\n").next().unwrap()).unwrap();
+    let spec = &workload["spec"]["template"]["spec"];
+    assert_eq!(
+        spec["initContainers"][0]["image"].as_str(),
+        Some("reg.example/openrusty:1.2.3")
+    );
+    assert_eq!(
+        spec["containers"].as_sequence().unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some(SIDECAR_NAME))
+            .unwrap()["image"]
+            .as_str(),
+        Some("reg.example/openrusty:1.2.3")
+    );
+    // The `--image=REF` spelling parses identically.
+    let opts = parse_cli_args(&argv(&["--image=reg.example/openrusty:1.2.3"])).unwrap();
+    assert_eq!(opts.image.as_deref(), Some("reg.example/openrusty:1.2.3"));
+
+    // b. unknown flag is a parse error.
+    assert!(parse_cli_args(&argv(&["--bogus"])).is_err());
+
+    // c. no flag: the default IMAGE const lands in both containers.
+    assert!(parse_cli_args(&[]).unwrap().image.is_none());
+    let out = run(&fixture()).unwrap();
+    assert!(out.contains(IMAGE), "default image rendered: {IMAGE}");
 }
