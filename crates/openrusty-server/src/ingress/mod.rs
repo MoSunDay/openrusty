@@ -288,7 +288,7 @@ pub async fn run(state: Arc<AppState>, ingress: IngressConfig, static_routes: Ve
         while rx.changed().await.is_ok() {
             tokio::time::sleep(MERGE_DEBOUNCE).await;
             let pair = rx.borrow_and_update().clone();
-            apply_pair(&apply_state, &base, &static_routes, &apply_class, &pair);
+            apply_pair(&apply_state, &base, &static_routes, &apply_class, &pair).await;
         }
     });
 
@@ -301,7 +301,7 @@ pub async fn run(state: Arc<AppState>, ingress: IngressConfig, static_routes: Ve
 
 /// One synthetic-snapshot apply: render, merge, compose, publish. Every
 /// failure path logs and returns WITHOUT touching the runtime.
-fn apply_pair(
+async fn apply_pair(
     state: &AppState,
     base: &Config,
     static_routes: &[RouteConfig],
@@ -344,6 +344,10 @@ fn apply_pair(
         }
     };
     let cfg = build_ingress_config(base, merged_routes, rendered_upstreams, &tls);
+    // DNS endpoints (service-discovered upstreams) fold into concrete
+    // peers here, off the request path; an unresolved service leaves
+    // that upstream peer-less until the next watch event re-renders.
+    let cfg = openrusty_proxy::resolve::resolve_config(&cfg).await;
     // Outbound TLS material is built before anything is published; a
     // failure keeps the previous runtime, like every other render error.
     let tls_plans = match state::build_tls_plans(&cfg) {

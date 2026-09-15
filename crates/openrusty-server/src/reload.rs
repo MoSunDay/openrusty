@@ -48,6 +48,9 @@ impl std::error::Error for ReloadError {}
 /// snapshot, so any failure (compile, ABI) leaves both the old plugin
 /// snapshot and the old runtime untouched.
 async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError> {
+    // DNS endpoints (service-discovered upstreams) fold into concrete
+    // peers here, off the request path; failures degrade per-upstream.
+    let cfg = &openrusty_proxy::resolve::resolve_config(cfg).await;
     // Build the upstream TLS plans first: a bad certificate must abort the
     // swap before the plugin registry compiles anything, leaving the old
     // snapshot and the old runtime untouched.
