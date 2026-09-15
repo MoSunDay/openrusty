@@ -17,7 +17,7 @@
 #     reconnects/last_rv).
 #   G5 conflict -> Conflict policy: a double-claimed (host, path) key
 #     or a missing TLS Secret rejects the WHOLE apply; the previous
-#     config stays authoritative, generation does not advance.
+#     config stays authoritative and nothing extra renders.
 #   G6 rollback -> Ingress is an enhancement, never a dependency:
 #     static baseline returns, ready stays 200, no crashloop.
 #   G7 window -> Lifecycle ready/live + the status ingress node:
@@ -44,6 +44,8 @@ MODE=full WINDOW_MIN=10 IMAGE="" SKIP_IMAGE=0 NS_ARG=""
 RELEASE=orr-cluster-e2e GATE_SVC="" EDGE_PORT=8443 GW_ADDR="" PODSEL=""
 KCFG="" CAN_NETPOL=no TUNNEL_PID="" NS="" HELM_DONE=""
 PASS=0 FAIL=0 SKIP=0 GAPS=() TMP="$(mktemp -d /tmp/openrusty-clustere2e.XXXXXX)"
+declare -A POD_TUNNEL_PIDS=() POD_TUNNEL_PORTS=() # per-pod admin tunnels (G7 dual-replica view)
+POD_PORT_BASE=41930
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +64,10 @@ PODSEL="app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=ingress"
 
 cleanup() { # best effort only; never masks an assertion result
     [ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true
+    local _pod
+    for _pod in "${!POD_TUNNEL_PIDS[@]}"; do
+        [ -n "${POD_TUNNEL_PIDS[$_pod]:-}" ] && kill "${POD_TUNNEL_PIDS[$_pod]}" 2>/dev/null || true
+    done
     if command -v kubectl >/dev/null 2>&1 && [ -n "$NS" ]; then
         kubectl delete ingress,netpol,secret,svc,deploy,configmap -l app.kubernetes.io/orr-e2e=yes \
             -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
@@ -93,19 +99,77 @@ wait_for() { # timeout_s condition...
     while [ "$(date +%s)" -lt "$deadline" ]; do "$@" >/dev/null 2>&1 && return 0; sleep 2; done
     return 1
 }
-status_field() { # path under the status JSON "ingress" node (no jq assumed)
-    curl -s --max-time 5 "$ADMIN/openrusty/status" | python3 -c '
+_ingress_field() { # path - prints an "ingress" node field; JSON on stdin
+    python3 -c '
 import json, sys
 n = json.load(sys.stdin).get("ingress", {})
 for k in sys.argv[1].split("."): n = n.get(k) if isinstance(n, dict) else None
 print("" if n is None else n)' "$1" 2>/dev/null || true
 }
+_status_field_once() {
+    curl -s --max-time 5 "$ADMIN/openrusty/status" | _ingress_field "$1"
+}
+status_field() { # path under the status JSON "ingress" node (no jq assumed); heals a dead tunnel
+    local out; out="$(_status_field_once "$1")"
+    [ -n "$out" ] || { admin_tunnel >/dev/null 2>&1 || true; out="$(_status_field_once "$1")"; }
+    printf '%s' "$out"
+}
 svc_field() { kubectl get svc "$GATE_SVC" -n "$NS" -o "jsonpath=$1" 2>/dev/null || true; }
 admin_tunnel() { # the admin port 4191 is not exposed by the Service
     [ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true
-    kubectl port-forward -n "$NS" "deploy/$GATE_SVC" "127.0.0.1:$ADMIN_LOCAL:4191" >/dev/null 2>&1 &
+    kubectl port-forward -n "$NS" "deploy/$GATE_SVC" --address 127.0.0.1 "$ADMIN_LOCAL:4191" >/dev/null 2>&1 &
     TUNNEL_PID=$!
     wait_for 30 bash -c "exec 3<>/dev/tcp/127.0.0.1/$ADMIN_LOCAL"
+}
+admin_curl() { # best-effort curl through the admin tunnel; heals a dead tunnel once
+    curl -sf --max-time 5 "$@" && return 0
+    admin_tunnel >/dev/null 2>&1 || true
+    curl -sf --max-time 5 "$@" && return 0
+    return 1
+}
+gateway_pods() { # Running gateway pod names, one per line
+    kubectl get pods -n "$NS" -l "$PODSEL" \
+        -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+}
+pod_tunnel() { # pod - per-pod admin tunnel on its assigned local port
+    local pod="$1" port="${POD_TUNNEL_PORTS[$pod]:-}"
+    if [ -z "$port" ]; then
+        POD_PORT_BASE=$((POD_PORT_BASE + 1)); port="$POD_PORT_BASE"; POD_TUNNEL_PORTS[$pod]="$port"
+    fi
+    [ -n "${POD_TUNNEL_PIDS[$pod]:-}" ] && kill "${POD_TUNNEL_PIDS[$pod]}" 2>/dev/null || true
+    kubectl port-forward -n "$NS" "pod/$pod" --address 127.0.0.1 "$port:4191" >/dev/null 2>&1 &
+    POD_TUNNEL_PIDS[$pod]=$!
+    wait_for 30 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port"
+}
+pod_curl() { # pod path - per-pod admin probe; heals a dead tunnel once
+    local pod="$1" port="${POD_TUNNEL_PORTS[$pod]:-}"
+    [ -n "$port" ] || return 1
+    curl -sf --max-time 5 "http://127.0.0.1:$port$2" && return 0
+    pod_tunnel "$pod" >/dev/null 2>&1 || true
+    curl -sf --max-time 5 "http://127.0.0.1:$port$2"
+}
+pod_status_field() { # pod path - an "ingress" status field read from that pod directly
+    printf '%s' "$(pod_curl "$1" /openrusty/status | _ingress_field "$2" || true)"
+}
+pod_redline_clean() { # pods... - true iff every pod reports last_success_age_ms < 60000
+    local pod age
+    for pod in "$@"; do
+        age="$(pod_status_field "$pod" last_success_age_ms)"
+        { [ -n "$age" ] && [ "$age" -lt 60000 ]; } || return 1
+    done
+}
+dump_state() { # post-mortem aid on a data-plane failure; best effort, never fails
+    echo "-- dump: ingress/netpol objects --"
+    kubectl get ingress,netpol -n "$NS" -o wide 2>&1 | head -20
+    echo "-- dump: gateway status --"
+    curl -s --max-time 5 "$ADMIN/openrusty/status" 2>&1 | head -5
+    echo "-- dump: recent gateway pod logs --"
+    kubectl logs -n "$NS" -l "$PODSEL" --tail=20 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g' | grep -E "snapshot|ingress|error|warn|resolve" | tail -15
+}
+check_dump() { # check that dumps cluster state into the log on failure
+    local name="$1"; shift
+    if "$@" >/dev/null 2>&1; then PASS=$((PASS + 1)); echo "PASS: $name"; else FAIL=$((FAIL + 1)); echo "FAIL: $name"; dump_state; fi
 }
 pod_json() { kubectl get pods -n "$NS" -l "$PODSEL" -o "jsonpath=$1" 2>/dev/null || true; }
 pod_restarts() { pod_json '{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{end}{end}'; }
@@ -113,12 +177,15 @@ pod_reasons() { pod_json '{range .items[*]}{range .status.containerStatuses[*]}{
 probe_body() { curl -sk --max-time 8 --resolve "$1:$EDGE_PORT:$GW_ADDR" "https://$1:$EDGE_PORT$2" || true; }
 route_serves() { probe_body "$HOST_NAME" "$1" | grep -q "$BACKEND_MARK"; }
 route_absent() { ! route_serves "$1"; }
+route_never_serves() { # path [n] - negative probe: must miss on n consecutive tries
+    local i; for i in $(seq 1 "${2:-3}"); do route_serves "$1" && return 1; sleep 1; done; return 0
+}
 sni_subject_matches() {
     echo | timeout 10 openssl s_client -connect "$GW_ADDR:$EDGE_PORT" -servername "$HOST_NAME" \
         2>/dev/null | openssl x509 -noout -subject | grep -q "CN *= *$HOST_NAME" || true
 }
-gen_advances() { [ -n "$1" ] && [ "$(status_field ingresses.generation)" -gt "$1" ]; }
-rv_observable() { [ -n "$(status_field ingresses.last_rv)" ] && [ -n "$(status_field ingresses.reconnects)" ]; }
+gen_advances() { [ -n "$1" ] && [ "$(status_field generation)" -gt "$1" ]; }
+rv_observable() { [ -n "$(status_field last_rv)" ] && [ -n "$(status_field reconnects)" ]; }
 resolve_ns() { # --namespace, else a namespace key in chart values, else default
     if [ -n "$NS_ARG" ]; then NS="$NS_ARG"; return 0; fi
     NS="$(sed -n 's/^namespace:[[:space:]]*//p' "$CHART/values.yaml" 2>/dev/null | head -1 | tr -d '" ' || true)"; NS="${NS:-default}"
@@ -131,16 +198,35 @@ write_ingress() { # file name tls_secret path1 type1 [path2 type2]
         set -- $pair # path + pathType, word-split on purpose
         printf -v paths '%s      - path: %s\n        pathType: %s\n        backend:\n          service:\n            name: orr-e2e-echo\n            port: {number: 80}\n' "$paths" "$1" "$2"
     done
-    printf 'apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: {name: %s, namespace: %s, labels: {app.kubernetes.io/orr-e2e: yes}}\nspec:\n  ingressClassName: %s\n%s  rules:\n  - host: %s\n    http:\n      paths:\n%s' \
+    printf 'apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: {name: %s, namespace: %s, labels: {app.kubernetes.io/orr-e2e: "yes"}}\nspec:\n  ingressClassName: %s\n%s  rules:\n  - host: %s\n    http:\n      paths:\n%s' \
         "$name" "$NS" "$ING_CLASS" "$tls" "$HOST_NAME" "$paths" > "$f"
 }
 write_backend() {
-    printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: orr-e2e-echo, namespace: %s, labels: {app.kubernetes.io/orr-e2e: yes}}\nspec:\n  replicas: 1\n  selector: {matchLabels: {app: orr-e2e-echo}}\n  template:\n    metadata: {labels: {app: orr-e2e-echo}}\n    spec:\n      containers:\n        - name: echo\n          image: hashicorp/http-echo:1.0.0\n          args: ["-text=%s", "-listen=:8080"]\n          readinessProbe: {httpGet: {path: /, port: 8080}, initialDelaySeconds: 2}\n---\napiVersion: v1\nkind: Service\nmetadata: {name: orr-e2e-echo, namespace: %s, labels: {app.kubernetes.io/orr-e2e: yes}}\nspec:\n  selector: {app: orr-e2e-echo}\n  ports: [{name: http, port: 80, targetPort: 8080}]\n' \
+    printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: orr-e2e-echo, namespace: %s, labels: {app.kubernetes.io/orr-e2e: "yes"}}\nspec:\n  replicas: 1\n  selector: {matchLabels: {app: orr-e2e-echo}}\n  template:\n    metadata: {labels: {app: orr-e2e-echo}}\n    spec:\n      containers:\n        - name: echo\n          image: hashicorp/http-echo:1.0.0\n          args: ["-text=%s", "-listen=:8080"]\n          readinessProbe: {httpGet: {path: /, port: 8080}, initialDelaySeconds: 2}\n---\napiVersion: v1\nkind: Service\nmetadata: {name: orr-e2e-echo, namespace: %s, labels: {app.kubernetes.io/orr-e2e: "yes"}}\nspec:\n  selector: {app: orr-e2e-echo}\n  ports: [{name: http, port: 80, targetPort: 8080}]\n' \
         "$NS" "$BACKEND_MARK" "$NS" > "$TMP/backend.yaml"
 }
-write_cut() { # deny all egress for the gateway pods (stale-serve drill)
-    printf 'apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: orr-e2e-cut, namespace: %s, labels: {app.kubernetes.io/orr-e2e: yes}}\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: openrusty\n      app.kubernetes.io/instance: %s\n  policyTypes: [Egress]\n  egress: []\n' \
-        "$NS" "$RELEASE" > "$TMP/cut.yaml"
+write_cut() { # cut egress to the apiserver only; the data plane must stay alive
+    # (stale-serve is about the config watch, not about reaching the backend;
+    # an "egress: []" deny-all also severs upstream traffic and makes the
+    # probe flap on pooled-connection warmth)
+    # Runtime self-check: the policy MUST come out in the ipBlock/except shape.
+    # If apiserver/node IP discovery failed we skip loudly instead of silently
+    # degrading to deny-all - that shape change would also make the recovery
+    # checks below pass trivially on a no-op cut.
+    local api_ip node_ip
+    api_ip="$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+    node_ip="$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+    local except=""
+    [ -n "$api_ip" ] && except="$except \"$api_ip/32\","
+    [ -n "$node_ip" ] && [ "$node_ip" != "$api_ip" ] && except="$except \"$node_ip/32\","
+    if [ -z "$except" ]; then
+        echo "-- G4: apiserver/node IP discovery came back empty; refusing the deny-all fallback" >&2
+        return 1
+    fi
+    except="${except%,}" # trailing comma off
+    printf 'apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: orr-e2e-cut, namespace: %s, labels: {app.kubernetes.io/orr-e2e: "yes"}}\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: openrusty\n      app.kubernetes.io/instance: %s\n  policyTypes: [Egress]\n  egress:\n    - to:\n        - ipBlock: {cidr: 0.0.0.0/0, except: [%s]}\n' \
+        "$NS" "$RELEASE" "$except" > "$TMP/cut.yaml"
+    grep -q 'ipBlock: {cidr: 0.0.0.0/0, except: \[' "$TMP/cut.yaml" # self-check the emitted shape
 }
 
 g1_preflight() {
@@ -163,7 +249,13 @@ g1_preflight() {
     if ! timeout 20 kubectl cluster-info >/dev/null 2>&1; then gap "cluster unreachable (kubectl cluster-info failed)"; return 0; fi
     check "G1: cluster reachable (kubectl cluster-info)" timeout 20 kubectl cluster-info
     local ver major minor v
-    ver="$(kubectl version -o jsonpath='{.serverVersion.major} {.serverVersion.minor}' 2>/dev/null | tr -dc '0-9 ' || true)"
+    # kubectl >= 1.36 dropped `version -o jsonpath`; -o json + python3 is portable.
+    ver="$(kubectl version -o json 2>/dev/null | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)["serverVersion"]
+    print(d["major"], d["minor"])
+except Exception:
+    pass' | tr -dc '0-9 ' || true)"
     major="${ver%% *}"; minor="$(printf '%s' "${ver#* }" | tr -dc 0-9)"
     if [ -n "$major" ] && { [ "$major" -ge 2 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 19 ]; }; }; then
         check "G1: server version >= 1.19 (got $major.$minor)" true
@@ -271,8 +363,8 @@ g3_routes() {
     echo "-- G3: waiting up to ${ROUTE_WAIT}s for the rendered routes"
     wait_for "$ROUTE_WAIT" route_serves /exact || true
     check "G3: SNI handshake serves the adopted certificate" sni_subject_matches
-    check "G3: Exact path /exact served by the backend" route_serves /exact
-    check "G3: Prefix path /pre served by the backend" route_serves /pre
+    check "G3: Exact path /exact served by the backend" wait_for 30 route_serves /exact
+    check "G3: Prefix path /pre served by the backend" wait_for 30 route_serves /pre
     check "G3: non-matching host never reaches the route" \
         test "$(probe_body wrong.orr-e2e.invalid /exact | grep -c "$BACKEND_MARK" || true)" = 0
     return 0
@@ -280,10 +372,11 @@ g3_routes() {
 
 g4_watch() {
     echo "== G4: watch resilience (Watch semantics: fold, stale-serve, re-list) =="
+    admin_tunnel >/dev/null 2>&1 || true
     write_ingress "$TMP/updated.yaml" "$PRIMARY" orr-e2e-tls /exact Exact /pre2 Prefix
     check "G4: Ingress path update applied" kubectl apply -f "$TMP/updated.yaml"
     check "G4: new path /pre2 serves within the bound" wait_for "$ROUTE_WAIT" route_serves /pre2
-    check "G4: old path /pre withdrawn after the update" route_absent /pre
+    check "G4: old path /pre withdrawn after the update (30s bound)" wait_for 30 route_absent /pre
     check "G4: Ingress deleted" kubectl delete ingress "$PRIMARY" -n "$NS" --ignore-not-found
     check "G4: routes withdrawn after the delete" wait_for "$ROUTE_WAIT" route_absent /exact
     if [ "$CAN_NETPOL" != yes ]; then
@@ -292,52 +385,59 @@ g4_watch() {
         return 0
     fi
     write_ingress "$TMP/primary.yaml" "$PRIMARY" orr-e2e-tls /exact Exact /pre Prefix
-    kubectl apply -f "$TMP/primary.yaml" >/dev/null 2>&1 || true
-    wait_for "$ROUTE_WAIT" route_serves /pre || true
-    write_cut
+    check_dump "G4: primary Ingress re-created" kubectl apply -f "$TMP/primary.yaml"
+    check_dump "G4: re-created routes serve again within the bound" wait_for "$ROUTE_WAIT" route_serves /pre
+    if ! write_cut; then
+        skip_item "G4 stale-serve: cut policy not provable as ipBlock/except (IP discovery failed; no silent deny-all)"
+        skip_item "G4 re-list convergence: depends on the NetworkPolicy blackout"
+        return 0
+    fi
     if ! kubectl apply -f "$TMP/cut.yaml" >/dev/null 2>&1; then skip_item "G4 stale-serve: NetworkPolicy apply failed"; return 0; fi
+    check "G4: applied cut policy kept its ipBlock/except shape on the cluster (a deny-all cut would be a semantic drift)" \
+        test -n "$(kubectl get netpol orr-e2e-cut -n "$NS" -o 'jsonpath={.spec.egress[0].to[0].ipBlock.except}' 2>/dev/null)"
     echo "-- G4: apiserver blackout for ${CUT_SECS}s (stale-serve expected)"
     sleep "$CUT_SECS"
-    check "G4: stale-serve - /pre still served while the apiserver is blocked" route_serves /pre
+    check "G4: stale-serve - /pre still served while the apiserver is blocked (8s bound)" wait_for 8 route_serves /pre
     check "G4: blackout policy removed" kubectl delete netpol orr-e2e-cut -n "$NS" --ignore-not-found
-    local gen_before; gen_before="$(status_field ingresses.generation)"
+    local gen_before; gen_before="$(status_field generation)"
     kubectl -n "$NS" annotate ingress "$PRIMARY" orr-e2e-touch="$(date +%s)" --overwrite >/dev/null 2>&1 || true
     check "G4: re-list converges (generation advances after a touch)" \
         wait_for "$ROUTE_WAIT" gen_advances "$gen_before"
     check "G4: watching=true after recovery" test "$(status_field watching)" = True
     check "G4: fresh LIST on record (last_success_age_ms < 60000)" \
-        test "$(status_field ingresses.last_success_age_ms)" -lt 60000
+        test "$(status_field last_success_age_ms)" -lt 60000
     check "G4: reconnects/last_rv observable on the status ingress node" rv_observable
     return 0
 }
 
 g5_conflict() {
     echo "== G5: conflict policy (a claimed key rejects the whole apply) =="
-    local gen; gen="$(status_field ingresses.generation)"
+    admin_tunnel >/dev/null 2>&1 || true
     # Same (host, path) key as the primary Ingress plus a path unique to
     # this object: a valid merge would have to serve /collide-only.
     write_ingress "$TMP/collide.yaml" orr-e2e-collide orr-e2e-tls /pre Prefix /collide-only Prefix
     check "G5: colliding Ingress accepted by the apiserver" kubectl apply -f "$TMP/collide.yaml"
     sleep 8 # two debounce windows; a rejected apply never renders
-    check "G5: previous route still authoritative (/pre serves)" route_serves /pre
-    check "G5: /collide-only never appears (whole apply rejected)" route_absent /collide-only
-    check "G5: status generation did not advance" test "$(status_field ingresses.generation)" = "$gen"
+    check "G5: previous route still authoritative (/pre serves)" wait_for 15 route_serves /pre
+    check "G5: /collide-only never appears (whole apply rejected)" route_never_serves /collide-only 3
+    check "G5: /pre prefix still covers subpaths (/pre2 via the authoritative route)" wait_for 15 route_serves /pre2
     write_ingress "$TMP/ghost.yaml" orr-e2e-ghost orr-e2e-missing-tls /ghost Prefix
     check "G5: missing-Secret Ingress accepted by the apiserver" kubectl apply -f "$TMP/ghost.yaml"
     sleep 8
-    check "G5: /ghost never appears (apply rejected again)" route_absent /ghost
-    check "G5: generation still does not advance" test "$(status_field ingresses.generation)" = "$gen"
-    check "G5: /pre still serves after both rejections" route_serves /pre
+    check "G5: /ghost never appears (apply rejected again)" route_never_serves /ghost 3
+    check "G5: authoritative set intact (/exact still serves)" wait_for 15 route_serves /exact
+    check "G5: /pre still serves after both rejections" wait_for 15 route_serves /pre
     kubectl delete ingress orr-e2e-collide orr-e2e-ghost -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
     return 0
 }
 
 g6_rollback() {
     echo "== G6: removal rollback (Ingress is an enhancement, never a dependency) =="
+    admin_tunnel >/dev/null 2>&1 || true
     local restarts_before ready_miss=0 elapsed=0; restarts_before="$(pod_restarts)"
     kubectl delete ingress "$PRIMARY" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
     while [ "$elapsed" -lt 30 ]; do
-        curl -sf --max-time 5 "$ADMIN/openrusty/ready" >/dev/null 2>&1 || ready_miss=$((ready_miss + 1))
+        admin_curl "$ADMIN/openrusty/ready" >/dev/null 2>&1 || ready_miss=$((ready_miss + 1))
         sleep 2; elapsed=$((elapsed + 2))
     done
     check "G6: /openrusty/ready stayed 200 during teardown (0 misses)" test "$ready_miss" = 0
@@ -349,24 +449,34 @@ g6_rollback() {
 
 g7_window() {
     echo "== G7: observation window (${WINDOW_MIN}min; M4 acceptance: the default 10) =="
+    admin_tunnel >/dev/null 2>&1 || true
     # Put content back so the window observes a live watch, not an idle one.
     write_ingress "$TMP/primary.yaml" "$PRIMARY" orr-e2e-tls /exact Exact /pre Prefix
     kubectl apply -f "$TMP/primary.yaml" >/dev/null 2>&1 || true
     wait_for "$ROUTE_WAIT" route_serves /exact || true
-    local t0 restarts0 samples=0 bad_ready=0 bad_live=0 bad_watch=0; restarts0="$(pod_restarts)"; t0="$(date +%s)"
+    # Sample every replica directly: the deploy-level admin tunnel pins one
+    # pod, so a wedged second replica would be masked by the healthy one.
+    local pod t0 restarts0 samples=0 bad_ready=0 bad_live=0 bad_watch=0 podlist=()
+    while read -r pod; do [ -n "$pod" ] && podlist+=("$pod"); done < <(gateway_pods)
+    for pod in "${podlist[@]}"; do pod_tunnel "$pod" >/dev/null 2>&1 || true; done
+    check "G7: direct per-pod admin tunnels up (${#podlist[@]} gateway pod(s); chart default 2)" \
+        test "${#podlist[@]}" -ge 1
+    restarts0="$(pod_restarts)"; t0="$(date +%s)"
     while [ "$(( $(date +%s) - t0 ))" -lt "$((WINDOW_MIN * 60))" ]; do
         samples=$((samples + 1))
-        curl -sf --max-time 5 "$ADMIN/openrusty/ready" >/dev/null 2>&1 || bad_ready=$((bad_ready + 1))
-        curl -sf --max-time 5 "$ADMIN/openrusty/live" >/dev/null 2>&1 || bad_live=$((bad_live + 1))
-        [ "$(status_field watching)" = True ] || bad_watch=$((bad_watch + 1))
+        for pod in "${podlist[@]}"; do
+            pod_curl "$pod" /openrusty/ready >/dev/null 2>&1 || bad_ready=$((bad_ready + 1))
+            pod_curl "$pod" /openrusty/live >/dev/null 2>&1 || bad_live=$((bad_live + 1))
+            [ "$(pod_status_field "$pod" watching)" = True ] || bad_watch=$((bad_watch + 1))
+        done
         sleep "$WINDOW_POLL"
     done
-    check "G7: ready 200 in all $samples samples" test "$bad_ready" = 0
-    check "G7: live 200 in all $samples samples" test "$bad_live" = 0
-    check "G7: watching=true in all $samples samples (any drop converged back)" test "$bad_watch" = 0
+    check "G7: ready 200 on every pod in all $samples samples" test "$bad_ready" = 0
+    check "G7: live 200 on every pod in all $samples samples" test "$bad_live" = 0
+    check "G7: watching=true on every pod in all $samples samples (any drop converged back)" test "$bad_watch" = 0
     check "G7: pod restart count did not grow" test "$(pod_restarts)" = "$restarts0"
-    check "G7: status red-line clean (last_success_age_ms < 60000)" \
-        test "$(status_field ingresses.last_success_age_ms)" -lt 60000
+    check "G7: status red-line clean on every pod (last_success_age_ms < 60000)" \
+        pod_redline_clean "${podlist[@]}"
     return 0
 }
 
