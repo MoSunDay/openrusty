@@ -80,6 +80,11 @@ const EVENT_BOOKMARK_110: &str = r#"{"type":"BOOKMARK","object":{"apiVersion":"n
 /// bookmark handed out; a re-list must never rewind past it.
 const LIST_RV_110: &str = r#"{"metadata":{"resourceVersion":"110"},"items":[{"metadata":{"name":"app","namespace":"web","resourceVersion":"110"},"spec":{"ingressClassName":"openrusty","rules":[{"host":"app.example.com","http":{"paths":[{"path":"/v2","pathType":"Prefix","backend":{"service":{"name":"example-svc","port":{"number":8001}}}}]}}]}},{"metadata":{"name":"second","namespace":"web","resourceVersion":"101"},"spec":{"ingressClassName":"openrusty","rules":[{"host":"second.example.com","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"second-svc","port":{"number":8100}}}}]}}]}}]}"#;
 
+/// Modeled exactly on [`LIST_RV_110`], but rv=200 in the envelope AND the
+/// first item's metadata: what a re-list answers after changes the silent
+/// stream never delivered. The second item stays at rv=101 (2 items).
+const LIST_RV_200: &str = r#"{"metadata":{"resourceVersion":"200"},"items":[{"metadata":{"name":"app","namespace":"web","resourceVersion":"200"},"spec":{"ingressClassName":"openrusty","rules":[{"host":"app.example.com","http":{"paths":[{"path":"/v2","pathType":"Prefix","backend":{"service":{"name":"example-svc","port":{"number":8001}}}}]}}]}},{"metadata":{"name":"second","namespace":"web","resourceVersion":"101"},"spec":{"ingressClassName":"openrusty","rules":[{"host":"second.example.com","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"second-svc","port":{"number":8100}}}}]}}]}}]}"#;
+
 fn list_response(body: &str) -> Response<FakeBody> {
     scripted_response(
         vec![(Duration::ZERO, Bytes::from(body.to_string()))],
@@ -258,6 +263,51 @@ async fn serve(listener: TcpListener, state: Arc<FakeState>) {
     }
 }
 
+/// Resync script: every watch stream is silent and held open forever (the
+/// half-open-stream scenario - no frame, no EOF, no error), so only the
+/// resync tick can ever restart the cycle:
+///
+/// | # | request      | scripted response   |
+/// |---|--------------|---------------------|
+/// | 0 | LIST         | 200, rv=100, 1 item |
+/// | 1 | WATCH rv=100 | silent, held open   |
+/// | 2 | LIST         | 200, rv=200, 2 items|
+/// | 3 | WATCH rv=200 | silent, held open   |
+/// | 4+| either       | watch: silent held; list: rv=200 |
+async fn handle_resync(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<FakeState>,
+) -> std::result::Result<Response<FakeBody>, std::convert::Infallible> {
+    state.record(&req);
+    let n = state.served.load(Ordering::SeqCst) - 1;
+    let is_watch = req.uri().query().unwrap_or_default().contains("watch=1");
+    if is_watch {
+        return Ok(scripted_response(vec![], None, true));
+    }
+    Ok(match n {
+        0 => list_response(LIST_RV_100),
+        _ => list_response(LIST_RV_200),
+    })
+}
+
+async fn serve_resync(listener: TcpListener, state: Arc<FakeState>) {
+    loop {
+        let (tcp, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(_) => return,
+        };
+        let st = state.clone();
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(tcp),
+                    service_fn(move |req| handle_resync(req, st.clone())),
+                )
+                .await;
+        });
+    }
+}
+
 /// Plain-HTTP [`WatchSource`] for the fake: same shape as `Client`'s impl,
 /// minus TLS.
 #[derive(Clone)]
@@ -299,6 +349,9 @@ impl WatchSource for FakeSource {
 struct Observed {
     events: Mutex<Vec<(u64, String, usize)>>,
     snapshots: Mutex<Vec<Snapshot<Ingress>>>,
+    /// `(lists, reconnects)` at each callback, same push pattern as
+    /// `events`; the scripted-order test ignores it.
+    stats: Mutex<Vec<(u64, u64)>>,
 }
 
 async fn wait_for_generation(observed: &Observed, generation: u64, state: &FakeState) {
@@ -337,6 +390,8 @@ async fn watch_loop_relists_and_reconnects_against_fake_apiserver() {
     let opts = WatchOptions {
         debounce: DEBOUNCE,
         ingress_class: "openrusty".to_string(),
+        // Deterministic scripted order; resync has its own test.
+        resync: None,
     };
 
     tokio::select! {
@@ -397,4 +452,93 @@ async fn watch_loop_relists_and_reconnects_against_fake_apiserver() {
     assert!(log[3].contains("watch=1") && log[3].contains("resourceVersion=102"));
     assert!(log[4].ends_with(PATH));
     assert!(log[5].contains("watch=1") && log[5].contains("resourceVersion=110"));
+}
+
+/// M4 acceptance: staleness must be bounded - a fresh LIST is always on
+/// record, so a silently dead (half-open) watch stream after an egress
+/// blackout can never pin a stale snapshot longer than one resync
+/// interval. Every scripted stream stays silent and held open (nothing
+/// ever errors or EOFs), so only the resync tick restarts the cycle: the
+/// first tick's re-list sees the rv jump 100→200 and hands it over after
+/// the usual debounce, while later ticks re-list the SAME rv=200 and skip
+/// the hand-over (quiet clusters do not churn generations).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_loop_resync_bounds_staleness_against_silent_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let state = Arc::new(FakeState::default());
+    tokio::spawn(serve_resync(listener, state.clone()));
+
+    let source = FakeSource::new(port);
+    let observed = Arc::new(Observed::default());
+    let recorder = observed.clone();
+    let opts = WatchOptions {
+        debounce: DEBOUNCE,
+        ingress_class: "openrusty".to_string(),
+        resync: Some(Duration::from_millis(150)),
+    };
+
+    // The loop must outlive the wait below: the beats under test happen
+    // after the last hand-over, and a `select!` branch would drop it the
+    // moment the wait arm wins - so it runs on its own task instead (its
+    // join handle can never resolve; that arm is the `unreachable!`).
+    let loop_task = tokio::spawn(async move {
+        watch_loop::<Ingress, _, _>(
+            &source,
+            PATH,
+            opts,
+            move |snap: &Snapshot<Ingress>, stats: &WatchStats| {
+                recorder.snapshots.lock().unwrap().push(snap.clone());
+                recorder
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push((stats.generation, stats.last_rv.clone(), snap.len()));
+                recorder
+                    .stats
+                    .lock()
+                    .unwrap()
+                    .push((stats.lists, stats.reconnects));
+            },
+        )
+        .await
+    });
+
+    tokio::select! {
+        _ = loop_task => unreachable!("watch_loop never returns on its own"),
+        _ = wait_for_generation(&observed, 2, &state) => {}
+    }
+
+    // Several resync beats at a steady rv=200: every beat re-lists, none
+    // hands over.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let events = observed.events.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![
+            (1, "100".to_string(), 1),
+            (2, "200".to_string(), 2),
+        ],
+        "the initial LIST hands over, then the resync that saw the rv jump \
+         100→200 while the watch stream stayed silent; steady-rv re-lists do \
+         not hand over"
+    );
+
+    // Resync is a re-LIST, not a reconnect: no stream ever ended, so the
+    // last recorded stats show reconnects == 0. Stats are captured at
+    // hand-over and steady-rv beats hand nothing over, so the growing LIST
+    // count is read from the server log instead (>= 3: at least one
+    // re-list beyond the two that handed over).
+    let recorded = observed.stats.lock().unwrap().clone();
+    let (_, reconnects) = *recorded.last().expect("stats recorded at hand-over");
+    assert_eq!(reconnects, 0, "resync is not a reconnect");
+    let log = state.log.lock().unwrap().clone();
+    let lists = log.iter().filter(|entry| entry.ends_with(PATH)).count();
+    assert!(lists >= 3, "resync kept re-listing: {log:?}");
+
+    assert!(
+        state.served.load(Ordering::SeqCst) >= 5,
+        "the loop kept re-listing: {log:?}"
+    );
 }

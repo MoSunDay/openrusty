@@ -83,6 +83,12 @@ fn home_kubeconfig(home: &str) -> PathBuf {
     Path::new(home).join(".kube").join("config")
 }
 
+/// True when the kubeconfig source must exist: an explicit path argument
+/// or a set (non-empty) `$KUBECONFIG`. Pure: the home default never is.
+fn strict_kubeconfig_source(explicit: bool, kubeconfig_env: Option<&str>) -> bool {
+    explicit || kubeconfig_env.is_some_and(|list| !list.trim().is_empty())
+}
+
 /// Ordered kubeconfig candidates for one resolution pass (pure).
 ///
 /// Returns the candidate group for the highest-priority source only, so a
@@ -113,9 +119,10 @@ fn kubeconfig_candidates(
 /// `explicit_path` is the override hook the server will wire to its config
 /// in a later milestone.
 pub fn load(explicit_path: Option<&Path>) -> Result<(Cluster, Credentials)> {
+    let kubeconfig_env = env::var("KUBECONFIG").ok();
     let candidates = kubeconfig_candidates(
         explicit_path,
-        env::var("KUBECONFIG").ok().as_deref(),
+        kubeconfig_env.as_deref(),
         env::var("HOME").ok().as_deref(),
     );
 
@@ -126,6 +133,14 @@ pub fn load(explicit_path: Option<&Path>) -> Result<(Cluster, Credentials)> {
         if candidate.exists() {
             return load_kubeconfig_file(candidate);
         }
+    }
+    // A missing candidate is fatal only for strict sources (an explicit
+    // path, a set $KUBECONFIG). The home-dir default is best-effort: a pod
+    // whose HOME points at a passwd-derived directory with no kubeconfig
+    // falls through to the in-cluster service account, exactly as the
+    // documented load order promises.
+    if !strict_kubeconfig_source(explicit_path.is_some(), kubeconfig_env.as_deref()) {
+        return in_cluster::load();
     }
     Err(K8sError::CredentialMissing(format!(
         "no kubeconfig found at any of: {}",
@@ -303,6 +318,17 @@ mod tests {
             kubeconfig_candidates(None, Some("   "), Some("/home/u")),
             vec![home_kubeconfig("/home/u")]
         );
+    }
+
+    #[test]
+    fn strict_only_for_explicit_or_env_sources() {
+        // The home default is best-effort; explicit path and $KUBECONFIG are strict.
+        assert!(!strict_kubeconfig_source(false, None));
+        assert!(!strict_kubeconfig_source(false, Some("")));
+        assert!(!strict_kubeconfig_source(false, Some("   ")));
+        assert!(strict_kubeconfig_source(false, Some("/a.yaml")));
+        assert!(strict_kubeconfig_source(true, None));
+        assert!(strict_kubeconfig_source(true, Some("")));
     }
 
     #[test]
