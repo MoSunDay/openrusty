@@ -107,7 +107,7 @@ for k in sys.argv[1].split("."): n = n.get(k) if isinstance(n, dict) else None
 print("" if n is None else n)' "$1" 2>/dev/null || true
 }
 _status_field_once() {
-    curl -s --max-time 5 "$ADMIN/openrusty/status" | _ingress_field "$1"
+    curl -s --max-time 5 "$ADMIN/openrusty/status" | _ingress_field "$1" || true
 }
 status_field() { # path under the status JSON "ingress" node (no jq assumed); heals a dead tunnel
     local out; out="$(_status_field_once "$1")"
