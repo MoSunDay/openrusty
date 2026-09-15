@@ -4,7 +4,7 @@
 - 同一个 `openrusty` 二进制，纯靠配置分成三种部署形态：sidecar（pod 内透明拦截）、ingress（watch Ingress + TLS Secret 动态路由）、egress（出站三态）。HTTP 连接在任一形态都走同一 8 阶段插件管线；opaque TCP 走明文隧道（不经 wasm 阶段）。
 - 权威运维面文档：[docs/sidecar.md](../../docs/sidecar.md)（端口、决策矩阵、watch 语义、部署面、安全边界均以此为准）。
 
-## 完成定义（M5 时点）
+## 完成定义
 
 ### sidecar
 - `[[server.listeners]]` 按 role（inbound/outbound/admin）拆分监听面；空 listeners 时从 `server.listen` 派生单 inbound（向后兼容）。
@@ -19,7 +19,7 @@
 
 ### ingress
 - `[ingress]`（enabled/ingress_class/kubeconfig/namespaces）：watch `networking.k8s.io/v1` Ingress + `kubernetes.io/tls` Secret，渲染为动态路由。
-- watch 语义：LIST→WATCH→410 re-list，指数退避 100ms→30s，200ms 防抖；**stale-serve：快照只换不清**，apiserver 不可达时继续用最后快照。
+- watch 语义：LIST→WATCH→410 re-list，指数退避 100ms→30s，200ms 防抖；**stale-serve：快照只换不清**，apiserver 不可达时继续用最后快照；周期性 resync：每 30s 重启 LIST→WATCH 周期，静默死流（半开 TCP）也不会长期钉住旧快照，rv 未变的 re-list 不触发下发。
 - 冲突策略：static∩rendered 路由键（host+path_prefix+exact）冲突 → 拒绝整次 apply、保留旧运行时；TLS Secret 缺失/类型不对同罪。
 - TLS：SNI 动态证书（ingress 命中优先，静态对兜底 SNI miss；两者皆无则握手失败）；轮换不断在途连接。
 - upstream 直拨 ClusterIP DNS（`ing-{ns}-{svc}-{port}` → `svc.ns.svc.cluster.local:port`），被动健康禁用（`max_fails = 0`）；路由支持 exact + host 约束。
@@ -27,10 +27,10 @@
 - 观测面：`/openrusty/status` 的 `ingress` 节（enabled/watching/generation/last_rv/reconnects/last_success_age_ms + secrets）。
 - 验收入口：`scripts/cluster-e2e.sh`（M4 集群 e2e 七组断言 + 10min 观察窗；`--preflight` 无集群可跑，见 [changelog](../changelog/2026-09-01/cluster-e2e.md)）。
 
-## 部署面（同属本批能力）
+## 部署面
 - `openrusty iptables-init`：nat REDIRECT 参数面（OPENRUSTY_IN/OPENRUSTY_OUT custom chain、owner 豁免第一条、幂等、preflight 自检、--dry-run）。
 - `openrusty inject`：静态注入（v1 边界：单 YAML 文档、opaque-ports 仅透传 env），见 [docs/inject.md](../../docs/inject.md)。
-- Helm chart 三件套（ingress / egress-gateway / demo），`scripts/chart-lint.sh`（24 checks）+ chart-vs-CLI 一致性演练。
+- Helm chart 三件套（ingress / egress-gateway / demo），`scripts/chart-lint.sh`（30 checks）+ chart-vs-CLI 一致性演练。
 - 生命周期：三段式 shutdown（SIGTERM 与 `POST /openrusty/shutdown` 同一路径）；`/openrusty/ready` draining 时 503、`/openrusty/live` 恒 200；`shutdown_grace_ms`（默认 5000）。
 
 ## 不含什么（P2/P3 边界）
