@@ -25,7 +25,8 @@
 //! only in the command name, the rule syntax is shared.
 //!
 //! Order inside `OPENRUSTY_OUT` is load-bearing and locked by tests:
-//! owner RETURN (never loop the proxy) -> ignore-outbound-ports RETURN ->
+//! loopback RETURN (pod-local traffic must never be hijacked) -> owner
+//! RETURN (never loop the proxy) -> ignore-outbound-ports RETURN ->
 //! skip-subnets RETURN -> full-port REDIRECT.
 //!
 //! Self-checks run before any mutation (fail-fast, like an init container):
@@ -195,7 +196,14 @@ pub fn build_rules(params: InitParams) -> Vec<String> {
     let mut rules = Vec::new();
     // Inbound: everything that arrives at the pod is hijacked into the
     // inbound listener, except the ignore ports (admin stays reachable).
+    // Loopback is exempt first: pod-local traffic (app <-> sidecar on
+    // localhost) must never be hijacked - the gateway's loop guard would
+    // reject a redirected localhost hit (orig_dst is an own port), so
+    // without this RETURN our own rules would break localhost entirely.
     rules.extend(chain_setup(CHAIN_IN, "PREROUTING"));
+    rules.push(format!(
+        "iptables -t nat -A {CHAIN_IN} -p tcp -i lo -m comment --comment {COMMENT} -j RETURN"
+    ));
     for port in &params.ignore_inbound_ports {
         rules.push(format!(
             "iptables -t nat -A {CHAIN_IN} -p tcp --dport {port} -m comment --comment {COMMENT} -j RETURN"
@@ -205,9 +213,13 @@ pub fn build_rules(params: InitParams) -> Vec<String> {
         "iptables -t nat -A {CHAIN_IN} -p tcp -m comment --comment {COMMENT} -j REDIRECT --to-ports {}",
         params.inbound_port
     ));
-    // Outbound: the proxy's own dials first (no self-loop), then explicit
-    // exemptions, then the full-port REDIRECT into the outbound listener.
+    // Outbound: loopback first (pod-local contract, same reason as the
+    // inbound RETURN above), then the proxy's own dials (no self-loop),
+    // then explicit exemptions, then the full-port REDIRECT.
     rules.extend(chain_setup(CHAIN_OUT, "OUTPUT"));
+    rules.push(format!(
+        "iptables -t nat -A {CHAIN_OUT} -p tcp -o lo -m comment --comment {COMMENT} -j RETURN"
+    ));
     rules.push(format!(
         "iptables -t nat -A {CHAIN_OUT} -p tcp -m owner --uid-owner {} -m comment --comment {COMMENT} -j RETURN",
         params.proxy_uid
@@ -257,12 +269,14 @@ mod tests {
             "iptables -t nat -F OPENRUSTY_IN",
             "iptables -t nat -C PREROUTING -m comment --comment openrusty-init -j OPENRUSTY_IN",
             "iptables -t nat -I PREROUTING -m comment --comment openrusty-init -j OPENRUSTY_IN",
+            "iptables -t nat -A OPENRUSTY_IN -p tcp -i lo -m comment --comment openrusty-init -j RETURN",
             "iptables -t nat -A OPENRUSTY_IN -p tcp --dport 4191 -m comment --comment openrusty-init -j RETURN",
             "iptables -t nat -A OPENRUSTY_IN -p tcp -m comment --comment openrusty-init -j REDIRECT --to-ports 4143",
             "iptables -t nat -N OPENRUSTY_OUT",
             "iptables -t nat -F OPENRUSTY_OUT",
             "iptables -t nat -C OUTPUT -m comment --comment openrusty-init -j OPENRUSTY_OUT",
             "iptables -t nat -I OUTPUT -m comment --comment openrusty-init -j OPENRUSTY_OUT",
+            "iptables -t nat -A OPENRUSTY_OUT -p tcp -o lo -m comment --comment openrusty-init -j RETURN",
             "iptables -t nat -A OPENRUSTY_OUT -p tcp -m owner --uid-owner 65534 -m comment --comment openrusty-init -j RETURN",
             "iptables -t nat -A OPENRUSTY_OUT -p tcp --dport 443 -m comment --comment openrusty-init -j RETURN",
             "iptables -t nat -A OPENRUSTY_OUT -p tcp -m comment --comment openrusty-init -j REDIRECT --to-ports 4140",
@@ -279,12 +293,28 @@ mod tests {
         };
         let plan = build_rules(p);
         let pos = |needle: &str| plan.iter().position(|l| l.contains(needle)).expect("line present");
+        let lo = pos("-o lo");
         let owner = pos("--uid-owner 511");
         let ignore = pos("--dport 443");
         let subnet1 = pos("-d 10.0.0.0/8");
         let subnet2 = pos("-d 192.168.0.0/16");
         let redirect = plan.iter().position(|l| l.contains(CHAIN_OUT) && l.contains("REDIRECT")).unwrap();
-        assert!(owner < ignore && ignore < subnet1 && subnet1 < subnet2 && subnet2 < redirect);
+        assert!(lo < owner && owner < ignore && ignore < subnet1 && subnet1 < subnet2 && subnet2 < redirect);
+    }
+
+    #[test]
+    fn loopback_is_exempt_first_in_both_chains() {
+        // Pod-local contract: app <-> sidecar on localhost must never be
+        // hijacked, and the RETURN must precede every other chain rule.
+        let plan = build_rules(InitParams {
+            proxy_uid: 65534,
+            ignore_inbound_ports: vec![4191, 9090],
+            ..InitParams::default()
+        });
+        let first_in = plan.iter().position(|l| l.contains(&format!("-A {CHAIN_IN}"))).unwrap();
+        let first_out = plan.iter().position(|l| l.contains(&format!("-A {CHAIN_OUT}"))).unwrap();
+        assert!(plan[first_in].contains("-i lo") && plan[first_in].ends_with("-j RETURN"));
+        assert!(plan[first_out].contains("-o lo") && plan[first_out].ends_with("-j RETURN"));
     }
 
     #[test]
@@ -353,3 +383,4 @@ mod tests {
         assert!(err(&["--proxy-uid", "7", "--ignore-inbound-ports"]).contains("needs a value"));
     }
 }
+

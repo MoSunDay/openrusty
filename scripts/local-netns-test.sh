@@ -5,8 +5,9 @@
 # Topology (nothing leaks to the host; everything is cleaned on EXIT):
 #   netns orr-m1-<pid>
 #     10.123.0.2:18080  echo_upstream "app"      (HTTP workload)
-#     10.123.0.2:18081  inline python3 TCP echo  (opaque workload)
-#     10.123.0.3:18080  same app via a loopback VIP (outbound-path target)
+#     host veth peer 10.123.0.1 (NON-local inside the netns):
+#       10.123.0.1:18082  echo_upstream "app"    (outbound-path target)
+#       10.123.0.1:18083  python3 TCP echo       (opaque-path target)
 #     0.0.0.0:4143      openrusty inbound  (transparent)
 #     0.0.0.0:4140      openrusty outbound (transparent)
 #     0.0.0.0:4191      openrusty admin
@@ -17,8 +18,13 @@
 #     -> OUTPUT/OPENRUSTY_OUT:    full-port REDIRECT to 4140 (outbound)
 #   The gateway itself runs as UID 65534 so its own dials bypass the
 #   OUTPUT REDIRECT (-m owner --uid-owner 65534 -j RETURN) - otherwise
-#   the proxy would loop into itself. Inbound probes are driven from the
-#   host side through the veth, so PREROUTING is what intercepts them.
+#   the proxy would loop into itself. Loopback is exempt before anything
+#   else in both chains (-i/-o lo RETURN): pod-local traffic must never
+#   be hijacked, and every locally-owned address (127.0.0.1, the pod's
+#   own eth0 IP, the loopback VIP) egresses via `lo` - so the outbound
+#   path is driven at the non-local host veth peer. Inbound probes are
+#   driven from the host side through the veth, so PREROUTING is what
+#   intercepts them.
 #
 # Assertions (each counted PASS/FAIL, style of scripts/integration.sh):
 #   0. iptables-init: deterministic dry-run plan; installed by executing
@@ -34,12 +40,13 @@
 #      branch does not - so this drives an opaque probe at the app addr.
 #   3. opaque TCP passthrough: 4096 random bytes round-trip verbatim
 #      through the tunnel (tunnel semantics, zero bytes lost).
-#   4. outbound path: traffic to the VIP is REDIRECTed to 4140 and dialed
-#      straight at the original destination.
-#   5. loop guard: a REDIRECT aiming the gateway's own admin port at the
-#      inbound listener is refused and logged. Chosen shape: an OUTPUT
-#      REDIRECT rule dport 4191 -> 4143 (the guard compares ports only,
-#      so the address in front of the guarded port does not matter).
+#   4. outbound path: traffic to the non-local host peer is REDIRECTed
+#      to 4140 and dialed straight at the original destination.
+#   5. loop guard: an OUTPUT-intercepted dial whose orig_dst port is the
+#      gateway's own admin port is refused and logged (the guard compares
+#      ports only, so the address in front of the guarded port does not
+#      matter; the dial must be non-local, since pod-local traffic is
+#      loopback-exempt by design).
 #   6. graceful exit: SIGTERM -> exit 0, three-phase log lines, ports freed.
 #   7. repeatability: full cleanup lets the script run green twice in a row.
 #
@@ -58,7 +65,16 @@ FAIL=0
 SKIP_TAG="local-netns"
 NET_TAG="m1"
 APP_IP=10.123.0.2
+# Loopback VIP inside the netns: installed by netns_up (its signature
+# requires it) but deliberately NOT used as an interception target any
+# more - pod-local addresses are loopback-exempt by design.
 VIP_IP=10.123.0.3
+# Host-side veth peer: the only NON-local address reachable from inside
+# the netns, so dials at it still traverse OUTPUT/OPENRUSTY_OUT after the
+# loopback exemption (pod-local traffic must never be hijacked).
+HOST_IP=10.123.0.1
+HOST_APP_PORT=18082
+HOST_RAW_PORT=18083
 APP_PORT=18080
 RAW_PORT=18081
 INB_PORT=4143
@@ -128,8 +144,15 @@ CONF
 ip netns exec "$NS" "$ROOT/target/debug/examples/echo_upstream" \
     "0.0.0.0:$APP_PORT" app > "$TMP/logs/app.log" 2>&1 &
 PIDS+=($!)
-# Raw TCP echo for the opaque path: plain python3 asyncio (no ncat needed).
-ip netns exec "$NS" python3 -c '
+# Outbound-path target: the same echo workload on the NON-local host veth
+# peer (pod-local addresses are loopback-exempt, so the outbound REDIRECT
+# is only reachable at the peer).
+"$ROOT/target/debug/examples/echo_upstream" \
+    "$HOST_IP:$HOST_APP_PORT" app > "$TMP/logs/host-app.log" 2>&1 &
+PIDS+=($!)
+# Raw TCP echo for the opaque path: plain python3 asyncio (no ncat needed),
+# also on the host peer so intercepted dials reach it via the tunnel.
+python3 -c '
 import asyncio
 async def handle(r, w):
     try:
@@ -148,7 +171,7 @@ async def handle(r, w):
         except Exception:
             pass
 async def main():
-    s = await asyncio.start_server(handle, "0.0.0.0", '"$RAW_PORT"')
+    s = await asyncio.start_server(handle, "'"$HOST_IP"'", '"$HOST_RAW_PORT"')
     async with s:
         await s.serve_forever()
 asyncio.run(main())
@@ -161,7 +184,18 @@ RUST_LOG=debug ip netns exec "$NS" setpriv --reuid "$GATE_UID" --regid "$GATE_UI
     --clear-groups "$ROOT/target/debug/openrusty" "$TMP/openrusty.toml" \
     > "$TMP/logs/gw.log" 2>&1 &
 GW_PID=$!; PIDS+=("$GW_PID")
-wait_port "$ADM_PORT" 10 && wait_port "$APP_PORT" 10 && wait_port "$RAW_PORT" 10 \
+# Host-side readiness probe (the raw echo and the outbound app live on
+# the veth peer now, outside the netns wait_port can see).
+wait_host_port() { # ip port timeout_s
+    local i
+    for ((i = 0; i < $3 * 10; i++)); do
+        (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+wait_port "$ADM_PORT" 10 && wait_port "$APP_PORT" 10 \
+    && wait_host_port "$HOST_IP" "$HOST_APP_PORT" 10 && wait_host_port "$HOST_IP" "$HOST_RAW_PORT" 10 \
     || { echo "FATAL: services did not come up"; tail -n 5 "$TMP/logs"/*.log >&2; exit 1; }
 require_alive "startup" "${PIDS[@]}" || { tail -n 5 "$TMP/logs"/*.log >&2; exit 1; }
 
@@ -230,8 +264,8 @@ check "a1b: admin port exempt from inbound hijack (200)" test "$ADM_CODE" = "200
 echo "== 2. orig_dst observability (true pre-NAT address) =="
 # The gateway recovers the pre-NAT destination on the intercepted socket;
 # the tunnel path is where it logs that address, so drive an opaque probe
-# straight at the app address and read the recorded orig_dst back.
-ip netns exec "$NS" python3 - "$APP_IP" "$APP_PORT" <<'PY' || true
+# at the (non-local) app address and read the recorded orig_dst back.
+ip netns exec "$NS" python3 - "$HOST_IP" "$HOST_APP_PORT" <<'PY' || true
 import socket, sys
 host, port = sys.argv[1], int(sys.argv[2])
 s = socket.create_connection((host, port), timeout=10)
@@ -246,13 +280,13 @@ except Exception:
 s.close()
 PY
 check "a2: orig_dst logged as the app address" \
-    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$APP_IP:$APP_PORT'"
+    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$HOST_IP:$HOST_APP_PORT'"
 check "a2: orig_dst never an own listener address" \
     bash -c "! plain_log '$TMP/logs/gw.log' 2>/dev/null | grep -qE 'dst=127\\.0\\.0\\.1:(4140|4143|4191)'"
 
-echo "== 3. opaque TCP passthrough (REDIRECT -> 4143, tunnel) =="
+echo "== 3. opaque TCP passthrough (REDIRECT -> 4140, tunnel) =="
 PY_RC=0
-ip netns exec "$NS" python3 - "$APP_IP" "$RAW_PORT" <<'PY' || PY_RC=$?
+ip netns exec "$NS" python3 - "$HOST_IP" "$HOST_RAW_PORT" <<'PY' || PY_RC=$?
 import os, socket, sys
 host, port = sys.argv[1], int(sys.argv[2])
 payload = os.urandom(4096)
@@ -269,21 +303,22 @@ sys.exit(0 if got == payload else 1)
 PY
 check "a3: 4096 random bytes round-trip verbatim" test "$PY_RC" = "0"
 check "a3: tunnel log records orig_dst raw port" \
-    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$APP_IP:$RAW_PORT'"
+    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$HOST_IP:$HOST_RAW_PORT'"
 
-echo "== 4. outbound path (REDIRECT VIP -> 4140, dial orig_dst) =="
-CODE="$(ns_curl -o "$TMP/a4.body" -w '%{http_code}' --max-time 5 "http://$VIP_IP:$APP_PORT/echo" || true)"
+echo "== 4. outbound path (REDIRECT host peer -> 4140, dial orig_dst) =="
+CODE="$(ns_curl -o "$TMP/a4.body" -w '%{http_code}' --max-time 5 "http://$HOST_IP:$HOST_APP_PORT/echo" || true)"
 check "a4: outbound interception reaches the target (200)" test "$CODE" = "200"
 check "a4: response body comes from the app" grep -q '"node":"app"' "$TMP/a4.body"
-check "a4: outbound log records orig_dst == VIP" \
-    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$VIP_IP:$APP_PORT'"
+check "a4: outbound log records orig_dst == host peer" \
+    bash -c "plain_log '$TMP/logs/gw.log' 2>/dev/null | grep 'opaque tunnel established' | grep -q 'dst=$HOST_IP:$HOST_APP_PORT'"
 
 echo "== 5. loop guard (own admin port as orig_dst) =="
-# No temporary rule needed: the init parameter surface already hijacks a
-# local dial at the admin port into the outbound listener (only the proxy
-# UID is exempt on OUTPUT), so orig_dst recovers as an own listen port.
+# The init parameter surface hijacks a NON-local dial at the admin port
+# into the outbound listener, so orig_dst recovers as an own listen port.
+# (A pod-local dial would be loopback-exempt and reach admin directly -
+# that is the contract, so the guard must be probed via the host peer.)
 LOOP_RC=0
-ns_curl -o /dev/null --max-time 5 "http://$APP_IP:$ADM_PORT/openrusty/live" || LOOP_RC=$?
+ns_curl -o /dev/null --max-time 5 "http://$HOST_IP:$ADM_PORT/openrusty/live" || LOOP_RC=$?
 check "a5: looped connection refused (curl rc=$LOOP_RC)" test "$LOOP_RC" != "0"
 check "a5: loop guard logged" grep -q 'transparent loop guard' "$TMP/logs/gw.log"
 
