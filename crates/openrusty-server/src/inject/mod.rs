@@ -58,8 +58,8 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-use openrusty_core::config::EgressMode;
 use config::render_config_map;
+use openrusty_core::config::EgressMode;
 use render::{metadata_of, pod_spec, pod_template_metadata};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -158,7 +158,9 @@ pub fn parse_cli_args(argv: &[String]) -> Result<CliOptions, String> {
                 Some(v) => Ok(v),
                 None => {
                     i += 1;
-                    argv.get(i).cloned().ok_or_else(|| format!("{what} needs a value"))
+                    argv.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("{what} needs a value"))
                 }
             }
         };
@@ -240,11 +242,15 @@ pub fn run_with_image(raw: &str, image: &str) -> Result<String, String> {
     let pod_spec = pod_spec(&mut doc)?;
     render::inject_pod_spec(pod_spec, &params, image, &cm_name)?;
     let config_map = render_config_map(&name, render::namespace_of(&doc), &params)?;
-    let workload_yaml = serde_yaml::to_string(&doc)
-        .map_err(|e| format!("cannot re-render the workload: {e}"))?;
+    let workload_yaml =
+        serde_yaml::to_string(&doc).map_err(|e| format!("cannot re-render the workload: {e}"))?;
     let cm_yaml = serde_yaml::to_string(&config_map)
         .map_err(|e| format!("cannot render the config ConfigMap: {e}"))?;
-    Ok(format!("{}\n---\n{}\n", workload_yaml.trim_end(), cm_yaml.trim_end()))
+    Ok(format!(
+        "{}\n---\n{}\n",
+        workload_yaml.trim_end(),
+        cm_yaml.trim_end()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +308,10 @@ pub fn parse_annotations(annotations: &BTreeMap<String, String>) -> Result<Injec
                     .map_err(|_| invalid(name, value, "a numeric uid"))?
             }
             "proxy-log-level" => {
-                if !matches!(value.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
+                if !matches!(
+                    value.as_str(),
+                    "trace" | "debug" | "info" | "warn" | "error"
+                ) {
                     return Err(invalid(name, value, "trace|debug|info|warn|error"));
                 }
                 p.log_level = value.to_string();
@@ -353,7 +362,11 @@ pub fn ignore_inbound_ports(p: &InjectParams) -> String {
     ports.push(ADMIN_IGNORE_PORT);
     ports.sort_unstable();
     ports.dedup();
-    ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_ports(what: &str, raw: &str) -> Result<Vec<u16>, String> {

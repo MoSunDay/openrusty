@@ -4,6 +4,7 @@
 //! re-exported here, so `openrusty_core::config::ListenerConfig` and friends
 //! keep their historical paths.
 
+mod admin;
 mod dynamic;
 mod egress;
 mod ingress;
@@ -16,7 +17,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use thiserror::Error;
 
-pub use dynamic::DynamicConfig;
+pub use admin::AdminConfig;
+pub use dynamic::{
+    normalize_method, normalize_route_path, valid_module_name, DynamicConfig, DynamicRoute,
+};
 pub use egress::{resolve_gateway, EgressConfig, EgressMode};
 pub use ingress::IngressConfig;
 pub use listeners::{effective_listeners, ListenerConfig, ListenerRole};
@@ -36,6 +40,10 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
+    /// Management-plane hardening (`[admin]`); empty by default, so the
+    /// `/openrusty/*` endpoints stay open without it (historical shape).
+    #[serde(default)]
+    pub admin: AdminConfig,
     #[serde(default)]
     pub plugins: PluginsConfig,
     /// Dynamic single-module execution API (`POST /api/v1/dynamic/<name>`);
@@ -134,6 +142,8 @@ pub enum BalancerKind {
     #[default]
     Swrr,
     IpHash,
+    /// Least connections: fewest in-flight requests per unit of weight.
+    LeastConn,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +489,17 @@ upstream = "vllm"
         assert_eq!(ls[0].role, ListenerRole::Inbound);
         assert_eq!(ls[0].listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!ls[0].http1_only);
+    }
+
+    #[test]
+    fn parses_least_conn_balancer() {
+        let cfg: Config = toml::from_str(&GOOD.replace(
+            "name = \"vllm\"",
+            "name = \"vllm\"\nbalancer = \"least_conn\"",
+        ))
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.upstreams[0].balancer, BalancerKind::LeastConn);
     }
 
     #[test]

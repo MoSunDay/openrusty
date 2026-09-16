@@ -8,7 +8,7 @@
 //! - [`health`] - passive health checking keyed by upstream name so peer
 //!   state survives config reloads.
 //! - [`balancer`] - pure peer selection (smooth weighted round-robin,
-//!   FNV-1a based ip_hash).
+//!   FNV-1a based ip_hash, least_conn over in-flight gauges).
 //! - [`client`] - pooled keep-alive HTTP/1 clients, one per peer address.
 //! - [`forward`] - request forwarding with retryability classification and
 //!   bidirectional tunneling for upgraded connections.
@@ -38,19 +38,17 @@ pub mod tls;
 pub mod tunnel;
 pub mod upstream;
 
-pub use balancer::{ip_hash_pick, swrr_next};
-pub use client::{
-    evict_except, get, get_tls, new_pool, ClientPool, HttpBody, HttpClient, PoolKey,
-};
+pub use balancer::{ip_hash_pick, least_conn_pick, swrr_next};
+pub use client::{evict_except, get, get_tls, new_pool, ClientPool, HttpBody, HttpClient, PoolKey};
 pub use detect::{detect, Protocol};
 pub use forward::{
     failure_kind, forward, forward_https, forward_peer, is_idempotent, may_retry, merge_xff,
-    tunnel, FailureKind,
-    ForwardError, ForwardRequest,
+    tunnel, FailureKind, ForwardError, ForwardRequest,
 };
 pub use health::{
-    active_peers, evaluate_active, evaluate_failure, healthy_indices, is_active_healthy,
-    is_healthy, new, record_failure, record_probe, record_success, register, HealthRegistry,
+    active_peers, dec_in_flight, evaluate_active, evaluate_failure, healthy_indices, in_flights,
+    inc_in_flight, is_active_healthy, is_healthy, new, record_failure, record_probe,
+    record_success, register, HealthRegistry,
 };
 pub use loop_guard::is_loopback;
 pub use orig_dst::original_dst;

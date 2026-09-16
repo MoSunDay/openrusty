@@ -5,11 +5,11 @@ Commit: abe419f
 - 上游模型与转发层：upstream/peer 定义、负载均衡算法、被动+主动健康检查、连接池客户端、HTTP/HTTPS 转发与重试、WebSocket 字节隧道。
 
 ## 边界
-- 负责：`swrr`/`ip_hash` 选择算法（`balancer.rs`）；被动+主动健康的记账与判定（`health.rs`）；按地址池化的客户端（`client.rs`）；转发、`X-Forwarded-For` 合并、可重试错误分类（`forward.rs`）；双向隧道（`tunnel`）。
+- 负责：`swrr`/`ip_hash`/`least_conn` 选择算法（`balancer.rs`）；被动+主动健康的记账与判定、以及 `least_conn` 依赖的在途请求计数（`health.rs`）；按地址池化的客户端（`client.rs`）；转发、`X-Forwarded-For` 合并、可重试错误分类（`forward.rs`）；双向隧道（`tunnel`）。
 - 不负责：阶段编排与 `balancer` 阶段的插件调用（[网关请求管线](../gateway-pipeline/index.md) 的 `pipeline_peer.rs` 把插件选择注入本层）；配置解析（`openrusty-core`）。
 
 ## 关键设计
-- 均衡：`swrr` 为平滑加权轮询（`swrr_next` 维护 current weight）；`ip_hash` 按客户端 IP 在健康集合中取模固定（`ip_hash_pick`）。
+- 均衡：`swrr` 为平滑加权轮询（`swrr_next` 维护 current weight）；`ip_hash` 按客户端 IP 在健康集合中取模固定（`ip_hash_pick`）；`least_conn` 取「在途/weight」最小的健康 peer（`least_conn_pick`，整数交叉相乘比较），在途计数按地址存于 `HealthRegistry`（`inc_in_flight`/`dec_in_flight`/`in_flights`），随重载 remap 保留。
 - 被动健康：`max_fails` 次失败落在 `fail_window_s` 窗口内即标记 down（`max_fails=0` 关闭被动记账，nginx 语义）；`fail_timeout_s` 后自动恢复试探；`record_success` 复位失败计数。状态按地址归属：热重载时 `register` 按 peer 地址 remap 既有被动/主动状态，新地址从零开始。
 - 主动健康：`record_probe` 记录探测结果，`evaluate_active` 纯函数按 `unhealthy_threshold`/`healthy_threshold` 判定状态迁移；阈值只门控翻转（成功不把健康 peer 标脏、失败不治愈脏 peer）。探测任务本身在 `openrusty-server`（`active_probe.rs`）。
 - 重试语义：幂等方法按 `is_retryable` 重试，非幂等方法仅连接级（`Connect`）失败可重试（nginx 对齐）；每次失败把 peer 地址记入 `ReqCtx::tried`，后续重试与插件 pin 都不会再选已试 peer；上限为 `upstreams.retries`；响应已开始后不重试。
@@ -25,7 +25,7 @@ Commit: abe419f
 
 ## 依赖与接口
 - 依赖 hyper/hyper-util、socket2、rustls/tokio-rustls（出向 TLS）、`openrusty-core`（upstream/route 配置类型）。
-- 对外接口：`forward`、`tunnel`、`swrr_next`/`ip_hash_pick`、`HealthRegistry` 系列（`register`/`healthy_indices`/`record_failure`/`record_success`/`record_probe`）、`ClientPool`。
+- 对外接口：`forward`、`tunnel`、`swrr_next`/`ip_hash_pick`/`least_conn_pick`、`HealthRegistry` 系列（`register`/`healthy_indices`/`record_failure`/`record_success`/`record_probe`/`inc_in_flight`/`dec_in_flight`/`in_flights`）、`ClientPool`。
 - 代码锚点：`crates/openrusty-proxy/src/{upstream,balancer,health,client,forward}.rs`、`crates/openrusty-proxy/src/tls/{mod,connector}.rs`。
 
 ## 关联模块

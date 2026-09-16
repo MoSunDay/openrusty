@@ -489,11 +489,11 @@ async fn watch_loop_resync_bounds_staleness_against_silent_stream() {
             opts,
             move |snap: &Snapshot<Ingress>, stats: &WatchStats| {
                 recorder.snapshots.lock().unwrap().push(snap.clone());
-                recorder
-                    .events
-                    .lock()
-                    .unwrap()
-                    .push((stats.generation, stats.last_rv.clone(), snap.len()));
+                recorder.events.lock().unwrap().push((
+                    stats.generation,
+                    stats.last_rv.clone(),
+                    snap.len(),
+                ));
                 recorder
                     .stats
                     .lock()
@@ -516,10 +516,7 @@ async fn watch_loop_resync_bounds_staleness_against_silent_stream() {
     let events = observed.events.lock().unwrap().clone();
     assert_eq!(
         events,
-        vec![
-            (1, "100".to_string(), 1),
-            (2, "200".to_string(), 2),
-        ],
+        vec![(1, "100".to_string(), 1), (2, "200".to_string(), 2),],
         "the initial LIST hands over, then the resync that saw the rv jump \
          100→200 while the watch stream stayed silent; steady-rv re-lists do \
          not hand over"

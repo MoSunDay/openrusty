@@ -51,7 +51,13 @@ fn parse_activation(vars: &dyn Fn(&str) -> Option<String>, pid: u32) -> Option<A
     let mut names: Vec<Option<String>> = match vars("LISTEN_FDNAMES") {
         Some(raw) => raw
             .split(':')
-            .map(|n| if n.is_empty() { None } else { Some(n.to_owned()) })
+            .map(|n| {
+                if n.is_empty() {
+                    None
+                } else {
+                    Some(n.to_owned())
+                }
+            })
             .collect(),
         None => Vec::new(),
     };
@@ -98,7 +104,11 @@ fn match_ports(
 
 /// Render both sides of a failed match: the configured addresses vs the
 /// inherited fds (fd number, name when systemd gave one, local port).
-fn mismatch_message(inherited: &[u16], names: &[Option<String>], expected: &[SocketAddr]) -> String {
+fn mismatch_message(
+    inherited: &[u16],
+    names: &[Option<String>],
+    expected: &[SocketAddr],
+) -> String {
     let expected = expected
         .iter()
         .map(|a| a.to_string())
@@ -159,7 +169,9 @@ fn adopt_fds(
     let mut sockets: Vec<Option<std::net::TcpListener>> = adopted.into_iter().map(Some).collect();
     let mut listeners = Vec::with_capacity(order.len());
     for i in order {
-        let l = sockets[i].take().expect("match_ports returns a permutation");
+        let l = sockets[i]
+            .take()
+            .expect("match_ports returns a permutation");
         l.set_nonblocking(true)?;
         listeners.push(tokio::net::TcpListener::from_std(l)?);
     }
@@ -235,7 +247,11 @@ mod tests {
     fn parse_activation_pads_short_name_lists() {
         // One name for two fds: the second fd is unnamed.
         let a = activate(
-            &[("LISTEN_FDS", "2"), ("LISTEN_PID", "7"), ("LISTEN_FDNAMES", "inbound")],
+            &[
+                ("LISTEN_FDS", "2"),
+                ("LISTEN_PID", "7"),
+                ("LISTEN_FDNAMES", "inbound"),
+            ],
             7,
         )
         .unwrap();
@@ -270,7 +286,10 @@ mod tests {
         );
         // Configured listener with no inherited fd for it.
         let err = match_ports(&[8090], &none, &[addr(8080), addr(8090)]).unwrap_err();
-        assert!(err.contains("expected [127.0.0.1:8080, 127.0.0.1:8090]"), "{err}");
+        assert!(
+            err.contains("expected [127.0.0.1:8080, 127.0.0.1:8090]"),
+            "{err}"
+        );
         assert!(err.contains("received [fd3=8090]"), "{err}");
         // Duplicate inherited port against one configured listener.
         assert!(match_ports(&[8080, 8080], &none, &[addr(8080)]).is_err());

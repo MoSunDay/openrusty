@@ -48,7 +48,8 @@ max_tasks_per_node = "0"
 
 [[upstreams]]
 name = "vllm"
-# Load balancing policy: swrr (smooth weighted round-robin) | ip_hash
+# Load balancing policy: swrr (smooth weighted round-robin) | ip_hash | least_conn
+# least_conn = pick the healthy peer with the fewest in-flight requests per weight.
 balancer = "swrr"
 # Retry the request on another peer when a connection-level failure occurs.
 retries = 2
@@ -290,6 +291,16 @@ timeout_ms = 30000
 #
 # # Free-form per-module settings, readable via cfg_get (keys must match
 # # ^[A-Za-z0-9][A-Za-z0-9._-]*$; values are strings).
+# Boot-time {method, path} -> module bindings; the gateway fallback
+# consults them before proxy route matching (they win over [[routes]]
+# prefixes). `/api/*` and `/api` share one slot; later binds replace
+# earlier ones. Runtime PUT bindings live alongside these and survive
+# reloads, while config entries are re-enforced on every reload.
+# [[dynamic.routes]]
+# method = "get"
+# path = "/api/todo/*"
+# module = "todo"
+
 # [dynamic.settings.echo]
 # greeting = "hi"
 
@@ -297,3 +308,11 @@ timeout_ms = 30000
 # [[server.listeners]]
 # role = "admin"
 # listen = "127.0.0.1:4191"
+
+# [admin]
+# Optional management-plane authentication. When `token` is set, the
+# /openrusty/status|reload|metrics|shutdown endpoints require it as
+# `Authorization: Bearer <token>` (or `X-OpenRusty-Token: <token>`).
+# /openrusty/ready and /openrusty/live stay open for LB / k8s probes.
+# Rotating the value takes effect on the next config reload (SIGHUP/POST).
+# token = "generate-a-long-random-secret-here"

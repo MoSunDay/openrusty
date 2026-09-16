@@ -9,7 +9,7 @@
 
 use openrusty_core::load_config;
 use openrusty_server::{
-    active_probe, check, ingress, inject, init, listeners, logging, reload, shutdown, state,
+    active_probe, check, ingress, init, inject, listeners, logging, reload, shutdown, state,
 };
 use openrusty_wasm::host_state;
 use std::path::PathBuf;
@@ -233,15 +233,14 @@ async fn main() {
     let listeners_cfg = openrusty_core::effective_listeners(&cfg);
     // Bind everything up front (fail-fast) and keep the accept-task handles:
     // the shutdown sequence waits on exactly these.
-    let tasks = match listeners::spawn(listeners::mounts(&state, &listeners_cfg), &state.shutdown)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(error = %e, "listener failed");
-            std::process::exit(1);
-        }
-    };
+    let tasks =
+        match listeners::spawn(listeners::mounts(&state, &listeners_cfg), &state.shutdown).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "listener failed");
+                std::process::exit(1);
+            }
+        };
 
     // Shutdown trigger: SIGTERM, SIGINT and POST /openrusty/shutdown are
     // three doors into the same room - all of them are answered by the one
@@ -275,11 +274,19 @@ async fn main() {
         .await
     } else {
         let grace = Duration::from_millis(cfg.server.shutdown_grace_ms);
-        shutdown::run(state.shutdown.tx.clone(), tasks, state.shutdown.in_flight.clone(), grace)
-            .await
+        shutdown::run(
+            state.shutdown.tx.clone(),
+            tasks,
+            state.shutdown.in_flight.clone(),
+            grace,
+        )
+        .await
     };
     if report.task_errors > 0 {
-        tracing::error!(errors = report.task_errors, "accept tasks failed during drain");
+        tracing::error!(
+            errors = report.task_errors,
+            "accept tasks failed during drain"
+        );
         // process::exit skips destructors; drop the guard first so the
         // error line reaches the sink before the process goes away.
         drop(log_guard);

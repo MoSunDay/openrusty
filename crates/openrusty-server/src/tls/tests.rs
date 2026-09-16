@@ -46,11 +46,7 @@ fn client_config() -> rustls::ClientConfig {
 /// Handshake with the listener, trusting the fixture CA. Err = the
 /// handshake itself failed (that IS the assertion for SNI misses with
 /// no fallback).
-async fn connect_tls(
-    port: u16,
-    sni: &str,
-    alpn: &[&[u8]],
-) -> Result<TlsStream<TcpStream>, String> {
+async fn connect_tls(port: u16, sni: &str, alpn: &[&[u8]]) -> Result<TlsStream<TcpStream>, String> {
     let mut cfg = client_config();
     cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     let connector = TlsConnector::from(Arc::new(cfg));
@@ -72,10 +68,7 @@ fn alpn_of(tls: &TlsStream<TcpStream>) -> Option<Vec<u8>> {
 fn fixture_leaf_der(pem_path: &str) -> Vec<u8> {
     let pem = std::fs::read_to_string(pem_path).unwrap();
     let mut cursor = pem.as_bytes();
-    let der = rustls_pemfile::certs(&mut cursor)
-        .next()
-        .unwrap()
-        .unwrap();
+    let der = rustls_pemfile::certs(&mut cursor).next().unwrap().unwrap();
     der.as_ref().to_vec()
 }
 
@@ -103,7 +96,11 @@ async fn http_get(mut tls: TlsStream<TcpStream>, path: &str) -> String {
 /// one catch-all route to an upstream on `upstream` (which may not be
 /// listening - admin-plane probes never reach it), plus one TLS
 /// listener block and optionally `[ingress] enabled`.
-fn boot_with(upstream: u16, listener_block: &str, ingress: bool) -> (Arc<AppState>, Vec<ListenerConfig>) {
+fn boot_with(
+    upstream: u16,
+    listener_block: &str,
+    ingress: bool,
+) -> (Arc<AppState>, Vec<ListenerConfig>) {
     let dir = TmpDir::new("tls");
     dir.write_config(&format!(
         r#"
@@ -146,9 +143,7 @@ fn static_listener(port: u16) -> String {
 }
 
 fn ingress_listener(port: u16) -> String {
-    format!(
-        "[[server.listeners]]\nrole = \"inbound\"\nlisten = \"127.0.0.1:{port}\"\ntls = true\n"
-    )
+    format!("[[server.listeners]]\nrole = \"inbound\"\nlisten = \"127.0.0.1:{port}\"\ntls = true\n")
 }
 
 #[test]
@@ -215,16 +210,13 @@ async fn alpn_picks_the_protocol_mode() {
     ] {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let cfg = config.clone();
-        let (res_server, res_client) = tokio::join!(
-            accept_tls(server, cfg),
-            async move {
-                let mut ccfg = client_config();
-                ccfg.alpn_protocols = vec![client_alpn.to_vec()];
-                TlsConnector::from(Arc::new(ccfg))
-                    .connect(ServerName::try_from(HOST.to_string()).unwrap(), client)
-                    .await
-            }
-        );
+        let (res_server, res_client) = tokio::join!(accept_tls(server, cfg), async move {
+            let mut ccfg = client_config();
+            ccfg.alpn_protocols = vec![client_alpn.to_vec()];
+            TlsConnector::from(Arc::new(ccfg))
+                .connect(ServerName::try_from(HOST.to_string()).unwrap(), client)
+                .await
+        });
         let (_, mode) = res_server.unwrap();
         assert_eq!(mode, expect_mode, "server mode for ALPN {client_alpn:?}");
         assert_eq!(
@@ -237,14 +229,11 @@ async fn alpn_picks_the_protocol_mode() {
     // No ALPN extension at all -> None (listener default applies).
     let (client, server) = tokio::io::duplex(64 * 1024);
     let cfg = config.clone();
-    let (res_server, res_client) = tokio::join!(
-        accept_tls(server, cfg),
-        async move {
-            TlsConnector::from(Arc::new(client_config()))
-                .connect(ServerName::try_from(HOST.to_string()).unwrap(), client)
-                .await
-        }
-    );
+    let (res_server, res_client) = tokio::join!(accept_tls(server, cfg), async move {
+        TlsConnector::from(Arc::new(client_config()))
+            .connect(ServerName::try_from(HOST.to_string()).unwrap(), client)
+            .await
+    });
     let (_, mode) = res_server.unwrap();
     assert_eq!(mode, None);
     assert_eq!(res_client.unwrap().get_ref().1.alpn_protocol(), None);
@@ -259,10 +248,13 @@ async fn static_tls_listener_serves_http1_h2_and_fallback() {
     let upstream = spawn_echo_upstream().await;
     let port = free_port();
     let (state, ls) = boot_with(upstream, &static_listener(port), false);
-    assert!(state.tls_resolver.is_some(), "static TLS listener seeds a resolver");
-    let tasks =
-        listeners::spawn(listeners::mounts(&state, &ls), &state.shutdown).await
-            .unwrap();
+    assert!(
+        state.tls_resolver.is_some(),
+        "static TLS listener seeds a resolver"
+    );
+    let tasks = listeners::spawn(listeners::mounts(&state, &ls), &state.shutdown)
+        .await
+        .unwrap();
 
     // SNI hit + ALPN http/1.1: the proxied GET reaches the upstream.
     // There is no SNI map here, so the static wildcard fallback serves.
@@ -303,7 +295,10 @@ async fn static_tls_listener_serves_http1_h2_and_fallback() {
         .await
         .expect("SETTINGS read timed out")
         .unwrap();
-    assert_eq!(frame[3], 0x04, "expected an HTTP/2 SETTINGS frame, got {frame:?}");
+    assert_eq!(
+        frame[3], 0x04,
+        "expected an HTTP/2 SETTINGS frame, got {frame:?}"
+    );
 
     for t in tasks {
         t.abort();
@@ -318,11 +313,14 @@ async fn ingress_source_publishes_and_unknown_sni_fails() {
     let upstream = spawn_echo_upstream().await;
     let port = free_port();
     let (state, ls) = boot_with(upstream, &ingress_listener(port), true);
-    let resolver = state.tls_resolver.clone().expect("tls listener -> resolver");
+    let resolver = state
+        .tls_resolver
+        .clone()
+        .expect("tls listener -> resolver");
 
-    let tasks =
-        listeners::spawn(listeners::mounts(&state, &ls), &state.shutdown).await
-            .unwrap();
+    let tasks = listeners::spawn(listeners::mounts(&state, &ls), &state.shutdown)
+        .await
+        .unwrap();
     // Nothing published yet and no static fallback: miss = handshake
     // failure.
     assert!(connect_tls(port, HOST, &[]).await.is_err());

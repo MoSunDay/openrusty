@@ -187,7 +187,7 @@ where
         let mut dirty = restart_rv
             .take()
             .as_deref()
-            .map_or(true, |rv| snap.resource_version() != rv);
+            .is_none_or(|rv| snap.resource_version() != rv);
         let mut deadline: Option<Pin<Box<Sleep>>> =
             Some(Box::pin(tokio::time::sleep(opts.debounce)));
 

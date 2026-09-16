@@ -128,7 +128,12 @@ pub fn fallback_decision(policy: FailPolicy) -> Decision {
 
 /// Run one phase and map any failure through `policy`. Errors are logged
 /// and counted on the plugin's shared state.
-pub fn run_phase(rt: &mut PluginRt, timeout: Duration, policy: FailPolicy, phase: Phase) -> Decision {
+pub fn run_phase(
+    rt: &mut PluginRt,
+    timeout: Duration,
+    policy: FailPolicy,
+    phase: Phase,
+) -> Decision {
     match run_phase_outcome(rt, timeout, phase) {
         PhaseOutcome::Decision(d) => d,
         PhaseOutcome::Error { plugin, kind } => {
@@ -301,12 +306,7 @@ mod tests {
     fn ok_module_returns_ok() {
         let (_ticker, mut rt) = setup(OK_MOD, 16);
         assert_eq!(
-            run_phase(
-                &mut rt,
-                CALM,
-                FailPolicy::FailOpen,
-                Phase::PostRead
-            ),
+            run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::PostRead),
             Decision::Ok
         );
         assert_eq!(rt.host_data().state.error_count(), 0);
@@ -338,12 +338,7 @@ mod tests {
         // fail_closed -> Deny(503)
         let (_ticker, mut rt) = setup(TRAP_MOD, 16);
         assert_eq!(
-            run_phase(
-                &mut rt,
-                CALM,
-                FailPolicy::FailClosed,
-                Phase::Access
-            ),
+            run_phase(&mut rt, CALM, FailPolicy::FailClosed, Phase::Access),
             Decision::Deny(503)
         );
         assert_eq!(rt.host_data().state.error_count(), 1);
@@ -399,7 +394,6 @@ mod tests {
     #[test]
     fn stale_bump_does_not_shorten_the_next_call() {
         let (_ticker, mut rt) = setup(LOOP_MOD, 16);
-        
 
         let first_started = std::time::Instant::now();
         assert_eq!(
@@ -486,12 +480,7 @@ mod tests {
         // limiter refuses, which traps (trap_on_grow_failure).
         let (_ticker, mut rt) = setup(GROW_MOD, 1);
         assert_eq!(
-            run_phase(
-                &mut rt,
-                CALM,
-                FailPolicy::FailOpen,
-                Phase::BodyFilter
-            ),
+            run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::BodyFilter),
             Decision::Declined
         );
         assert_eq!(rt.host_data().state.error_count(), 1);
@@ -520,7 +509,14 @@ mod tests {
             Arc::new(HashMap::new()),
         );
         let started = std::time::Instant::now();
-        let err = match instantiate_with_budget(engine, &linker, &module, host, 16, Duration::from_millis(250)) {
+        let err = match instantiate_with_budget(
+            engine,
+            &linker,
+            &module,
+            host,
+            16,
+            Duration::from_millis(250),
+        ) {
             Ok(_) => panic!("infinite start section must fail instantiation"),
             Err(err) => err,
         };

@@ -125,7 +125,9 @@ pub fn parse_args(argv: &[String]) -> Result<InitParams, String> {
                 Some(v) => Ok(v),
                 None => {
                     i += 1;
-                    argv.get(i).cloned().ok_or_else(|| format!("{what} needs a value"))
+                    argv.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("{what} needs a value"))
                 }
             }
         };
@@ -133,7 +135,9 @@ pub fn parse_args(argv: &[String]) -> Result<InitParams, String> {
             "--proxy-uid" => uid = Some(parse_num(&next("--proxy-uid")?, "proxy-uid")?),
             "--inbound-port" => p.inbound_port = parse_port(&next("--inbound-port")?)?,
             "--outbound-port" => p.outbound_port = parse_port(&next("--outbound-port")?)?,
-            "--ignore-inbound-ports" => p.ignore_inbound_ports = parse_ports(&next("--ignore-inbound-ports")?)?,
+            "--ignore-inbound-ports" => {
+                p.ignore_inbound_ports = parse_ports(&next("--ignore-inbound-ports")?)?
+            }
             "--ignore-outbound-ports" => {
                 p.ignore_outbound_ports = parse_ports(&next("--ignore-outbound-ports")?)?
             }
@@ -155,7 +159,8 @@ pub fn parse_args(argv: &[String]) -> Result<InitParams, String> {
 }
 
 fn parse_num(s: &str, what: &str) -> Result<u32, String> {
-    s.parse::<u32>().map_err(|_| format!("invalid {what} '{s}'"))
+    s.parse::<u32>()
+        .map_err(|_| format!("invalid {what} '{s}'"))
 }
 
 fn parse_port(s: &str) -> Result<u16, String> {
@@ -166,7 +171,10 @@ fn parse_port(s: &str) -> Result<u16, String> {
 }
 
 fn parse_ports(s: &str) -> Result<Vec<u16>, String> {
-    s.split(',').filter(|x| !x.trim().is_empty()).map(|x| parse_port(x.trim())).collect()
+    s.split(',')
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| parse_port(x.trim()))
+        .collect()
 }
 
 fn parse_subnets(s: &str) -> Result<Vec<String>, String> {
@@ -175,16 +183,19 @@ fn parse_subnets(s: &str) -> Result<Vec<String>, String> {
         .filter(|x| !x.is_empty())
         .map(|cidr| match cidr.split_once('/') {
             Some((addr, mask)) => {
-                let addr: IpAddr = addr.parse().map_err(|_| format!("invalid subnet '{cidr}'"))?;
+                let addr: IpAddr = addr
+                    .parse()
+                    .map_err(|_| format!("invalid subnet '{cidr}'"))?;
                 let max = if addr.is_ipv4() { 32 } else { 128 };
                 match mask.parse::<u32>() {
                     Ok(m) if m <= max => Ok(cidr.to_string()),
                     _ => Err(format!("invalid subnet '{cidr}'")),
                 }
             }
-            None => {
-                cidr.parse::<IpAddr>().map(|_| cidr.to_string()).map_err(|_| format!("invalid subnet '{cidr}'"))
-            }
+            None => cidr
+                .parse::<IpAddr>()
+                .map(|_| cidr.to_string())
+                .map_err(|_| format!("invalid subnet '{cidr}'")),
         })
         .collect()
 }
@@ -292,14 +303,27 @@ mod tests {
             ..InitParams::default()
         };
         let plan = build_rules(p);
-        let pos = |needle: &str| plan.iter().position(|l| l.contains(needle)).expect("line present");
+        let pos = |needle: &str| {
+            plan.iter()
+                .position(|l| l.contains(needle))
+                .expect("line present")
+        };
         let lo = pos("-o lo");
         let owner = pos("--uid-owner 511");
         let ignore = pos("--dport 443");
         let subnet1 = pos("-d 10.0.0.0/8");
         let subnet2 = pos("-d 192.168.0.0/16");
-        let redirect = plan.iter().position(|l| l.contains(CHAIN_OUT) && l.contains("REDIRECT")).unwrap();
-        assert!(lo < owner && owner < ignore && ignore < subnet1 && subnet1 < subnet2 && subnet2 < redirect);
+        let redirect = plan
+            .iter()
+            .position(|l| l.contains(CHAIN_OUT) && l.contains("REDIRECT"))
+            .unwrap();
+        assert!(
+            lo < owner
+                && owner < ignore
+                && ignore < subnet1
+                && subnet1 < subnet2
+                && subnet2 < redirect
+        );
     }
 
     #[test]
@@ -311,15 +335,28 @@ mod tests {
             ignore_inbound_ports: vec![4191, 9090],
             ..InitParams::default()
         });
-        let first_in = plan.iter().position(|l| l.contains(&format!("-A {CHAIN_IN}"))).unwrap();
-        let first_out = plan.iter().position(|l| l.contains(&format!("-A {CHAIN_OUT}"))).unwrap();
+        let first_in = plan
+            .iter()
+            .position(|l| l.contains(&format!("-A {CHAIN_IN}")))
+            .unwrap();
+        let first_out = plan
+            .iter()
+            .position(|l| l.contains(&format!("-A {CHAIN_OUT}")))
+            .unwrap();
         assert!(plan[first_in].contains("-i lo") && plan[first_in].ends_with("-j RETURN"));
         assert!(plan[first_out].contains("-o lo") && plan[first_out].ends_with("-j RETURN"));
     }
 
     #[test]
     fn ignore_ports_expand_one_return_each() {
-        let argv = ["--proxy-uid", "7", "--ignore-inbound-ports", "4191,15000", "--ignore-outbound-ports", "443,9090"];
+        let argv = [
+            "--proxy-uid",
+            "7",
+            "--ignore-inbound-ports",
+            "4191,15000",
+            "--ignore-outbound-ports",
+            "443,9090",
+        ];
         let plan = plan_of(&argv);
         // dport RETURNs only: the owner exemption is a RETURN without a port.
         let returns: Vec<&String> = plan
@@ -338,9 +375,15 @@ mod tests {
         for rule in build_rules(InitParams::default()) {
             let words: Vec<&str> = rule.split(' ').collect();
             assert_eq!(words[0], "iptables");
-            assert!(words.iter().all(|w| !w.is_empty()), "no empty tokens: {rule}");
+            assert!(
+                words.iter().all(|w| !w.is_empty()),
+                "no empty tokens: {rule}"
+            );
             if words[3] == "-A" {
-                assert!(rule.contains(&format!("--comment {COMMENT}")), "append carries the tag: {rule}");
+                assert!(
+                    rule.contains(&format!("--comment {COMMENT}")),
+                    "append carries the tag: {rule}"
+                );
             }
         }
         // The -C guard and its -I twin differ only in the op word.
@@ -355,16 +398,38 @@ mod tests {
     #[test]
     fn cli_parse_plan_equals_build_rules() {
         let argv = [
-            "--proxy-uid", "65534", "--inbound-port", "4143", "--outbound-port", "4140",
-            "--ignore-inbound-ports", "4191", "--ignore-outbound-ports", "443", "--skip-subnets", "10.0.0.0/8",
+            "--proxy-uid",
+            "65534",
+            "--inbound-port",
+            "4143",
+            "--outbound-port",
+            "4140",
+            "--ignore-inbound-ports",
+            "4191",
+            "--ignore-outbound-ports",
+            "443",
+            "--skip-subnets",
+            "10.0.0.0/8",
         ];
-        assert_eq!(plan_of(&argv), build_rules(InitParams { skip_subnets: vec!["10.0.0.0/8".into()], ..Default::default() }));
+        assert_eq!(
+            plan_of(&argv),
+            build_rules(InitParams {
+                skip_subnets: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            })
+        );
         // --flag=value form is accepted too.
         let inline = plan_of(&["--proxy-uid=65534", "--inbound-port=5000"]);
         assert!(inline.iter().any(|l| l.ends_with("--to-ports 5000")));
         // run() prints exactly the plan on dry-run; nothing is spawned.
-        let params = InitParams { dry_run: true, ..InitParams::default() };
-        assert_eq!(build_rules(params.clone()), build_rules(InitParams::default()));
+        let params = InitParams {
+            dry_run: true,
+            ..InitParams::default()
+        };
+        assert_eq!(
+            build_rules(params.clone()),
+            build_rules(InitParams::default())
+        );
         assert!(params.dry_run);
     }
 
@@ -377,10 +442,11 @@ mod tests {
         assert!(err(&[]).contains("--proxy-uid"));
         assert!(err(&["--proxy-uid", "7", "--inbound-port", "0"]).contains("invalid port"));
         assert!(err(&["--proxy-uid", "x"]).contains("invalid proxy-uid"));
-        assert!(err(&["--proxy-uid", "7", "--skip-subnets", "300.1.2.3/8"]).contains("invalid subnet"));
+        assert!(
+            err(&["--proxy-uid", "7", "--skip-subnets", "300.1.2.3/8"]).contains("invalid subnet")
+        );
         assert!(err(&["--proxy-uid", "7", "--wat"]).contains("unknown flag"));
         assert!(err(&["--proxy-uid", "7", "--backend", "pf"]).contains("unknown backend"));
         assert!(err(&["--proxy-uid", "7", "--ignore-inbound-ports"]).contains("needs a value"));
     }
 }
-

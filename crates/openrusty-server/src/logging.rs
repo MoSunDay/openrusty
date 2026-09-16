@@ -120,7 +120,10 @@ mod tests {
         reopen(&w).unwrap();
         append(&mut w, "second\n");
 
-        assert_eq!(fs::read_to_string(tmp.0.join("rotated.log")).unwrap(), "first\n");
+        assert_eq!(
+            fs::read_to_string(tmp.0.join("rotated.log")).unwrap(),
+            "first\n"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
     }
 

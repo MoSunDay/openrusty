@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Request body buffering ceiling (16 MiB).
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
-pub(crate) use crate::pipeline_peer::{pick_peer, Pick};
+pub(crate) use crate::pipeline_peer::{pick_peer, release_peer, Pick};
 
 /// Run the log phase exactly once for a short-circuited request.
 pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
@@ -393,6 +393,8 @@ pub async fn handle_request(
                 // before the (possibly slow) attempt, and passive health
                 // windows must be judged against when the outcome happened.
                 proxy::record_success(&state.health, &up_rt.up.name, idx, now_ms());
+                // Release the in-flight slot: the attempt is answered.
+                release_peer(&state, &up_rt, idx);
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_SUCCESS);
                 resp = Some(r);
                 break;
@@ -408,6 +410,8 @@ pub async fn handle_request(
                 state
                     .metrics
                     .record_attempt(&up_rt.up.name, RESULT_CONNECT_FAIL);
+                // Release the in-flight slot before retrying/returning.
+                release_peer(&state, &up_rt, idx);
                 let kind = proxy::failure_kind(&e);
                 if proxy::may_retry(&method, kind) {
                     // Never revisit a peer this request already tried.
@@ -433,6 +437,8 @@ pub async fn handle_request(
                     now_ms(),
                 );
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_TIMEOUT);
+                // Release the in-flight slot before retrying/returning.
+                release_peer(&state, &up_rt, idx);
                 // A timed-out attempt may have delivered the request, so a
                 // replay is only allowed for idempotent methods.
                 if proxy::may_retry(&method, proxy::FailureKind::Timeout)
@@ -504,7 +510,6 @@ pub async fn handle_request(
         .map(|r| (r, Some(route_label.clone())))
         .unwrap_or_else(|_| (text_response(500, "500 bad response\n"), Some(route_label)))
 }
-
 
 #[cfg(test)]
 mod tests;

@@ -56,6 +56,7 @@ fn cfg(dir: &str) -> Config {
             shutdown_grace_ms: 5_000,
             log_file: None,
         },
+        admin: Default::default(),
         plugins: PluginsConfig {
             dir: dir.into(),
             order: vec!["vllm-kv-scheduler".to_string()],

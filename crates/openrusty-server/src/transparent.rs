@@ -36,8 +36,10 @@
 
 pub(crate) mod prefixed;
 
-use crate::h2c::{ProtoMode, serve_conn};
-use crate::metrics::{Metrics, OUTCOME_HTTP, OUTCOME_LOOP_REJECTED, OUTCOME_NO_ORIG_DST, OUTCOME_TUNNEL};
+use crate::h2c::{serve_conn, ProtoMode};
+use crate::metrics::{
+    Metrics, OUTCOME_HTTP, OUTCOME_LOOP_REJECTED, OUTCOME_NO_ORIG_DST, OUTCOME_TUNNEL,
+};
 use openrusty_core::config::{EgressConfig, ListenerConfig, ListenerRole};
 use openrusty_proxy as proxy;
 use prefixed::PrefixedStream;
@@ -125,7 +127,6 @@ pub struct EgressPlane {
     pub gateway: Option<SocketAddr>,
     pub metrics: Arc<Metrics>,
 }
-
 
 /// Accept loop for a transparent listener: per connection, recover the
 /// original destination and split by role and protocol. Mirrors the
@@ -241,7 +242,9 @@ async fn handle_conn<S>(
         }
         Step::DegradeHttp => {
             // Degraded or not, the connection ends up served as HTTP.
-            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
+            plane
+                .metrics
+                .record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
             tracing::warn!(
                 role = cfg.role.as_str(),
                 %remote,
@@ -281,7 +284,9 @@ async fn handle_conn<S>(
                     let io = PrefixedStream::new(prefix, stream);
                     match route_http(protocol) {
                         HttpStep::ServeHttp(mode) => {
-                            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
+                            plane
+                                .metrics
+                                .record_transparent(cfg.role.as_str(), OUTCOME_HTTP);
                             tracing::info!(
                                 role = cfg.role.as_str(),
                                 %remote,
@@ -292,7 +297,9 @@ async fn handle_conn<S>(
                             serve_conn(svc, io, remote, mode, rx, timeouts).await;
                         }
                         HttpStep::Tunnel => {
-                            plane.metrics.record_transparent(cfg.role.as_str(), OUTCOME_TUNNEL);
+                            plane
+                                .metrics
+                                .record_transparent(cfg.role.as_str(), OUTCOME_TUNNEL);
                             tunnel_to(io, dst, remote).await;
                         }
                     }
@@ -338,7 +345,6 @@ where
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests;

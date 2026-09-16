@@ -269,6 +269,7 @@ mod tests {
                 shutdown_grace_ms: 5_000,
                 log_file: None,
             },
+            admin: Default::default(),
             plugins: PluginsConfig {
                 dir: dir.into(),
                 order: order.iter().map(|s| s.to_string()).collect(),

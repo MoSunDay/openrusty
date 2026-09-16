@@ -172,7 +172,8 @@ the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
 
 ## Hot reload
 
-- `SIGHUP` or `POST /openrusty/reload` (loopback only) re-reads the config,
+- `SIGHUP` or `POST /openrusty/reload` (loopback only; an optional `[admin]
+token` additionally requires `Authorization: Bearer`/`X-OpenRusty-Token`) re-reads the config,
   validates it, compiles every plugin module in the background, and publishes
   a new snapshot atomically. Any failure aborts the whole reload and keeps
   the previous snapshot. In-flight requests keep their snapshot alive via
@@ -210,6 +211,37 @@ missing file answers 404.
   cap, 413 above), and `[dynamic.settings.<name>]` free-form settings
   readable via `cfg_get`. Route mounting is boot-time; reload rebuilds
   the registry when the section changes but cannot mount/unmount routes.
+- Registration face (admin plane, behind the `[admin]` token guard when
+  one is set):
+  - `PUT /openrusty/dynamic/{name}` - body is the module artifact (wasm
+    binary or WAT text, 64 MiB cap -> 413). The bytes are validated
+    (compile + ABI) BEFORE anything lands on disk, then stored via
+    temp-file + atomic rename; the stat-driven cache serves the new
+    module on the next request, no reload. Optional query
+    `method=M&path=P` binds the module at the same time; an EMPTY body
+    with both params binds an already-present artifact (404 if the file
+    is missing, 400 if only one param is sent).
+  - `DELETE /openrusty/dynamic/{name}` - removes the artifact and every
+    binding pointing at it (404 when neither existed).
+  - `GET /openrusty/dynamic` - lists modules on disk and live bindings.
+- Route bindings: `{METHOD, base path} -> module`, from `[[dynamic.routes]]`
+  config entries and runtime `PUT ...?method=&path=` calls. The gateway
+  fallback consults the binding table BEFORE proxy route matching, so
+  bindings win over `[[routes]]` prefixes (the fixed
+  `POST /api/v1/dynamic/<name>` route keeps precedence over bindings).
+  A binding hit ALSO takes precedence over WebSocket upgrade handling
+  on the bound path: the module sees and answers the handshake request
+  instead of the upgrade being transparently proxied.
+  Semantics: methods are matched case-insensitively; `/api/*` and `/api`
+  share one slot (a later bind of either shape replaces the earlier);
+  exact paths are checked before the longest prefix; a `/api/*` prefix
+  matches `/api` itself and everything below it, never `/apifoo`.
+  Dispatched requests run the same synthesized pipeline as the fixed
+  route and count only in `openrusty_dynamic_requests_total{module,code}`
+  (no per-route histogram). Reload semantics: config-declared bindings
+  are re-enforced (stale ones dropped) on every reload while runtime
+  bindings survive; removing the `[dynamic]` section empties the table
+  (dispatch never hijacks the pipeline).
 - Example modules: `plugins/dynamic-echo` (settings + module headers) and
   `plugins/dynamic-reverse` (used to demo replace-without-reload).
 

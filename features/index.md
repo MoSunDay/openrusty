@@ -5,7 +5,7 @@ Commit: 86fac98
 - [代理转发与流式协议](./proxying/index.md) —— 同端口 HTTP/1.1+h2c、WebSocket 透传、SSE、路由超时、连接失败换 peer 重试
 - [WASM 插件阶段管线与沙箱](./plugin-pipeline/index.md) —— 8 个 nginx 对齐阶段、Decision 语义、超时/内存收容、fail_open/fail_closed
 - [热重载](./hot-reload/index.md) —— SIGHUP / `POST /openrusty/reload`，原子发布、失败整体拒绝、在途请求与状态保留
-- [负载均衡与健康检查](./load-balancing/index.md) —— swrr/ip_hash、被动健康、故障摘除与恢复
+- [负载均衡与健康检查](./load-balancing/index.md) —— swrr/ip_hash/least_conn、被动健康、故障摘除与恢复
 - [vllm-kv-scheduler 亲和调度](./vllm-kv-scheduler/index.md) —— vLLM 风格 KV-cache 亲和：task key 粘滞、最少任务选择、TTL 释放
 - 动态 WASM 执行 API —— `[dynamic]` 节启用 `POST /api/v1/dynamic/{name}`：单模块合成管线、stat 驱动换模块即生效（[changelog 2026-09-05](./changelog/2026-09-05/dynamic-wasm-api.md)）
 - Upstream TLS —— `[[upstreams]] tls` 节：https 上游（CA/mTLS/SNI，reload 前置校验），mesh mTLS 的出向底座（[changelog 2026-09-05](./changelog/2026-09-05/upstream-tls.md)）

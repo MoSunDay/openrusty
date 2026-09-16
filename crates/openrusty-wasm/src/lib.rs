@@ -18,7 +18,7 @@ mod linker_kv;
 mod linker_req;
 mod registry_validate;
 
-pub use dynamic::{DynOutcome, DynamicRegistry, ResolveError};
+pub use dynamic::{valid_name, DynOutcome, DynamicRegistry, ResolveError};
 pub use epoch::{ticks_for, EpochTicker, TICK_MS};
 pub use host_state::HostState;
 pub use instance::{new_host_data, HeaderEdit, HostData, PeerView};

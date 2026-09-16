@@ -68,7 +68,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// Stand-in for `detect`: strips the first `n` bytes off a duplex socket
     /// and hands back the stream plus the consumed prefix.

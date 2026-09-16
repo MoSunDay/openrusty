@@ -29,9 +29,15 @@ fn route_egress_matrix() {
 
     // direct: everything dials the original destination, always.
     for d in [plain, tls] {
-        assert_eq!(route_egress(EgressMode::Direct, None, d), EgressStep::Orig(d));
+        assert_eq!(
+            route_egress(EgressMode::Direct, None, d),
+            EgressStep::Orig(d)
+        );
         for p in all.clone() {
-            assert_eq!(route_egress(EgressMode::Direct, Some(p), d), EgressStep::Orig(d));
+            assert_eq!(
+                route_egress(EgressMode::Direct, Some(p), d),
+                EgressStep::Orig(d)
+            );
         }
     }
     // deny: everything is refused, always.
@@ -49,7 +55,10 @@ fn route_egress_matrix() {
     }
     // gateway without a protocol: sniff, whatever the port.
     for d in [plain, tls] {
-        assert_eq!(route_egress(EgressMode::Gateway, None, d), EgressStep::Sniff(d));
+        assert_eq!(
+            route_egress(EgressMode::Gateway, None, d),
+            EgressStep::Sniff(d)
+        );
     }
     // gateway + plaintext HTTP off 443: forward to the gateway.
     for p in http {
@@ -106,7 +115,10 @@ async fn deny_mode_closes_the_connection_and_counts() {
         &m,
     )
     .await;
-    assert_eq!(count(&m.snapshot().transparent, OUTCOME_EGRESS_DENY), Some(&1));
+    assert_eq!(
+        count(&m.snapshot().transparent, OUTCOME_EGRESS_DENY),
+        Some(&1)
+    );
     let mut buf = [0u8; 16];
     assert_eq!(peer.read(&mut buf).await.unwrap(), 0, "peer must see EOF");
 }
@@ -137,7 +149,10 @@ async fn direct_mode_tunnels_and_counts() {
     drop(up);
     drop(peer);
     task.await.unwrap();
-    assert_eq!(count(&task_m.snapshot().transparent, OUTCOME_EGRESS_DIRECT), Some(&1));
+    assert_eq!(
+        count(&task_m.snapshot().transparent, OUTCOME_EGRESS_DIRECT),
+        Some(&1)
+    );
 }
 
 /// Gateway dial to a closed port: fail-close - peer EOF, one
@@ -157,7 +172,9 @@ async fn gateway_dial_failure_fail_closes() {
     };
     // Emit a real H1 request so the sniff succeeds and the Gateway step is
     // reached; only its dial fails.
-    peer.write_all(b"GET /x HTTP/1.1\r\nhost: app\r\n\r\n").await.unwrap();
+    peer.write_all(b"GET /x HTTP/1.1\r\nhost: app\r\n\r\n")
+        .await
+        .unwrap();
     run_outbound(
         io,
         dst(9000),
@@ -168,7 +185,10 @@ async fn gateway_dial_failure_fail_closes() {
         &m,
     )
     .await;
-    assert_eq!(count(&m.snapshot().transparent, OUTCOME_EGRESS_GATEWAY_FAIL), Some(&1));
+    assert_eq!(
+        count(&m.snapshot().transparent, OUTCOME_EGRESS_GATEWAY_FAIL),
+        Some(&1)
+    );
     // Fail-close: the peer sees the connection torn down. A FIN (read 0) is
     // the tidy case; an RST also happens because the sniffed prefix stays
     // in the kernel queue and the socket is dropped with it undrained.
@@ -210,7 +230,9 @@ async fn gateway_success_forwards_bytes_verbatim() {
     // Split the H1 request so the sniff sees only a borrowed prefix.
     peer.write_all(b"GE").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    peer.write_all(b"T /mesh HTTP/1.1\r\nhost: app\r\n\r\n").await.unwrap();
+    peer.write_all(b"T /mesh HTTP/1.1\r\nhost: app\r\n\r\n")
+        .await
+        .unwrap();
     peer.shutdown().await.unwrap();
 
     let (mut side, _) = gw.accept().await.unwrap();
@@ -222,5 +244,8 @@ async fn gateway_success_forwards_bytes_verbatim() {
     );
     drop(side);
     task.await.unwrap();
-    assert_eq!(count(&task_m.snapshot().transparent, OUTCOME_EGRESS_GATEWAY_OK), Some(&1));
+    assert_eq!(
+        count(&task_m.snapshot().transparent, OUTCOME_EGRESS_GATEWAY_OK),
+        Some(&1)
+    );
 }

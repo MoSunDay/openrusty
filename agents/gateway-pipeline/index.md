@@ -9,7 +9,7 @@ Commit: 681ad49
 - 不负责：插件的执行与沙箱语义（[WASM 插件运行时](../wasm-runtime/index.md)）；peer 选择、健康与转发细节（[代理与负载均衡](../proxy/index.md)）；配置结构与 Decision 定义（`openrusty-core`）；k8s 凭据/watch 状态机/渲染（`openrusty-k8s`，依赖箭头指向本 crate 的被消费库，语义由网关条目与 [docs/sidecar.md](../../docs/sidecar.md) 覆盖，不单独建索引）。
 
 ## 关键设计
-- 路由表：`/openrusty/status`（GET）、`/openrusty/reload`（POST）、`/openrusty/metrics`（GET）先于业务路由匹配，其余请求进入 `handle_request` 代理管线；启动配置含 `[dynamic]` 节（或 env `OPENRUSTY_DYNAMIC_DIR`）时另挂 `POST /api/v1/dynamic/{name}`（挂载是启动期语义，reload 只能在该节变化时重建 registry、不能挂/摘路由）。
+- 路由表：`/openrusty/status`（GET）、`/openrusty/reload`（POST）、`/openrusty/metrics`（GET）先于业务路由匹配，其余请求进入 `handle_request` 代理管线；启动配置含 `[dynamic]` 节（或 env `OPENRUSTY_DYNAMIC_DIR`）时另挂 `POST /api/v1/dynamic/{name}`（挂载是启动期语义，reload 只能在该节变化时重建 registry、不能挂/摘路由）与管理面注册接口 `PUT/DELETE /openrusty/dynamic/{name}`、`GET /openrusty/dynamic`（`dynamic_admin.rs`，同样受 `[admin]` token 守卫；PUT 先验证后原子落盘、可选 `method`+`path` 参数即绑即用）。
 - 业务路由按 `path_prefix` 最长前缀匹配；无匹配返回 404。
 - 请求侧按 `Phase::PRE_PROXY` 顺序执行 `post_read`/`rewrite`/`access`/`content`；任一阶段出现 `Deny` 即短路返回；`Done`/`Deny` 短路在 `resp_shortcut.rs` 统一映射：模块经 `resp_body_set` 写了 body 则 `200/s + body`（模块头原样），否则 `Done` 为空 204。
 - `content` 的默认处理器是代理转发：每次 upstream 尝试前先运行 `balancer` 阶段（插件可接管 peer 选择）；连接级失败换 peer 重试。
@@ -35,8 +35,8 @@ Commit: 681ad49
 
 ## 依赖与接口
 - 依赖 `openrusty-core`（config/context/Decision）、`openrusty-wasm`（`PluginRegistry` 快照）、`openrusty-proxy`（forward/tunnel/health）。
-- 对外接口：监听端口上的全部网关行为 + `GET /openrusty/status` + `POST /openrusty/reload` + `GET /openrusty/metrics` + `GET /openrusty/ready` + `GET /openrusty/live` + `POST /openrusty/shutdown` + `POST /api/v1/dynamic/{name}`（`dynamic_api.rs`，`[dynamic]` 启用时）+ 一次性子命令 `openrusty iptables-init`、`openrusty inject`。
-- 代码锚点：`crates/openrusty-server/src/{main,h2c,app,pipeline,ws,body_filter,reload,active_probe,metrics,dynamic_api,resp_shortcut}.rs`；`{listeners,transparent,egress,shutdown,sd_listen,check,logging}.rs`（sd_listen=socket activation fd 继承、check=`-t` 干跑、logging=文件日志+USR1 reopen） 与 `{tls,ingress,init,inject}/` 子模块、`crates/openrusty-k8s/`（被消费库）。
+- 对外接口：监听端口上的全部网关行为 + `GET /openrusty/status` + `POST /openrusty/reload` + `GET /openrusty/metrics` + `GET /openrusty/ready` + `GET /openrusty/live` + `POST /openrusty/shutdown` + `POST /api/v1/dynamic/{name}`（`dynamic_api.rs`，`[dynamic]` 启用时）+ `PUT/DELETE /openrusty/dynamic/{name}`、`GET /openrusty/dynamic`（`dynamic_admin.rs`）+ `{method,base path}→module` 绑定表（`dynamic_routes.rs`：fallback 在代理路由匹配前查表、胜过 `[[routes]]` 前缀；`/api/*` 与 `/api` 同槽互替、精确先于最长前缀；配置 `[[dynamic.routes]]` 每次 reload 重申、运行时绑定存活）+ 一次性子命令 `openrusty iptables-init`、`openrusty inject`。
+- 代码锚点：`crates/openrusty-server/src/{main,h2c,app,pipeline,ws,body_filter,reload,active_probe,metrics,dynamic_api,dynamic_admin,dynamic_routes,resp_shortcut}.rs`；`{listeners,transparent,egress,shutdown,sd_listen,check,logging}.rs`（sd_listen=socket activation fd 继承、check=`-t` 干跑、logging=文件日志+USR1 reopen） 与 `{tls,ingress,init,inject}/` 子模块、`crates/openrusty-k8s/`（被消费库）。
 
 ## 关联模块
 - [WASM 插件运行时](../wasm-runtime/index.md)

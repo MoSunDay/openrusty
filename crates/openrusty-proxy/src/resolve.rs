@@ -59,8 +59,7 @@ pub async fn resolve_config(cfg: &Config) -> Config {
         if up.endpoints.is_empty() {
             continue;
         }
-        let mut seen: HashSet<SocketAddr> =
-            up.peers.iter().map(|p| p.addr).collect();
+        let mut seen: HashSet<SocketAddr> = up.peers.iter().map(|p| p.addr).collect();
         let mut resolved = Vec::new();
         for endpoint in &up.endpoints {
             resolved.extend(resolve_endpoint(endpoint, &mut seen).await);

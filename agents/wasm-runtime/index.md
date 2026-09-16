@@ -15,7 +15,7 @@ Commit: 681ad49
 - 热重载：`PluginRegistry::reload` 重新读配置、编译并校验全部插件，成功后以 `arc-swap` 原子发布新 `PluginSnapshot`；任一步失败整体拒绝、旧快照保留；`generation` 递增。
 - host KV：键控于插件名（跨重载保留），支持带 TTL 的 `kv_get`/`kv_set`/`kv_del` 与 `kv_scan`；数据经两段式读写（`orr_alloc` 分配、长度不足返回 `-所需长度`）跨边界传递。
 - 响应体写入：第 19 个 import `resp_body_set`（SDK `host::set_resp_body`，1 MiB 上限，同请求覆盖）使 `Done`/`Deny` 短路携带模块写的 body（网关侧映射见 `resp_shortcut.rs`/`dynamic_api.rs`）。
-- 动态执行 API：`DynamicRegistry`（`dynamic.rs`）按 `[dynamic]` 节服务单模块合成管线；编译缓存 stat 驱动（键 `mtime+size`，替换文件下一请求生效、无需 reload）、按名 singleflight、`HostState` 按名跨替换存活；契约见 docs/wasm-abi.md "Dynamic execution API"。
+- 动态执行 API：`DynamicRegistry`（`dynamic.rs`）按 `[dynamic]` 节服务单模块合成管线；编译缓存 stat 驱动（键 `mtime+size`，替换文件下一请求生效、无需 reload）、按名 singleflight、`HostState` 按名跨替换存活；`validate_bytes`（编译+ABI 预检）与 `dir()` 支撑 server 侧注册面（PUT 先验证后原子落盘）；契约见 docs/wasm-abi.md "Dynamic execution API"。
 - guest 侧配套：`openrusty-sdk`（`no_std`：host imports 绑定、guest 分配器、`dispatch!`）与 `openrusty-macros`（`#[phase(...)]`）；一方插件见 `plugins/`。
 
 ## 核心链路

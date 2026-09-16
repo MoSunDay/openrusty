@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 /// Repo-root fixture, shared with `scripts/chart-lint.sh`.
 fn fixture() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/inject/deployment.yaml");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/inject/deployment.yaml");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", path.display()))
 }
@@ -30,10 +31,16 @@ fn defaults_when_no_annotations() {
 
 #[test]
 fn inject_disabled_is_explicit() {
-    assert!(!params_from(&[(&format!("{PREFIX}inject"), "disabled")])
-        .unwrap()
-        .enabled);
-    assert!(params_from(&[(&format!("{PREFIX}inject"), "enabled")]).unwrap().enabled);
+    assert!(
+        !params_from(&[(&format!("{PREFIX}inject"), "disabled")])
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        params_from(&[(&format!("{PREFIX}inject"), "enabled")])
+            .unwrap()
+            .enabled
+    );
     let err = params_from(&[(&format!("{PREFIX}inject"), "Enabled")]).unwrap_err();
     assert!(err.contains("enabled|disabled"), "got: {err}");
 }
@@ -66,7 +73,9 @@ fn uid_log_level_and_egress_parse() {
     assert_eq!(p.egress_gateway, "egress.demo.svc:4140");
 
     assert_eq!(
-        params_from(&[(&format!("{PREFIX}egress-mode"), "deny")]).unwrap().egress_mode,
+        params_from(&[(&format!("{PREFIX}egress-mode"), "deny")])
+            .unwrap()
+            .egress_mode,
         EgressMode::Deny
     );
     let err = params_from(&[(&format!("{PREFIX}egress-mode"), "gateway")]).unwrap_err();
@@ -85,7 +94,10 @@ fn app_port_parses_into_params() {
     assert_eq!(p.app_port, Some(8080));
     assert_eq!(InjectParams::default().app_port, None);
     let err = params_from(&[(&format!("{PREFIX}app-port"), "http")]).unwrap_err();
-    assert!(err.contains("app-port") && err.contains("port number"), "got: {err}");
+    assert!(
+        err.contains("app-port") && err.contains("port number"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -93,17 +105,35 @@ fn app_port_renders_pod_local_upstream_and_catch_all_route() {
     // With the annotation: the app upstream (127.0.0.1:<port>) plus the
     // catch-all route land between [egress] and [ingress] - and the
     // rendered TOML still boots through the real load_config.
-    let p = InjectParams { app_port: Some(8080), ..InjectParams::default() };
+    let p = InjectParams {
+        app_port: Some(8080),
+        ..InjectParams::default()
+    };
     let src = config::render_config_toml(&p).expect("renders");
-    assert!(src.contains("name = \"app\"\n"), "upstream named app: {src}");
-    assert!(src.contains("addr = \"127.0.0.1:8080\"\n"), "pod-local peer: {src}");
-    assert!(src.contains("path_prefix = \"/\"\nupstream = \"app\"\n"), "catch-all route: {src}");
+    assert!(
+        src.contains("name = \"app\"\n"),
+        "upstream named app: {src}"
+    );
+    assert!(
+        src.contains("addr = \"127.0.0.1:8080\"\n"),
+        "pod-local peer: {src}"
+    );
+    assert!(
+        src.contains("path_prefix = \"/\"\nupstream = \"app\"\n"),
+        "catch-all route: {src}"
+    );
     let egress = src.find("[egress]").expect("egress section");
     let app = src.find("[[upstreams]]").expect("upstreams section");
     let ingress = src.find("[ingress]").expect("ingress section");
-    assert!(egress < app && app < ingress, "block sits between egress and ingress");
+    assert!(
+        egress < app && app < ingress,
+        "block sits between egress and ingress"
+    );
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("openrusty-inject-appport-{}.toml", std::process::id()));
+    let path = dir.join(format!(
+        "openrusty-inject-appport-{}.toml",
+        std::process::id()
+    ));
     std::fs::write(&path, &src).unwrap();
     let cfg = load_config(&path).unwrap_or_else(|e| panic!("app-port config boots: {e}"));
     let _ = std::fs::remove_file(&path);
@@ -157,7 +187,10 @@ fn rendered_toml_loads_through_real_load_config() {
         ),
     ] {
         let src = config::render_config_toml(&mutate).expect("renders");
-        let path = dir.join(format!("openrusty-inject-test-{}-{check}.toml", std::process::id()));
+        let path = dir.join(format!(
+            "openrusty-inject-test-{}-{check}.toml",
+            std::process::id()
+        ));
         std::fs::write(&path, &src).unwrap();
         let cfg = load_config(&path).unwrap_or_else(|e| panic!("{check}: {e}"));
         let _ = std::fs::remove_file(&path);
@@ -240,17 +273,18 @@ fn e2e_fixture_deployment_gets_three_pieces() {
         .map(|p| p["containerPort"].as_u64().unwrap() as u16)
         .collect();
     assert_eq!(ports, vec![INBOUND_PORT, OUTBOUND_PORT, ADMIN_PORT]);
-    assert_eq!(
-        sidecar["env"][0]["name"].as_str(),
-        Some(OPAQUE_PORTS_ENV)
-    );
+    assert_eq!(sidecar["env"][0]["name"].as_str(), Some(OPAQUE_PORTS_ENV));
     assert_eq!(sidecar["env"][0]["value"].as_str(), Some("8443"));
     assert_eq!(
         sidecar["volumeMounts"][0]["mountPath"].as_str(),
         Some(CONFIG_MOUNT)
     );
     // The app container survives untouched.
-    assert!(spec["containers"].as_sequence().unwrap().iter().any(|c| c["name"].as_str() == Some("echo")));
+    assert!(spec["containers"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"].as_str() == Some("echo")));
     // Config volume references the ConfigMap.
     assert_eq!(
         spec["volumes"][0]["configMap"]["name"].as_str(),
@@ -259,7 +293,10 @@ fn e2e_fixture_deployment_gets_three_pieces() {
 
     // c. the ConfigMap document: name, key, and loadable TOML.
     assert_eq!(cm["kind"].as_str(), Some("ConfigMap"));
-    assert_eq!(cm["metadata"]["name"].as_str(), Some("echo-openrusty-config"));
+    assert_eq!(
+        cm["metadata"]["name"].as_str(),
+        Some("echo-openrusty-config")
+    );
     assert_eq!(cm["metadata"]["namespace"].as_str(), Some("demo"));
     let toml_src = cm["data"]["openrusty.toml"].as_str().expect("toml");
     let dir = std::env::temp_dir();
@@ -299,7 +336,8 @@ fn multidoc_unsupported_kind_and_double_inject_fail() {
 fn bare_pod_injects_at_spec() {
     let pod = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: scratch\n  annotations:\n    config.openrusty.io/proxy-uid: \"7\"\nspec:\n  containers:\n    - name: app\n      image: app\n";
     let out = run(pod).unwrap();
-    let workload: serde_yaml::Value = serde_yaml::from_str(out.split("\n---\n").next().unwrap()).unwrap();
+    let workload: serde_yaml::Value =
+        serde_yaml::from_str(out.split("\n---\n").next().unwrap()).unwrap();
     let cmd: Vec<String> = workload["spec"]["initContainers"][0]["command"]
         .as_sequence()
         .unwrap()
@@ -307,7 +345,11 @@ fn bare_pod_injects_at_spec() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     let uid_at = cmd.iter().position(|a| a == "--proxy-uid").unwrap();
-    assert_eq!(cmd[uid_at + 1], "7", "uid annotation encoded into init flags");
+    assert_eq!(
+        cmd[uid_at + 1],
+        "7",
+        "uid annotation encoded into init flags"
+    );
     assert!(
         out.contains("scratch-openrusty-config"),
         "configmap named after the pod: {out}"
@@ -318,13 +360,22 @@ fn bare_pod_injects_at_spec() {
 fn run_cli_exit_codes() {
     let no_args: Vec<String> = Vec::new();
     assert_eq!(run_cli(&no_args, fixture().as_bytes(), std::io::sink()), 0);
-    assert_eq!(run_cli(&no_args, "kind: Service\n".as_bytes(), std::io::sink()), 1);
+    assert_eq!(
+        run_cli(&no_args, "kind: Service\n".as_bytes(), std::io::sink()),
+        1
+    );
     assert_eq!(run_cli(&no_args, "".as_bytes(), std::io::sink()), 1);
     assert_eq!(run_cli(&no_args, "a: [1,\n".as_bytes(), std::io::sink()), 1);
     // Bad flags exit 2 (iptables-init convention); -h prints usage, exit 0.
     let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    assert_eq!(run_cli(&argv(&["--bogus"]), "".as_bytes(), std::io::sink()), 2);
-    assert_eq!(run_cli(&argv(&["--image"]), "".as_bytes(), std::io::sink()), 2);
+    assert_eq!(
+        run_cli(&argv(&["--bogus"]), "".as_bytes(), std::io::sink()),
+        2
+    );
+    assert_eq!(
+        run_cli(&argv(&["--image"]), "".as_bytes(), std::io::sink()),
+        2
+    );
     assert_eq!(run_cli(&argv(&["-h"]), "".as_bytes(), std::io::sink()), 0);
 }
 
@@ -344,7 +395,9 @@ fn image_flag_overrides_both_containers() {
         Some("reg.example/openrusty:1.2.3")
     );
     assert_eq!(
-        spec["containers"].as_sequence().unwrap()
+        spec["containers"]
+            .as_sequence()
+            .unwrap()
             .iter()
             .find(|c| c["name"].as_str() == Some(SIDECAR_NAME))
             .unwrap()["image"]

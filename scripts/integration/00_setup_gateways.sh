@@ -64,6 +64,13 @@ timeout_ms = 100
 [dynamic.settings.echo]
 greeting = "hi"
 
+# Boot-time {method, path} -> module bindings (enforced on every reload;
+# runtime PUT bindings survive reloads alongside these).
+[[dynamic.routes]]
+method = "get"
+path = "/bound/*"
+module = "echo"
+
 [[upstreams]]
 name = "vllm"
 balancer = "swrr"

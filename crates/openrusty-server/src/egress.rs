@@ -212,7 +212,8 @@ async fn forward_to_gateway<S>(
     metrics: &Metrics,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
-{    let role = ListenerRole::Outbound.as_str();
+{
+    let role = ListenerRole::Outbound.as_str();
     let Some(gateway) = gateway else {
         // Configuration slipped through unvalidated: fail closed, loudly.
         metrics.record_transparent(role, OUTCOME_EGRESS_GATEWAY_FAIL);

@@ -4,8 +4,10 @@
 //! `RuntimeSnapshot` is swapped atomically on reload; in-flight requests
 //! keep their own `Arc` clone alive for the whole request.
 
+use crate::dynamic_routes::DynamicRoutes;
 use crate::metrics;
-use openrusty_core::config::{Config, RouteConfig};
+use arc_swap::Guard;
+use openrusty_core::config::{Config, DynamicRoute, RouteConfig};
 use openrusty_proxy as proxy;
 use openrusty_wasm::{DynamicRegistry, PluginRegistry};
 use std::collections::HashMap;
@@ -41,6 +43,11 @@ pub struct AppState {
     pub metrics: Arc<metrics::Metrics>,
     pub runtime: arc_swap::ArcSwap<RuntimeSnapshot>,
     pub config_path: PathBuf,
+    /// Active `[admin]` shared secret (`None` = open admin plane). Seeded
+    /// at boot and swapped ONLY by the file-based reload path
+    /// (`reload::reload`): ingress-rendered configs carry no `[admin]`
+    /// section and must never clear a boot-time token.
+    pub admin_token: arc_swap::ArcSwapOption<String>,
     /// The boot-time static configuration. Base of the ingress render
     /// merge (static upstreams/routes plus the `[ingress]` segment); a
     /// file reload swaps the runtime directly and never rewrites this
@@ -57,6 +64,12 @@ pub struct AppState {
     /// rendered secrets into it. Rotation swaps resolver tables and
     /// never disturbs established connections.
     pub tls_resolver: Option<Arc<crate::tls::DynamicCertResolver>>,
+    /// `{method, path} -> module` bindings for the dynamic execution
+    /// API, consulted by `app::fallback` BEFORE the proxy routes (see
+    /// `dynamic_routes`). Swapped atomically: config reconciles it on
+    /// reload (`apply_dynamic_routes`), the registration face mutates
+    /// it at runtime (`bind_dynamic_route`/`unbind_dynamic_module`).
+    pub dynamic_routes: arc_swap::ArcSwap<DynamicRoutes>,
     /// Dynamic-API module registry (`POST /api/v1/dynamic/<name>`);
     /// `None` while the `[dynamic]` config section is absent. Rebuilt
     /// only when that section CHANGES on reload (see [`apply_dynamic`]):
@@ -105,8 +118,7 @@ pub fn from_config(
     // Fail fast on unreadable/invalid upstream TLS material, before any
     // plugin is compiled; the plans are threaded into `apply_runtime` so
     // the first snapshot is ready to serve https peers.
-    let tls_plans =
-        build_tls_plans(&cfg).map_err(openrusty_wasm::ReloadError::Io)?;
+    let tls_plans = build_tls_plans(&cfg).map_err(openrusty_wasm::ReloadError::Io)?;
     let registry = PluginRegistry::bootstrap(&cfg)?;
     // One shared SNI resolver whenever any listener terminates TLS; the
     // material itself is loaded later, in the listener bind phase (so a
@@ -122,6 +134,10 @@ pub fn from_config(
         .dynamic
         .as_ref()
         .map(|d| DynamicRegistry::new(registry.engine().clone(), registry.linker().clone(), d));
+    // Config-declared bindings seed the runtime table (later reloads
+    // reconcile it via `apply_dynamic_routes`).
+    let cfg_routes: &[DynamicRoute] = cfg.dynamic.as_ref().map_or(&[], |d| &d.routes);
+    let dynamic_routes = DynamicRoutes::new().reconcile(cfg_routes);
     let state = Arc::new(AppState {
         registry,
         health: Arc::new(proxy::new()),
@@ -129,10 +145,14 @@ pub fn from_config(
         metrics: Arc::new(metrics::Metrics::new()),
         runtime: arc_swap::ArcSwap::from_pointee(empty_runtime()),
         config_path,
+        admin_token: arc_swap::ArcSwapOption::new(
+            cfg.admin.effective_token().map(|t| Arc::new(t.to_string())),
+        ),
         static_config: cfg,
         ingress: arc_swap::ArcSwap::from_pointee(crate::ingress::WatchStatus::default()),
         tls_resolver,
         dynamic: arc_swap::ArcSwap::from_pointee(dynamic),
+        dynamic_routes: arc_swap::ArcSwap::from_pointee(dynamic_routes),
         started_at: std::time::Instant::now(),
         probe_task: Mutex::new(None),
         reload_gate: tokio::sync::Mutex::new(()),
@@ -148,9 +168,7 @@ pub fn from_config(
 /// certificate files are read and parsed here, once per boot/reload, so
 /// the request path only ever sees ready-to-use [`proxy::tls::UpstreamTls`]
 /// and a bad anchor aborts the swap before anything is published.
-pub fn build_tls_plans(
-    cfg: &Config,
-) -> Result<HashMap<String, proxy::tls::UpstreamTls>, String> {
+pub fn build_tls_plans(cfg: &Config) -> Result<HashMap<String, proxy::tls::UpstreamTls>, String> {
     let mut plans = HashMap::new();
     for uc in &cfg.upstreams {
         if let Some(tc) = &uc.tls {
@@ -284,11 +302,78 @@ pub fn apply_dynamic(state: &AppState, cfg: &Config) {
         return;
     }
     let next = cfg.dynamic.as_ref().map(|d| {
-        DynamicRegistry::new(state.registry.engine().clone(), state.registry.linker().clone(), d)
+        DynamicRegistry::new(
+            state.registry.engine().clone(),
+            state.registry.linker().clone(),
+            d,
+        )
     });
     state.dynamic.store(Arc::new(next));
     tracing::info!(
         dir = cfg.dynamic.as_ref().map(|d| d.dir.as_str()).unwrap_or(""),
         "dynamic module registry swapped"
     );
+}
+
+/// Reconcile the dynamic route table against the new config's
+/// `[[dynamic.routes]]`: config-owned keys are enforced verbatim, keys
+/// dropped from the config disappear, runtime-added bindings (PUT
+/// /openrusty/dynamic/...) survive. Unlike registry rebuilds this runs
+/// on EVERY reload (it is a cheap table swap, and bindings - unlike
+/// mounted routes - take effect without a router rebuild). A config
+/// with no `[dynamic]` section empties the table: with the registry
+/// gone, dynamic dispatch must stop intercepting the fallback.
+pub fn apply_dynamic_routes(state: &AppState, cfg: &Config) {
+    let next = match &cfg.dynamic {
+        None => DynamicRoutes::new(),
+        Some(d) => state.dynamic_routes.load_full().reconcile(&d.routes),
+    };
+    tracing::info!(
+        routes = next.len(),
+        config_routes = cfg.dynamic.as_ref().map(|d| d.routes.len()).unwrap_or(0),
+        "dynamic route table reconciled"
+    );
+    state.dynamic_routes.store(Arc::new(next));
+}
+
+/// Runtime-bind one dynamic route (registration face). Copy-on-write
+/// under compare-and-swap so two concurrent registrations cannot lose
+/// updates; the bounded retry keeps a pathological loser from spinning.
+pub fn bind_dynamic_route(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    module: &str,
+) -> Result<(), String> {
+    for _ in 0..8 {
+        let current = state.dynamic_routes.load_full();
+        let next = current.bind(method, path, module)?;
+        let prev = state
+            .dynamic_routes
+            .compare_and_swap(&current, Arc::new(next));
+        if Arc::ptr_eq(&Guard::into_inner(prev), &current) {
+            tracing::info!(method, path, module, "dynamic route bound");
+            return Ok(());
+        }
+    }
+    Err("dynamic route table contention; retry".to_string())
+}
+
+/// Remove every binding pointing at `module` (DELETE registration
+/// face); returns how many went away.
+pub fn unbind_dynamic_module(state: &AppState, module: &str) -> usize {
+    for _ in 0..8 {
+        let current = state.dynamic_routes.load_full();
+        let (next, removed) = current.unbind_module(module);
+        let prev = state
+            .dynamic_routes
+            .compare_and_swap(&current, Arc::new(next));
+        if Arc::ptr_eq(&Guard::into_inner(prev), &current) {
+            if removed > 0 {
+                tracing::info!(module, removed, "dynamic routes unbound");
+            }
+            return removed;
+        }
+    }
+    0
 }

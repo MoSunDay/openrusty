@@ -42,7 +42,9 @@ pub(crate) fn pin_is_valid(
     healthy: bool,
     tried: &[SocketAddr],
 ) -> bool {
-    up_rt.up.peers
+    up_rt
+        .up
+        .peers
         .get(idx)
         .is_some_and(|p| healthy && !tried.contains(&p.addr))
 }
@@ -63,8 +65,13 @@ pub(crate) fn pick_peer(
         // Re-validate against CURRENT health: a peer can die between the
         // plugin's (snapshot-age) view and this attempt. A peer this request
         // already tried is equally invalid: retrying it cannot help.
-        if pin_is_valid(up_rt, idx, proxy::is_healthy(&state.health, &up_rt.up.name, idx, now_ms()), &tried)
-        {
+        if pin_is_valid(
+            up_rt,
+            idx,
+            proxy::is_healthy(&state.health, &up_rt.up.name, idx, now_ms()),
+            &tried,
+        ) {
+            proxy::inc_in_flight(&state.health, &up_rt.up.name, up_rt.up.peers[idx].addr);
             return Pick::Peer(idx);
         }
         tracing::warn!(
@@ -89,10 +96,26 @@ pub(crate) fn pick_peer(
             let ip = session.ctx().client_addr.ip().to_string();
             proxy::ip_hash_pick(&ip, &candidates)
         }
+        BalancerKind::LeastConn => {
+            let flights = proxy::in_flights(&state.health, &up_rt.up.name, &up_rt.up.peers);
+            let weights: Vec<u32> = up_rt.up.peers.iter().map(|p| p.weight).collect();
+            proxy::least_conn_pick(&flights, &weights, &candidates)
+        }
     };
     match chosen {
-        Some(i) => Pick::Peer(i),
+        Some(i) => {
+            proxy::inc_in_flight(&state.health, &up_rt.up.name, up_rt.up.peers[i].addr);
+            Pick::Peer(i)
+        }
         None => Pick::None,
+    }
+}
+
+/// Mark one balancer-phase attempt as finished: the peer's in-flight
+/// gauge drops, so `least_conn` sees it as available again.
+pub(crate) fn release_peer(state: &AppState, up_rt: &UpstreamRt, idx: usize) {
+    if let Some(peer) = up_rt.up.peers.get(idx) {
+        proxy::dec_in_flight(&state.health, &up_rt.up.name, peer.addr);
     }
 }
 
@@ -132,7 +155,11 @@ mod tests {
 
     #[test]
     fn untried_filter_drops_attempted_and_keeps_others() {
-        let peers = vec![peer("127.0.0.1:9001"), peer("127.0.0.1:9002"), peer("127.0.0.1:9003")];
+        let peers = vec![
+            peer("127.0.0.1:9001"),
+            peer("127.0.0.1:9002"),
+            peer("127.0.0.1:9003"),
+        ];
         let healthy = vec![0, 1, 2];
         assert_eq!(untried_healthy(&peers, &healthy, &[]), vec![0, 1, 2]);
         let tried: Vec<SocketAddr> = vec!["127.0.0.1:9002".parse().unwrap()];
@@ -214,6 +241,67 @@ mod tests {
         match pick_peer(&state, &up_rt, &mut session) {
             Pick::None => {}
             other => panic!("expected no candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn least_conn_avoids_busy_peer_and_recovers_after_release() {
+        let dir = TmpDir::new("least-conn");
+        // Two equal peers under least_conn: the busy one must lose.
+        let cfg = dir
+            .standard_config()
+            .replace(
+                "  [[upstreams.peers]]\n  addr = \"127.0.0.1:9001\"",
+                "  [[upstreams.peers]]\n  addr = \"127.0.0.1:9001\"\n\n  [[upstreams.peers]]\n  addr = \"127.0.0.1:9002\"",
+            )
+            .replace("name = \"u\"\n", "name = \"u\"\nbalancer = \"least_conn\"\n");
+        dir.write_config(&cfg);
+        let state = boot_state(&dir);
+        let rt = state.runtime.load();
+        let up_rt = rt.upstreams["u"].clone();
+        assert!(matches!(up_rt.up.kind, BalancerKind::LeastConn));
+        let snap = state.registry.snapshot();
+        let views: Vec<PeerView> = up_rt
+            .up
+            .peers
+            .iter()
+            .map(|p| PeerView {
+                name: p.addr.to_string(),
+                addr: p.addr.to_string(),
+                healthy: true,
+            })
+            .collect();
+        let ctx = ReqCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            client_addr: "127.0.0.1:40000".parse().unwrap(),
+            headers: Vec::new(),
+            route_index: None,
+            upstream: Some("u".into()),
+            peer_index: None,
+            attempts: 0,
+            tried: vec![],
+        };
+        let mut session = RequestSession::new(&state.registry, snap, ctx, views);
+
+        // Two attempts still held open on peer 0: the pick must avoid it.
+        proxy::inc_in_flight(&state.health, &up_rt.up.name, up_rt.up.peers[0].addr);
+        proxy::inc_in_flight(&state.health, &up_rt.up.name, up_rt.up.peers[0].addr);
+        match pick_peer(&state, &up_rt, &mut session) {
+            Pick::Peer(i) => assert_eq!(i, 1, "least_conn must avoid the busy peer"),
+            other => panic!("expected a peer, got {other:?}"),
+        }
+
+        // Release both held slots (plus the one pick_peer itself took on
+        // peer 1): peer 0 becomes the least-loaded choice again.
+        release_peer(&state, &up_rt, 0);
+        release_peer(&state, &up_rt, 0);
+        release_peer(&state, &up_rt, 1);
+        match pick_peer(&state, &up_rt, &mut session) {
+            Pick::Peer(i) => assert_eq!(i, 0, "released peer must be preferred again"),
+            other => panic!("expected a peer, got {other:?}"),
         }
     }
 }

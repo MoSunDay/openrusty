@@ -17,8 +17,9 @@ const TLS_RULE: &str = r#"{"metadata":{"name":"tls","namespace":"shop","resource
 
 /// One-item snapshot parsed from an object JSON body.
 fn snap<T: ResourceMeta + DeserializeOwned>(json: &str, rv: &str) -> Snapshot<T> {
-    let item =
-        parse_line::<T>(&format!(r#"{{"type":"ADDED","object":{json}}}"#)).unwrap().object;
+    let item = parse_line::<T>(&format!(r#"{{"type":"ADDED","object":{json}}}"#))
+        .unwrap()
+        .object;
     replace_from_list(vec![item], rv)
 }
 
@@ -49,8 +50,7 @@ fn booted_with_tls_listener(tag: &str) -> (TmpDir, Arc<AppState>) {
 /// Base64 of a fixture file, for hand-built k8s Secret bodies.
 fn b64_fixture(name: &str) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .encode(std::fs::read(fixture_path(name)).unwrap())
+    base64::engine::general_purpose::STANDARD.encode(std::fs::read(fixture_path(name)).unwrap())
 }
 
 /// First DER cert of a fixture PEM (identity of published material).
@@ -77,8 +77,7 @@ fn watch_paths_are_cluster_wide_or_namespaced() {
     );
     assert_eq!(
         secret_paths(&["web".to_string()]),
-        vec!["/api/v1/namespaces/web/secrets?fieldSelector=type%3Dkubernetes.io%2Ftls"
-            .to_string()]
+        vec!["/api/v1/namespaces/web/secrets?fieldSelector=type%3Dkubernetes.io%2Ftls".to_string()]
     );
 }
 
@@ -166,7 +165,14 @@ fn up(name: &str) -> UpstreamConfig {
 fn route_keys(routes: &[RouteConfig]) -> Vec<(Option<String>, String, bool, String)> {
     routes
         .iter()
-        .map(|r| (r.host.clone(), r.path_prefix.clone(), r.exact, r.upstream.clone()))
+        .map(|r| {
+            (
+                r.host.clone(),
+                r.path_prefix.clone(),
+                r.exact,
+                r.upstream.clone(),
+            )
+        })
         .collect()
 }
 
@@ -211,9 +217,18 @@ async fn apply_publishes_merged_runtime_at_plugin_generation() {
     assert_eq!(rt.routes[0].path_prefix, "/");
     assert_eq!(rt.routes[1].path_prefix, "/api");
     assert_eq!(rt.routes[1].host.as_deref(), Some("app.example.com"));
-    let up = rt.upstreams.get("ing-shop-web-80").expect("rendered upstream");
-    assert!(up.up.peers.is_empty(), "unresolvable endpoint: apply-time DNS lookup yields no peers");
-    assert_eq!(up.up.health.max_fails, 0, "passive health off for single ClusterIP");
+    let up = rt
+        .upstreams
+        .get("ing-shop-web-80")
+        .expect("rendered upstream");
+    assert!(
+        up.up.peers.is_empty(),
+        "unresolvable endpoint: apply-time DNS lookup yields no peers"
+    );
+    assert_eq!(
+        up.up.health.max_fails, 0,
+        "passive health off for single ClusterIP"
+    );
     // route-only swap: the plugin snapshot generation is carried over
     assert_eq!(rt.generation, state.registry.snapshot().generation);
 }
@@ -277,7 +292,8 @@ async fn apply_without_tls_listeners_needs_no_resolver() {
 }
 
 #[tokio::test]
-async fn failed_client_setup_marks_watching_false_and_serves_static() {    let (_dir, state) = booted("ingress-nocreds");
+async fn failed_client_setup_marks_watching_false_and_serves_static() {
+    let (_dir, state) = booted("ingress-nocreds");
     let cfg = IngressConfig {
         enabled: true,
         kubeconfig: "/nonexistent/openrusty-kubeconfig".to_string(),
@@ -295,7 +311,10 @@ async fn failed_client_setup_marks_watching_false_and_serves_static() {    let (
 
 #[test]
 fn status_node_disabled_shape() {
-    assert_eq!(status_node(&WatchStatus::default()), serde_json::json!({"enabled": false}));
+    assert_eq!(
+        status_node(&WatchStatus::default()),
+        serde_json::json!({"enabled": false})
+    );
 }
 
 #[test]

@@ -30,6 +30,47 @@ dynamic_drill() {
     CODE="$(head -c 1048577 /dev/zero | curl -s -o /dev/null -w '%{http_code}' --max-time 8 --data-binary @- "$GATE/api/v1/dynamic/echo" || true)"
     check "dynamic: body over the 1 MiB cap rejected 413" test "$CODE" = "413"
     check "dynamic: requests counted in metrics" bash -c "curl -s --max-time 5 '$GATE/openrusty/metrics' | grep -q 'openrusty_dynamic_requests_total{module=\"echo\",code=\"200\"}'"
+
+    # ---- registration face + {method,path} bindings -----------------------
+    # All of /openrusty/* sits behind the [admin] token when one is set;
+    # this boot config sets none, so the face is exercised directly.
+    # (a) boot-time [[dynamic.routes]] enforcement.
+    check "dynamic: listing shows the config binding" bash -c "curl -s --max-time 5 '$GATE/openrusty/dynamic' | python3 -c 'import sys,json; d=json.load(sys.stdin); assert {\"echo\", \"reverse\"} <= set(d[\"modules\"]); assert any(r[\"module\"]==\"echo\" and r[\"method\"]==\"GET\" and r[\"path\"]==\"/bound/*\" for r in d[\"routes\"])'"
+    check "dynamic: config-bound prefix serves below the base" bash -c "curl -s --max-time 8 '$GATE/bound/x' | grep -qx 'hi: dynamic-echo'"
+    check "dynamic: config-bound prefix serves the bare base" bash -c "curl -s --max-time 8 '$GATE/bound' | grep -qx 'hi: dynamic-echo'"
+    check "dynamic: prefix does not match sibling paths" bash -c "! curl -s --max-time 8 '$GATE/boundfoo' | grep -q 'dynamic-echo'"
+    # (b) PUT stores + binds in one call; bindings win over [[routes]]
+    # prefixes (the catch-all / would otherwise proxy these).
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$ROOT/build/plugins/dynamic-reverse.wasm" --max-time 10 "$GATE/openrusty/dynamic/reg?method=post&path=/__reg" || true)"
+    check "dynamic: PUT stores and binds in one call" test "$CODE" = "200"
+    check "dynamic: bound route dispatches the module" bash -c "curl -s -d abc -X POST --max-time 8 '$GATE/__reg' | grep -qx cba"
+    check "dynamic: binding is method-scoped" bash -c "! curl -s --max-time 8 '$GATE/__reg' | grep -qx cba"
+    # (c) bind-only form (empty body) + slot replacement semantics.
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --max-time 8 "$GATE/openrusty/dynamic/echo?method=get&path=/__echo2" || true)"
+    check "dynamic: bind-only PUT reuses the stored artifact" test "$CODE" = "200"
+    check "dynamic: bind-only route serves the module" bash -c "curl -s --max-time 8 '$GATE/__echo2' | grep -qx 'hi: dynamic-echo'"
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --max-time 8 "$GATE/openrusty/dynamic/echo?method=post&path=/__slot" || true)"
+    check "dynamic: rebinding a base replaces the earlier shape" test "$CODE" = "200"
+    check "dynamic: replaced exact binding no longer matches deep paths" bash -c "! curl -s -d abc -X POST --max-time 8 '$GATE/__slot/deep' | grep -qx cba"
+    check "dynamic: replaced binding still answers the exact path" bash -c "curl -s -d abc -X POST --max-time 8 '$GATE/__slot' | grep -qx 'hi: abc'"
+    # (d) rejection paths: bad name, partial params, unknown module, garbage bytes.
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$ROOT/build/plugins/dynamic-reverse.wasm" --max-time 8 "$GATE/openrusty/dynamic/.hidden?method=get&path=/x" || true)"
+    check "dynamic: PUT rejects invalid module names" test "$CODE" = "400"
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$ROOT/build/plugins/dynamic-reverse.wasm" --max-time 8 "$GATE/openrusty/dynamic/reg?method=post" || true)"
+    check "dynamic: PUT rejects partial bind params" test "$CODE" = "400"
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --max-time 8 "$GATE/openrusty/dynamic/nosuch?method=get&path=/x" || true)"
+    check "dynamic: bind-only against missing artifact is 404" test "$CODE" = "404"
+    CODE="$(printf 'not a wasm module' | curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- --max-time 8 "$GATE/openrusty/dynamic/garbage" || true)"
+    check "dynamic: PUT rejects non-module bytes" test "$CODE" = "400"
+    check "dynamic: dispatched requests counted per module" bash -c "curl -s --max-time 5 '$GATE/openrusty/metrics' | grep -q 'openrusty_dynamic_requests_total{module=\"reg\",code=\"200\"}'"
+    # (e) DELETE drops artifact + bindings; dispatch stops immediately.
+    check "dynamic: DELETE reports the unbound count" bash -c "curl -s -X DELETE --max-time 8 '$GATE/openrusty/dynamic/reg' | grep -q '\"unbound\":1'"
+    check "dynamic: unbound path no longer serves the module" bash -c "! curl -s -d abc -X POST --max-time 8 '$GATE/__reg' | grep -qx cba"
+    check "dynamic: second DELETE is 404" test "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --max-time 8 "$GATE/openrusty/dynamic/reg" || true)" = "404"
+    # (f) reload keeps runtime bindings and re-enforces config ones.
+    curl -s -X POST --max-time 10 "$GATE/openrusty/reload" > /dev/null || true
+    check "dynamic: reload keeps runtime-added bindings" bash -c "curl -s --max-time 8 '$GATE/__echo2' | grep -qx 'hi: dynamic-echo'"
+    check "dynamic: reload re-enforces config bindings" bash -c "curl -s --max-time 8 '$GATE/bound/x' | grep -qx 'hi: dynamic-echo'"
     # Replace semantics: overwrite echo.wasm with the reverse module and
     # ask again immediately -- the stat-driven compile cache keys on
     # mtime+size, so the new module answers on the very next request, no
