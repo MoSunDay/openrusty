@@ -10,8 +10,8 @@
 //! shared ticker the deadline always covers exactly the caller's own
 //! window, regardless of how often the epoch advances.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use wasmtime::Engine;
@@ -23,7 +23,10 @@ pub const TICK_MS: u64 = 10;
 /// Whole epoch ticks covering `timeout`; always at least one tick so a
 /// (theoretically) zero timeout still cannot run unchecked.
 pub fn ticks_for(timeout: Duration) -> u64 {
-    std::cmp::max(1, u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX) / TICK_MS)
+    std::cmp::max(
+        1,
+        u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX) / TICK_MS,
+    )
 }
 
 /// Bumps the engine epoch every [`TICK_MS`] until dropped.

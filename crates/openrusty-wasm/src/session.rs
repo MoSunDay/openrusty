@@ -293,6 +293,7 @@ mod tests {
                 shutdown_grace_ms: 5_000,
                 log_file: None,
             },
+            admin: Default::default(),
             plugins: PluginsConfig {
                 dir: dir.into(),
                 order: order.iter().map(|s| s.to_string()).collect(),
@@ -446,7 +447,10 @@ mod tests {
         let reg = PluginRegistry::bootstrap(&cfg).unwrap();
         let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
         assert_eq!(sess.run_phase(Phase::Content), Decision::Done);
-        assert_eq!(sess.take_resp_body().as_deref(), Some(&b"served by plugin"[..]));
+        assert_eq!(
+            sess.take_resp_body().as_deref(),
+            Some(&b"served by plugin"[..])
+        );
         // The body is drained (session copy and instance host data).
         assert!(sess.take_resp_body().is_none());
     }

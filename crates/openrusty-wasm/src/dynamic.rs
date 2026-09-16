@@ -179,6 +179,26 @@ impl DynamicRegistry {
         &self.cfg
     }
 
+    /// Module directory (`[dynamic].dir`): where the registration face
+    /// (`PUT /openrusty/dynamic/{name}`) lands `<name>.wasm` artifacts.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Upload-time artifact check: compile + ABI-validate raw module
+    /// bytes with the shared engine/linker. Pure (no cache writes), so
+    /// the registration face can reject a bad artifact BEFORE it lands
+    /// in `dir` - a broken file would otherwise compile-fail per
+    /// request until replaced. Accepts wasm binaries and WAT text
+    /// (wasmtime compiles either).
+    pub fn validate_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        let module =
+            Module::new(&self.engine, bytes).map_err(|e| format!("compile failed: {e}"))?;
+        validate_module(&self.engine, &self.linker, &module)
+            .map_err(|e| format!("abi validation failed: {e}"))?;
+        Ok(())
+    }
+
     /// Run one request through the synthesized single-plugin pipeline.
     /// `ctx` should carry method POST and the dynamic path; `body` is the
     /// buffered request body (already capped by the caller).

@@ -7,7 +7,7 @@
 
 use super::{
     ignore_inbound_ports, InjectParams, ADMIN_PORT, CONFIG_MOUNT, CONFIG_PATH, CONFIG_VOLUME,
-    INBOUND_PORT, INIT_NAME, OUTBOUND_PORT, OPAQUE_PORTS_ENV, SIDECAR_NAME,
+    INBOUND_PORT, INIT_NAME, OPAQUE_PORTS_ENV, OUTBOUND_PORT, SIDECAR_NAME,
 };
 use serde::Serialize;
 use serde_yaml::Value;
@@ -97,7 +97,11 @@ pub fn pod_spec(doc: &mut Value) -> Result<&mut Value, String> {
             path.join(".")
         )
     })?;
-    if spec.get("containers").and_then(Value::as_sequence).is_none() {
+    if spec
+        .get("containers")
+        .and_then(Value::as_sequence)
+        .is_none()
+    {
         return Err(format!("pod spec at .{} has no containers", path.join(".")));
     }
     Ok(spec)

@@ -68,15 +68,14 @@ pub fn mounts(state: &Arc<AppState>, listeners: &[ListenerConfig]) -> Vec<Mount>
                 }
             },
             listener: l.clone(),
-            tls: state.tls_resolver.as_ref().filter(|_| tls::uses_tls(l)).map(
-                |resolver| TlsPlan {
+            tls: state
+                .tls_resolver
+                .as_ref()
+                .filter(|_| tls::uses_tls(l))
+                .map(|resolver| TlsPlan {
                     resolver: resolver.clone(),
-                    sources: tls::TlsSources::classify(
-                        l,
-                        state.static_config.ingress.enabled,
-                    ),
-                },
-            ),
+                    sources: tls::TlsSources::classify(l, state.static_config.ingress.enabled),
+                }),
             metrics: state.metrics.clone(),
             egress: state.static_config.egress.clone(),
             gateway: openrusty_core::config::resolve_gateway(&state.static_config.egress),
@@ -96,9 +95,7 @@ pub(crate) fn uses_transparent(l: &ListenerConfig) -> bool {
 /// Ports of every effective listener, all roles included. The transparent
 /// loop guard compares against this whole set: a hijacked connection aimed
 /// at *any* of our sockets would recurse if tunneled onward.
-pub(crate) fn own_ports<'a>(
-    listeners: impl IntoIterator<Item = &'a ListenerConfig>,
-) -> Arc<[u16]> {
+pub(crate) fn own_ports<'a>(listeners: impl IntoIterator<Item = &'a ListenerConfig>) -> Arc<[u16]> {
     let mut ports: Vec<u16> = listeners.into_iter().map(|l| l.listen.port()).collect();
     ports.sort_unstable();
     ports.dedup();
@@ -179,8 +176,7 @@ pub async fn spawn(
         tasks.push(tokio::spawn(async move {
             match tls_cfg {
                 Some(config) => {
-                    tls::serve_listener(m.router, m.listener, listener, config, rx, in_flight)
-                        .await
+                    tls::serve_listener(m.router, m.listener, listener, config, rx, in_flight).await
                 }
                 None if transparent => {
                     transparent::serve_listener(

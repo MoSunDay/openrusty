@@ -6,7 +6,9 @@
 //! State is stored in a registry that outlives config snapshots, so peer
 //! health SURVIVES config reloads: re-registering an upstream remaps the
 //! per-peer counters and down state by ADDRESS, so peers keep their history
-//! across reordering, additions and removals.
+//! across reordering, additions and removals. The per-peer in-flight
+//! gauges that feed `least_conn` balancing live here too and share that
+//! address-keyed, reload-surviving lifetime (see [`in_flights`]).
 //!
 //! Passive model per peer (nginx `max_fails` / `fail_timeout` style):
 //! - failures are counted inside a sliding window of `fail_window_s`;
@@ -25,9 +27,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::upstream::Peer;
 use openrusty_core::config::HealthConfig;
 
 /// Mutable failure accounting for one peer.
@@ -50,14 +53,24 @@ pub struct PeerHealth {
     /// [`record_probe`] so index-based call sites see it without signature
     /// changes. Starts healthy (fail-open).
     active_ok: AtomicBool,
+    /// Requests currently in flight on this peer: the gauge `least_conn`
+    /// balances over. Keyed with the address-keyed state, so it survives
+    /// reload remaps (see [`register`]).
+    in_flight: AtomicUsize,
 }
 
 impl Clone for PeerHealth {
     fn clone(&self) -> Self {
         PeerHealth {
-            counters: Mutex::new(self.counters.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            counters: Mutex::new(
+                self.counters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
             down_until_ms: AtomicU64::new(self.down_until_ms.load(Ordering::Relaxed)),
             active_ok: AtomicBool::new(self.active_ok.load(Ordering::Relaxed)),
+            in_flight: AtomicUsize::new(self.in_flight.load(Ordering::Relaxed)),
         }
     }
 }
@@ -135,6 +148,7 @@ pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
                 counters: Mutex::new(PeerCounters::default()),
                 down_until_ms: AtomicU64::new(0),
                 active_ok: AtomicBool::new(true),
+                in_flight: AtomicUsize::new(0),
             });
             // Backfill the active-plane judgment for this address; unknown
             // addresses are healthy (fail-open), matching `record_probe`.
@@ -159,7 +173,9 @@ pub fn register(h: &HealthRegistry, upstream: &str, addrs: &[SocketAddr]) {
 /// Shared handle to one registered peer, if present.
 fn lookup(h: &HealthRegistry, upstream: &str, idx: usize) -> Option<Arc<PeerSlots>> {
     let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(upstream).filter(|slots| idx < slots.peers.len()).cloned()
+    map.get(upstream)
+        .filter(|slots| idx < slots.peers.len())
+        .cloned()
 }
 
 /// True when the peer is not currently marked down.
@@ -270,7 +286,10 @@ pub fn record_success(h: &HealthRegistry, upstream: &str, idx: usize, now_ms: u6
     let Some(peers) = lookup(h, upstream, idx) else {
         return;
     };
-    let mut counters = peers.peers[idx].counters.lock().unwrap_or_else(|e| e.into_inner());
+    let mut counters = peers.peers[idx]
+        .counters
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     counters.fails = 0;
     counters.window_start_ms = now_ms;
 }
@@ -380,6 +399,60 @@ pub fn active_peers(h: &HealthRegistry) -> Vec<(String, String, bool)> {
         .collect();
     out.sort();
     out
+}
+
+/// Shared slot lookup by ADDRESS (not index): pick/release sites know the
+/// address they dialed, and index-to-address mapping changes across
+/// reloads. Returns the slot index inside `PeerSlots`.
+fn addr_slot(slots: &PeerSlots, addr: SocketAddr) -> Option<usize> {
+    slots.addrs.iter().position(|a| *a == addr)
+}
+
+/// Acquire one in-flight slot on a peer (called when a peer is picked for
+/// an attempt). No-op when the upstream or address is unknown.
+pub fn inc_in_flight(h: &HealthRegistry, upstream: &str, addr: SocketAddr) {
+    let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slots) = map.get(upstream) else {
+        return;
+    };
+    let Some(pos) = addr_slot(slots, addr) else {
+        return;
+    };
+    slots.peers[pos].in_flight.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Release one in-flight slot after an attempt finished, clamping at zero:
+/// a stray release (e.g. racing a reload remap) must not underflow the
+/// gauge into a huge count. No-op when the upstream/address is unknown.
+pub fn dec_in_flight(h: &HealthRegistry, upstream: &str, addr: SocketAddr) {
+    let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slots) = map.get(upstream) else {
+        return;
+    };
+    let Some(pos) = addr_slot(slots, addr) else {
+        return;
+    };
+    let _ = slots.peers[pos]
+        .in_flight
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+}
+
+/// One in-flight gauge per peer in `peers` order (zeros for unknown
+/// upstreams/addresses), the snapshot `least_conn` balances over.
+pub fn in_flights(h: &HealthRegistry, upstream: &str, peers: &[Peer]) -> Vec<usize> {
+    let map = h.upstreams.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slots) = map.get(upstream) else {
+        return vec![0; peers.len()];
+    };
+    peers
+        .iter()
+        .map(|p| {
+            addr_slot(slots, p.addr)
+                .map_or(0, |pos| slots.peers[pos].in_flight.load(Ordering::Relaxed))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -686,5 +759,34 @@ mod tests {
         assert_eq!(evaluate_active(true, 1, 0, false, 2, 2), (false, 2, 0));
         // A failure resets the success counter.
         assert_eq!(evaluate_active(false, 0, 5, false, 2, 2), (false, 1, 0));
+    }
+
+    #[test]
+    fn in_flight_gauges_keyed_by_address_survive_reload() {
+        let h = new();
+        let a = addr("127.0.0.1:9001");
+        let b = addr("127.0.0.1:9002");
+        register(&h, "u", &[a, b]);
+        let peers = vec![Peer { addr: a, weight: 1 }, Peer { addr: b, weight: 1 }];
+
+        inc_in_flight(&h, "u", a);
+        inc_in_flight(&h, "u", a);
+        assert_eq!(in_flights(&h, "u", &peers), vec![2, 0]);
+
+        // Unknown upstream/addr read as zero; inc/dec on them are no-ops.
+        assert_eq!(in_flights(&h, "nope", &peers), vec![0, 0]);
+        inc_in_flight(&h, "nope", a);
+        dec_in_flight(&h, "u", addr("127.0.0.1:9999"));
+        assert_eq!(in_flights(&h, "u", &peers), vec![2, 0]);
+
+        // Reload remap (register clones per-address state) keeps the gauge.
+        register(&h, "u", &[a, b]);
+        assert_eq!(in_flights(&h, "u", &peers), vec![2, 0]);
+
+        // Release clamps at zero instead of underflowing.
+        dec_in_flight(&h, "u", a);
+        dec_in_flight(&h, "u", a);
+        dec_in_flight(&h, "u", a);
+        assert_eq!(in_flights(&h, "u", &peers), vec![0, 0]);
     }
 }

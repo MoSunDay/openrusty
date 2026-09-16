@@ -260,9 +260,9 @@ mod tests {
             .contains("openrusty_upstream_attempts_total{upstream=\"vllm\",result=\"timeout\"} 1"));
         // Snapshot counter (1) + live registry view (2) merge into 3.
         assert!(out.contains("openrusty_plugin_errors_total{plugin=\"sched\",kind=\"trap\"} 3"));
-        assert!(out.contains(
-            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 1"
-        ));
+        assert!(
+            out.contains("openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 1")
+        );
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8000\"} 1"));
         assert!(out.contains("openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:8001\"} 0"));
         assert!(out.contains("openrusty_kv_entries{plugin=\"sched\"} 3"));
@@ -351,12 +351,11 @@ mod tests {
         m.record_transparent("outbound", OUTCOME_EGRESS_DIRECT);
 
         let out = render(&m.snapshot(), &[], &[], &[]);
-        assert!(out.contains(
-            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 3"
-        ));
-        assert!(out.contains(
-            "openrusty_transparent_conns_total{role=\"inbound\",outcome=\"tunnel\"} 1"
-        ));
+        assert!(
+            out.contains("openrusty_transparent_conns_total{role=\"inbound\",outcome=\"http\"} 3")
+        );
+        assert!(out
+            .contains("openrusty_transparent_conns_total{role=\"inbound\",outcome=\"tunnel\"} 1"));
         assert!(out.contains(
             "openrusty_transparent_conns_total{role=\"outbound\",outcome=\"egress_direct\"} 2"
         ));

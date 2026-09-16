@@ -2,7 +2,8 @@
 # OpenRusty integration drill: proxy, SSE, h2c, WebSocket, sticky
 # scheduling, hot reload (incl. in-flight + rejected reload + load),
 # passive health check, plugin fault containment, route timeouts,
-# ip_hash, health survival across reloads, KV del/TTL probes,
+# ip_hash, least_conn concurrent-load spreading, health survival
+# across reloads, KV del/TTL probes,
 # memory-ceiling containment, /openrusty/status shape, plugin phases
 # (post_read, rewrite, access, body_filter, log), KV scan from a
 # plugin, path-key extraction + per-node task cap with fallback,
@@ -155,6 +156,8 @@ post_body_check() { curl -s --max-time 5 -d 'hello-body' "$GATE/echo" | grep -q 
 . "$(dirname "$0")/integration/70_log_reopen.sh"
 . "$(dirname "$0")/integration/80_socket_activation.sh"
 . "$(dirname "$0")/integration/85_sigquit.sh"
+. "$(dirname "$0")/integration/90_admin_auth.sh"
+. "$(dirname "$0")/integration/95_least_conn.sh"
 
 
 echo

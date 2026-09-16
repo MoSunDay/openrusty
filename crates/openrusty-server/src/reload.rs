@@ -70,6 +70,9 @@ async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError
     // re-arm active probing -- all inside the reload gate.
     apply_runtime(state, cfg, generation, &tls_plans);
     crate::state::apply_dynamic(state, cfg);
+    // Binding reconcile runs on every publish (cheap table swap; unlike
+    // mounted routes, bindings take effect without a router rebuild).
+    crate::state::apply_dynamic_routes(state, cfg);
     crate::active_probe::spawn(state);
     Ok(generation)
 }
@@ -85,7 +88,10 @@ async fn publish(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError
 /// Any [`ReloadError::Failed`] means nothing changed: the previous plugin
 /// snapshot and runtime stay in effect.
 pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> {
-    let _gate = state.reload_gate.try_lock().map_err(|_| ReloadError::InFlight)?;
+    let _gate = state
+        .reload_gate
+        .try_lock()
+        .map_err(|_| ReloadError::InFlight)?;
     let path = state.config_path.clone();
     let cfg = tokio::task::spawn_blocking(move || load_config(&path))
         .await
@@ -93,6 +99,13 @@ pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> 
         .map_err(|e| ReloadError::Failed(format!("config: {e}")))?;
 
     let generation = publish(state, &cfg).await?;
+
+    // [admin] token rotates here, on the file-based reload path only —
+    // NOT in apply_runtime/publish: ingress-rendered and embedder configs
+    // have no [admin] section and must not clear a boot-time token.
+    state
+        .admin_token
+        .store(cfg.admin.effective_token().map(|t| Arc::new(t.to_string())));
 
     let plugins = state
         .registry
@@ -121,7 +134,10 @@ pub async fn reload(state: &Arc<AppState>) -> Result<ReloadReport, ReloadError> 
 /// previous plugin snapshot and runtime in effect. Returns the new
 /// generation.
 pub async fn apply_config(state: &Arc<AppState>, cfg: &Config) -> Result<u64, ReloadError> {
-    let _gate = state.reload_gate.try_lock().map_err(|_| ReloadError::InFlight)?;
+    let _gate = state
+        .reload_gate
+        .try_lock()
+        .map_err(|_| ReloadError::InFlight)?;
     let generation = publish(state, cfg).await?;
     tracing::info!(generation, "in-memory config applied");
     Ok(generation)
@@ -325,7 +341,9 @@ mod tests {
         let reg = state.dynamic.load_full();
         let reg = (*reg).as_ref().unwrap();
         assert_eq!(
-            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new()).await.status,
+            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new())
+                .await
+                .status,
             200
         );
         assert_eq!(reg.compiled_count(), 1);
@@ -355,7 +373,9 @@ mod tests {
         let before = state.dynamic.load_full();
         let reg = (*before).as_ref().unwrap();
         assert_eq!(
-            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new()).await.status,
+            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new())
+                .await
+                .status,
             200
         );
         assert_eq!(reg.compiled_count(), 1);
@@ -377,7 +397,9 @@ mod tests {
         // Cache stayed warm: the same module serves without recompiling.
         let reg = (*after).as_ref().unwrap();
         assert_eq!(
-            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new()).await.status,
+            reg.invoke("prog", dyn_ctx(), bytes::Bytes::new())
+                .await
+                .status,
             200
         );
         assert_eq!(reg.compiled_count(), 1);

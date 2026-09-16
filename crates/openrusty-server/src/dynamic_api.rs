@@ -12,7 +12,10 @@
 //!
 //! The routes are mounted by `app::router`/`app::data_router` only while
 //! the `[dynamic]` config section is enabled; nothing is mounted when the
-//! feature is off (zero routing cost for everyone else).
+//! feature is off (zero routing cost for everyone else). The same
+//! execution path (`dispatch`) also serves `{method, path}` bindings from
+//! `dynamic_routes`: `app::fallback` intercepts matching requests before
+//! the proxy pipeline and hands them here.
 
 use crate::pipeline::{empty_response, text_response};
 use crate::state::AppState;
@@ -44,9 +47,37 @@ async fn handle_dynamic(
     Path(name): Path<String>,
     req: axum::extract::Request,
 ) -> Response {
-    // Defensive: the route is only mounted while the feature is enabled,
-    // and a reload that disables the section swaps in `None` - answer
-    // 404 rather than panic in that window.
+    dispatch(state, remote, name, req).await
+}
+
+/// Fallback interception probe: `Some(module)` when the request's
+/// method+path hit a dynamic binding AND the feature is enabled (no
+/// registry = the section is gone; never hijack the proxy pipeline in
+/// that window, even if a stale binding lingers).
+pub(crate) fn route_hit(state: &AppState, method: &str, path: &str) -> Option<String> {
+    if state.dynamic.load().is_none() {
+        return None;
+    }
+    state
+        .dynamic_routes
+        .load()
+        .lookup(method, path)
+        .map(str::to_string)
+}
+
+/// Run one dynamic module for a request: the shared body of the fixed
+/// `POST /api/v1/dynamic/{name}` route and of fallback-intercepted
+/// `{method, path}` bindings (`dynamic_routes`). The request's actual
+/// method/path/headers reach the module verbatim either way.
+pub(crate) async fn dispatch(
+    state: Arc<AppState>,
+    remote: SocketAddr,
+    name: String,
+    req: axum::extract::Request,
+) -> Response {
+    // Defensive: the fixed route is only mounted while the feature is
+    // enabled, and a reload that disables the section swaps in `None` -
+    // answer 404 rather than panic in that window.
     let Some(registry) = state.dynamic.load_full().as_ref().clone() else {
         return text_response(404, "404 not found\n");
     };
@@ -196,7 +227,11 @@ mod tests {
         let dir = TmpDir::new(tag);
         let dyn_dir = dir.0.join("dyn");
         fs::create_dir_all(&dyn_dir).unwrap();
-        fs::write(dyn_dir.join(format!("{}.wasm", module.0)), module.1.as_bytes()).unwrap();
+        fs::write(
+            dyn_dir.join(format!("{}.wasm", module.0)),
+            module.1.as_bytes(),
+        )
+        .unwrap();
         let mut cfg = dir.standard_config();
         cfg.push_str(&format!("\n[dynamic]\ndir = \"{}\"\n", dyn_dir.display()));
         if let Some(cap) = max_body_bytes {
@@ -210,7 +245,9 @@ mod tests {
         hyper::Request::builder()
             .method(method)
             .uri(uri)
-            .extension(ConnectInfo::<SocketAddr>("127.0.0.1:40010".parse().unwrap()))
+            .extension(ConnectInfo::<SocketAddr>(
+                "127.0.0.1:40010".parse().unwrap(),
+            ))
             .body(Body::from(body))
             .unwrap()
     }
@@ -232,7 +269,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         assert_eq!(&body_bytes(resp).await[..], b"hello dyn");
         // Counted under the module name with the served status.
         assert_eq!(

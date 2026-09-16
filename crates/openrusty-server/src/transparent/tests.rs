@@ -125,7 +125,9 @@ async fn transparent_http_injects_xff_from_the_accept_side_address() {
 
     // Minimal HTTP/1 echo upstream: reflects the `X-Forwarded-For` header
     // it received back in the response body.
-    let up = TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+    let up = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
     let up_addr = up.local_addr().expect("upstream addr");
     let echo = tokio::spawn(async move {
         let (mut sock, _) = up.accept().await.expect("upstream accept");
@@ -187,7 +189,12 @@ async fn transparent_http_injects_xff_from_the_accept_side_address() {
                 body: body.clone(),
                 client_ip: remote.ip().to_string(),
             };
-            let client = proxy::get(&pool, up_addr, Duration::from_secs(2), Duration::from_secs(5));
+            let client = proxy::get(
+                &pool,
+                up_addr,
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            );
             let peer = proxy::Peer {
                 addr: up_addr,
                 weight: 1,
@@ -231,10 +238,7 @@ async fn transparent_http_injects_xff_from_the_accept_side_address() {
     loop {
         let n = client.read(&mut chunk).await.expect("read response");
         raw.extend_from_slice(&chunk[..n]);
-        let split = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|p| p + 4);
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
         if let Some(head_end) = split {
             let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
             let len: usize = head

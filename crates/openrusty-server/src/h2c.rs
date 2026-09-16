@@ -377,8 +377,10 @@ mod tests {
     /// Boot a real router on an ephemeral port with the given timeouts and
     /// return the bound address (the shutdown sender is kept alive by the
     /// caller; dropping it stops the accept loop and drains connections).
-    async fn spawn_server(dir: &TmpDir, timeouts: ConnTimeouts) -> (SocketAddr, watch::Sender<bool>)
-    {
+    async fn spawn_server(
+        dir: &TmpDir,
+        timeouts: ConnTimeouts,
+    ) -> (SocketAddr, watch::Sender<bool>) {
         let state = boot_state(dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

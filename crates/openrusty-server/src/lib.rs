@@ -15,15 +15,18 @@
 //! entry point is re-exported as [`metrics::render`]).
 
 pub mod active_probe;
+pub mod admin_auth;
 pub mod app;
 pub mod body_filter;
 pub mod check;
+pub mod dynamic_admin;
 pub mod dynamic_api;
+pub mod dynamic_routes;
 pub mod egress;
 pub mod h2c;
 pub mod ingress;
-pub mod inject;
 pub mod init;
+pub mod inject;
 pub mod listeners;
 pub mod logging;
 pub mod metrics;

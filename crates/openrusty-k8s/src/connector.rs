@@ -147,8 +147,7 @@ mod tests {
         let uri = "https://127.0.0.1:1/".parse::<Uri>().unwrap();
         let err = tower::ServiceExt::oneshot(&mut connector, uri)
             .await
-            .err()
-            .expect("closed port must fail");
+            .expect_err("closed port must fail");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("scheme is not http"),

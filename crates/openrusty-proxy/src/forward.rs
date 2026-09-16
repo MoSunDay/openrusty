@@ -236,7 +236,13 @@ pub async fn forward_peer(
     match &up.tls {
         Some(tls) => {
             forward_https(
-                &get_tls(pool, peer.addr, tls, up.connect_timeout, up.pool_idle_timeout),
+                &get_tls(
+                    pool,
+                    peer.addr,
+                    tls,
+                    up.connect_timeout,
+                    up.pool_idle_timeout,
+                ),
                 peer,
                 &tls.server_name,
                 req,
@@ -295,7 +301,10 @@ mod tests {
     #[test]
     fn idempotent_methods_are_the_safe_list() {
         for m in ["GET", "HEAD", "OPTIONS", "TRACE"] {
-            assert!(is_idempotent(&hyper::Method::from_bytes(m.as_bytes()).unwrap()), "{m}");
+            assert!(
+                is_idempotent(&hyper::Method::from_bytes(m.as_bytes()).unwrap()),
+                "{m}"
+            );
         }
         for m in ["POST", "PUT", "PATCH", "DELETE", "FOO"] {
             assert!(
@@ -494,8 +503,13 @@ mod tests {
             insecure_skip_verify: true,
         })
         .unwrap();
-        let client =
-            crate::client::get_tls(&pool, addr, &tls, std::time::Duration::from_millis(500), std::time::Duration::from_secs(30));
+        let client = crate::client::get_tls(
+            &pool,
+            addr,
+            &tls,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(30),
+        );
         let peer = Peer { addr, weight: 1 };
 
         let err = forward_https(&client, &peer, "localhost", &sample_request())

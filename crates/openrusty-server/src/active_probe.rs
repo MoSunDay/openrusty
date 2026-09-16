@@ -36,7 +36,12 @@ use std::time::Duration;
 pub fn spawn(state: &Arc<AppState>) {
     // A reload may change the interval or drop the last enabled upstream:
     // the old task is always cancelled, the new one reflects the snapshot.
-    if let Some(handle) = state.probe_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    if let Some(handle) = state
+        .probe_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         handle.abort();
     }
     let rt = state.runtime.load();
@@ -86,13 +91,12 @@ async fn probe_tick(state: &AppState, prev: &mut HashMap<(String, String), bool>
             jobs.push((up, idx, peer, active.clone()));
         }
     }
-    let results = futures::future::join_all(jobs.into_iter().map(
-        |(up, idx, peer, active)| async move {
+    let results =
+        futures::future::join_all(jobs.into_iter().map(|(up, idx, peer, active)| async move {
             let healthy = probe_peer(state, &up.up, idx, peer, &active).await;
             (up.up.name.clone(), peer.addr.to_string(), healthy)
-        },
-    ))
-    .await;
+        }))
+        .await;
     for (name, peer, healthy) in results {
         let key = (name, peer);
         match transition(prev.get(&key), healthy) {

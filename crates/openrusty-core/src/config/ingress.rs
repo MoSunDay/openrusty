@@ -102,16 +102,17 @@ listen = "127.0.0.1:8080"
         assert!(cfg.ingress.enabled);
         assert_eq!(cfg.ingress.ingress_class, "other");
         assert_eq!(cfg.ingress.kubeconfig, "/etc/kube/config");
-        assert_eq!(cfg.ingress.namespaces, vec!["web".to_string(), "api".to_string()]);
+        assert_eq!(
+            cfg.ingress.namespaces,
+            vec!["web".to_string(), "api".to_string()]
+        );
         validate(&cfg.ingress).unwrap();
     }
 
     #[test]
     fn rejects_empty_class_and_namespace_entries() {
-        let cfg: Config = toml::from_str(&format!(
-            "{MINIMAL}\n[ingress]\ningress_class = \"  \""
-        ))
-        .unwrap();
+        let cfg: Config =
+            toml::from_str(&format!("{MINIMAL}\n[ingress]\ningress_class = \"  \"")).unwrap();
         let err = validate(&cfg.ingress).unwrap_err();
         assert!(err.to_string().contains("ingress_class"), "got: {err}");
 

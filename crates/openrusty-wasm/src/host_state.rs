@@ -491,7 +491,12 @@ mod tests {
         assert_eq!(s.scan_peek(id(c)), Some((b"a".to_vec(), b"1".to_vec())));
 
         // Age the cursor past the TTL (injected, no sleeping) and sweep.
-        s.cursors.lock().unwrap().get_mut(&id(c)).unwrap().created_at = 0;
+        s.cursors
+            .lock()
+            .unwrap()
+            .get_mut(&id(c))
+            .unwrap()
+            .created_at = 0;
         let reclaimed = s.sweep(CURSOR_TTL_MS + 1);
         assert_eq!(reclaimed, 1);
         assert!(!s.scan_is_valid(id(c)));

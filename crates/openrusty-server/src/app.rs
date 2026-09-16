@@ -43,20 +43,31 @@ use std::sync::Arc;
 /// entry with `role = "admin"` exists, these routes live ONLY on the admin
 /// socket and are removed from every data-plane socket; without an admin
 /// listener they stay mounted on the data-plane router (historical shape).
-fn admin_routes() -> Router<Arc<AppState>> {
-    Router::new()
+fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
+    let mut routes = Router::new()
         .route("/openrusty/status", get(status))
         .route("/openrusty/reload", post(reload_endpoint))
         .route("/openrusty/metrics", get(metrics_endpoint))
         .route("/openrusty/ready", get(ready))
         .route("/openrusty/live", get(live))
-        .route("/openrusty/shutdown", post(shutdown_endpoint))
+        .route("/openrusty/shutdown", post(shutdown_endpoint));
+    // Registration face (PUT/DELETE/GET /openrusty/dynamic*), behind the
+    // same token guard as the rest of the admin plane; mounted only
+    // while `[dynamic]` is enabled at boot (same asymmetry as the
+    // execution routes in `with_dynamic_routes`).
+    if state.dynamic.load_full().is_some() {
+        routes = routes.merge(crate::dynamic_admin::routes());
+    }
+    routes.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::admin_auth::admin_auth,
+    ))
 }
 
 /// Admin-only router: `/openrusty/*` and nothing else; every other path 404s
 /// without touching the proxy pipeline.
 pub fn admin_router(state: Arc<AppState>) -> Router {
-    admin_routes().with_state(state)
+    admin_routes(&state).with_state(state)
 }
 
 /// Mount the dynamic-API routes (`POST /api/v1/dynamic/{name}`) onto a
@@ -87,7 +98,7 @@ pub fn data_router(state: Arc<AppState>) -> Router {
 /// This is the single-socket shape used when no dedicated admin listener
 /// is configured (and by embedders/tests).
 pub fn router(state: Arc<AppState>) -> Router {
-    with_dynamic_routes(admin_routes(), &state)
+    with_dynamic_routes(admin_routes(&state), &state)
         .fallback(fallback)
         .with_state(state)
 }
@@ -103,6 +114,15 @@ async fn fallback(
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
 ) -> Response {
+    // Dynamic bindings intercept BEFORE the proxy pipeline's route
+    // matching (a `{method, path}` hit wins over a `[[routes]]`
+    // prefix). Like the fixed POST route - which the router matches
+    // before this fallback - dispatched requests are counted in
+    // `openrusty_dynamic_requests_total` only, not the per-route
+    // request histogram.
+    if let Some(module) = dynamic_api::route_hit(&state, req.method().as_str(), req.uri().path()) {
+        return dynamic_api::dispatch(state.clone(), remote, module, req).await;
+    }
     let start = std::time::Instant::now();
     let (resp, pinned_label) = handle_request(state.clone(), remote, req).await;
     let duration = start.elapsed().as_secs_f64();
@@ -234,7 +254,11 @@ async fn reload_endpoint(
 /// receiver - no locks, no side effects.
 async fn ready(State(state): State<Arc<AppState>>) -> Response {
     if shutdown::is_draining(&state.shutdown.rx) {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "draining"}))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining"})),
+        )
+            .into_response()
     } else {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
     }

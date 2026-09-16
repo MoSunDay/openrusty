@@ -52,10 +52,7 @@ pub fn render_config_map(
             namespace,
             labels: BTreeMap::from([(MANAGED_BY_LABEL, MANAGED_BY.to_string())]),
         },
-        data: BTreeMap::from([(
-            CONFIG_KEY.to_string(),
-            render_config_toml(p)?,
-        )]),
+        data: BTreeMap::from([(CONFIG_KEY.to_string(), render_config_toml(p)?)]),
     };
     to_value(&cm)
 }
@@ -142,7 +139,10 @@ pub fn render_config_toml(p: &InjectParams) -> Result<String, String> {
     let cfg: Config = toml::from_str(&src).map_err(|e| format!("rendered config invalid: {e}"))?;
     match validate(&cfg) {
         Ok(()) => Ok(src),
-        Err(e) if e.to_string().contains("egress.gateway must be a resolvable host:port") => {
+        Err(e)
+            if e.to_string()
+                .contains("egress.gateway must be a resolvable host:port") =>
+        {
             eprintln!(
                 "openrusty {SUBCOMMAND}: warning: egress gateway {:?} does not resolve here \
                  (cluster-internal DNS?); the sidecar validates it at boot",

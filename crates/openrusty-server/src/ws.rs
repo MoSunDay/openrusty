@@ -4,7 +4,7 @@
 //! bytes both ways. The log phase runs when the tunnel closes (or the
 //! handshake fails).
 
-use crate::pipeline::{finish_log, pick_peer, text_response, Pick};
+use crate::pipeline::{finish_log, pick_peer, release_peer, text_response, Pick};
 use crate::state::{AppState, UpstreamRt};
 use axum::body::Body;
 use axum::response::Response;
@@ -47,10 +47,7 @@ pub(crate) fn handshake_headers(
         CONNECTION.as_str().to_string(),
         CONNECTION_UPGRADE.to_string(),
     ));
-    out.push((
-        UPGRADE.as_str().to_string(),
-        UPGRADE_WEBSOCKET.to_string(),
-    ));
+    out.push((UPGRADE.as_str().to_string(), UPGRADE_WEBSOCKET.to_string()));
     out.push((
         "x-forwarded-for".to_string(),
         proxy::merge_xff(client_headers, client_ip),
@@ -132,8 +129,7 @@ pub async fn proxy_websocket(
             finish_log(&mut session, 502);
             return text_response(502, "502 bad request\n");
         };
-        for (name, value) in
-            handshake_headers(&client_headers, &peer.addr.to_string(), &client_ip)
+        for (name, value) in handshake_headers(&client_headers, &peer.addr.to_string(), &client_ip)
         {
             let (Ok(hn), Ok(hv)) = (
                 HeaderName::from_bytes(name.as_bytes()),
@@ -175,7 +171,11 @@ pub async fn proxy_websocket(
             None => Some(fut.await),
         };
         match outcome {
-            Some(Ok(r)) => break (r, idx),
+            Some(Ok(r)) => {
+                // Release the in-flight slot: the handshake is answered.
+                release_peer(&state, &up_rt, idx);
+                break (r, idx);
+            }
             Some(Err(e)) => {
                 proxy::record_failure(
                     &state.health,
@@ -184,6 +184,8 @@ pub async fn proxy_websocket(
                     &up_rt.up.health,
                     now_ms(),
                 );
+                // Release the in-flight slot before trying the next peer.
+                release_peer(&state, &up_rt, idx);
                 session.ctx().mark_tried(peer.addr);
                 tracing::warn!(
                     upstream = %up_rt.up.name,
@@ -200,6 +202,8 @@ pub async fn proxy_websocket(
                     &up_rt.up.health,
                     now_ms(),
                 );
+                // Release the in-flight slot before trying the next peer.
+                release_peer(&state, &up_rt, idx);
                 session.ctx().mark_tried(peer.addr);
                 tracing::warn!(
                     upstream = %up_rt.up.name,
@@ -351,9 +355,15 @@ mod tests {
         let out = handshake_headers(&client, "10.0.0.9:9000", "203.0.113.7");
         assert_eq!(find(&out, "Authorization"), Some("Bearer abc"));
         assert_eq!(find(&out, "Cookie"), Some("sid=42"));
-        assert_eq!(find(&out, "Sec-WebSocket-Key"), Some("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert_eq!(
+            find(&out, "Sec-WebSocket-Key"),
+            Some("dGhlIHNhbXBsZSBub25jZQ==")
+        );
         // Existing XFF chain is appended to, not replaced.
-        assert_eq!(find(&out, "X-Forwarded-For"), Some("198.51.100.1, 203.0.113.7"));
+        assert_eq!(
+            find(&out, "X-Forwarded-For"),
+            Some("198.51.100.1, 203.0.113.7")
+        );
     }
 
     /// A peer that completes the TCP + HTTP exchange up to the request,
@@ -371,11 +381,7 @@ mod tests {
                     // Consume the request head so the failure is squarely
                     // "no response" (not a connect/send error), then park.
                     let mut buf = [0u8; 512];
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        sock.read(&mut buf),
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
                     futures::future::pending::<()>().await;
                 });
             }
@@ -394,11 +400,7 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        sock.read(&mut buf),
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
                     let _ = sock.write_all(head.as_bytes()).await;
                     let _ = sock.shutdown().await;
                 });
@@ -435,9 +437,7 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
-    fn ws_session(
-        state: &Arc<AppState>,
-    ) -> (RequestSession, Arc<UpstreamRt>) {
+    fn ws_session(state: &Arc<AppState>) -> (RequestSession, Arc<UpstreamRt>) {
         let rt = state.runtime.load();
         let up_rt = rt.upstreams["u"].clone();
         drop(rt);
@@ -470,12 +470,9 @@ mod tests {
     }
 
     async fn body_text(resp: &mut Response) -> String {
-        let bytes = axum::body::to_bytes(
-            std::mem::take(resp.body_mut()),
-            usize::MAX,
-        )
-        .await
-        .unwrap();
+        let bytes = axum::body::to_bytes(std::mem::take(resp.body_mut()), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&bytes).to_string()
     }
 

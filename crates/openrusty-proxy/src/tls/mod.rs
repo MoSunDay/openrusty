@@ -94,7 +94,10 @@ pub fn build(cfg: &UpstreamTlsConfig) -> Result<UpstreamTls, String> {
             let pem = read_pem(path, "ca_cert")?;
             let certs = parse_certs(&pem, "ca_cert")?;
             if certs.is_empty() {
-                return Err(format!("ca_cert {} contains no certificates", path.display()));
+                return Err(format!(
+                    "ca_cert {} contains no certificates",
+                    path.display()
+                ));
             }
             let mut roots = rustls::RootCertStore::empty();
             for cert in certs {
@@ -125,10 +128,9 @@ pub fn build(cfg: &UpstreamTlsConfig) -> Result<UpstreamTls, String> {
                 ));
             }
             let key_pem = read_pem(key_path, "client_key")?;
-            let signing = rustls::crypto::ring::sign::any_supported_type(&parse_key(
-                &key_pem, "client_key",
-            )?)
-            .map_err(|e| format!("unsupported client key {}: {e}", key_path.display()))?;
+            let signing =
+                rustls::crypto::ring::sign::any_supported_type(&parse_key(&key_pem, "client_key")?)
+                    .map_err(|e| format!("unsupported client key {}: {e}", key_path.display()))?;
             let certified = Arc::new(rustls::sign::CertifiedKey::new(certs, signing));
             builder.with_client_cert_resolver(Arc::new(SingleCertResolver(certified)))
         }
@@ -151,7 +153,6 @@ pub fn build(cfg: &UpstreamTlsConfig) -> Result<UpstreamTls, String> {
 /// (mTLS client pair).
 #[derive(Debug)]
 struct SingleCertResolver(Arc<rustls::sign::CertifiedKey>);
-
 
 impl ResolvesClientCert for SingleCertResolver {
     fn resolve(
@@ -218,7 +219,6 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
-
 
 pub mod connector;
 

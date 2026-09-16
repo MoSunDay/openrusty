@@ -66,6 +66,27 @@ pub fn ip_hash_pick(client_ip: &str, healthy: &[usize]) -> Option<usize> {
     Some(healthy[(hash % healthy.len() as u64) as usize])
 }
 
+/// nginx-style least_conn pick over the healthy subset.
+///
+/// Chooses the peer whose in-flight-to-weight ratio is smallest, compared
+/// with integer cross-multiplication (`in_flight[i] * weight[b] <
+/// in_flight[b] * weight[i]`) to stay float-free. Ties break to the
+/// lowest index for determinism. `healthy` holds indices into the
+/// parallel `in_flight`/`weights` arrays.
+pub fn least_conn_pick(in_flight: &[usize], weights: &[u32], healthy: &[usize]) -> Option<usize> {
+    let mut best = *healthy.first()?;
+    for &i in healthy.iter().skip(1) {
+        // in_flight[i]/weights[i] < in_flight[best]/weights[best], with
+        // u128 cross-products so no realistic counter can overflow.
+        let lhs = in_flight[i] as u128 * u128::from(weights[best]);
+        let rhs = in_flight[best] as u128 * u128::from(weights[i]);
+        if lhs < rhs {
+            best = i;
+        }
+    }
+    Some(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +171,47 @@ mod tests {
     #[test]
     fn ip_hash_empty_is_none() {
         assert_eq!(ip_hash_pick("203.0.113.9", &[]), None);
+    }
+
+    #[test]
+    fn least_conn_empty_is_none() {
+        assert_eq!(least_conn_pick(&[0, 0, 0], &[1, 1, 1], &[]), None);
+    }
+
+    #[test]
+    fn least_conn_idle_ties_break_to_lowest_index() {
+        let healthy = vec![0, 1, 2];
+        for _ in 0..100 {
+            assert_eq!(
+                least_conn_pick(&[0, 0, 0], &[1, 1, 1], &healthy),
+                Some(0),
+                "all-zero in-flight with equal weights must stay on index 0"
+            );
+        }
+    }
+
+    #[test]
+    fn least_conn_avoids_busy_peers() {
+        // Peer 1 carries load, peer 0 is idle: every pick must be 0.
+        assert_eq!(least_conn_pick(&[0, 3, 0], &[1, 1, 1], &[0, 1, 2]), Some(0));
+        // Only the busy subset: the least-loaded of {1, 2} is 2.
+        assert_eq!(least_conn_pick(&[0, 3, 1], &[1, 1, 1], &[1, 2]), Some(2));
+    }
+
+    #[test]
+    fn least_conn_weight_tilt() {
+        // weights [1,2]: in-flight [1,2] -> ratios 1/1 vs 2/2 -> tie -> 0.
+        assert_eq!(least_conn_pick(&[1, 2], &[1, 2], &[0, 1]), Some(0));
+        // in-flight [2,3] -> 2/1 vs 3/2 -> peer 1 is relatively freer.
+        assert_eq!(least_conn_pick(&[2, 3], &[1, 2], &[0, 1]), Some(1));
+    }
+
+    #[test]
+    fn least_conn_is_deterministic() {
+        let healthy = vec![0, 1, 2];
+        let first = least_conn_pick(&[4, 2, 2], &[3, 1, 2], &healthy);
+        for _ in 0..1000 {
+            assert_eq!(least_conn_pick(&[4, 2, 2], &[3, 1, 2], &healthy), first);
+        }
     }
 }

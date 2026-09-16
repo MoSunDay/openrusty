@@ -235,15 +235,16 @@ pub fn validate_module_with_budget(
     // with a non-terminating start section fails validation (with a
     // timeout-flavoured error) instead of hanging the reload forever.
     store.set_epoch_deadline(ticks_for(budget));
-    let inst = linker
-        .instantiate(&mut store, module)
-        .map_err(|e| match e.downcast_ref::<Trap>() {
-            Some(&Trap::Interrupt) => AbiError::Instantiate(format!(
-                "instantiation timed out after {}ms (non-terminating start section?)",
-                budget.as_millis()
-            )),
-            _ => AbiError::Instantiate(e.to_string()),
-        })?;
+    let inst =
+        linker
+            .instantiate(&mut store, module)
+            .map_err(|e| match e.downcast_ref::<Trap>() {
+                Some(&Trap::Interrupt) => AbiError::Instantiate(format!(
+                    "instantiation timed out after {}ms (non-terminating start section?)",
+                    budget.as_millis()
+                )),
+                _ => AbiError::Instantiate(e.to_string()),
+            })?;
     inst.get_typed_func::<(i32, i32), i32>(&mut store, abi::EXPORT_ON_PHASE)
         .map_err(|e| AbiError::BadExport(format!("{}: {e}", abi::EXPORT_ON_PHASE)))?;
     inst.get_typed_func::<i32, i32>(&mut store, abi::EXPORT_ALLOC)
@@ -417,7 +418,8 @@ mod tests {
         let linker = build_linker(engine).unwrap();
         let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
         let started = Instant::now();
-        let outcome = validate_module_with_budget(engine, &linker, &module, Duration::from_millis(250));
+        let outcome =
+            validate_module_with_budget(engine, &linker, &module, Duration::from_millis(250));
         match outcome {
             Err(AbiError::Instantiate(detail)) => {
                 assert!(

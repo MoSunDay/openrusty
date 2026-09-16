@@ -21,7 +21,7 @@ Commit: 681ad49
   - 脚本幂等：重复执行会重写单元文件并 restart 全部单元，从而加载新构建的二进制；所有单元 enabled + active，开机自启。
 - 生产上游拓扑：`config/openrusty.toml` 的 upstream `vllm` 指向 node03 llama-server 集群（`192.168.31.224:9001-9003`，一卡一实例 ×3，Qwen3.8-27B-UD-Q4_K_M，`-c 150000 --no-kv-offload`（KV cache 放系统内存，约 5.3GB/实例）、q8_0 KV、MTP 投机解码（`--spec-type draft-mtp`，约 727MiB 显存/卡）），由 node03 上的模板单元 `llama-server@<gpu>:<port>.service` 管理；路由超时 120000ms（V100 生成较慢）。本地 echo 实例仅保留演示用途，生产配置不再引用。
 - 配置加载顺序：命令行参数 1 > 环境变量 `OPENRUSTY_CONFIG` > `config/openrusty.toml`；示例见 `config/openrusty.example.toml`。
-- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，135 checks，覆盖代理/流式协议、调度、热重载、被动+主动健康、retry_on_timeout、收容、路由超时、kv-probe 全阶段、status/metrics 形状、env 配置启动、并发 reload 竞争、动态 WASM 执行 API、upstream TLS、`-t` 干跑、日志 reopen、socket activation 压载重启 0 拒连、SIGQUIT 快退等）。
+- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，152 checks，覆盖代理/流式协议、调度、热重载、被动+主动健康、retry_on_timeout、收容、路由超时、kv-probe 全阶段、status/metrics 形状、env 配置启动、并发 reload 竞争、动态 WASM 执行 API、upstream TLS、`-t` 干跑、日志 reopen、socket activation 压载重启 0 拒连、SIGQUIT 快退、管理面 token 鉴权、least_conn 并发分布等）；三层均由 `.github/workflows/ci.yml` 在 CI 中门禁（断言退出码，不断言 check 数）。
 
 ## 信号语义
 | 信号 | 行为 |
@@ -34,7 +34,7 @@ Commit: 681ad49
 
 ## 上线红线（部署前必读）
 - 插件故障策略 `fail_open` 为默认放行 —— 插件崩溃/超时时请求仍被放行，安全语义依赖 access 阶段显式 `fail_close`。
-- `/openrusty/*` 管理端点无鉴权 —— 必须仅绑定内网/回环，或由外部防火墙保护。
+- `/openrusty/*` 管理端点鉴权为**可选**（`[admin] token`，默认关闭）—— 未配置 token 时仍必须仅绑定内网/回环或由外部防火墙保护；配置后 `status/reload/metrics/shutdown` 要求 Bearer/`X-OpenRusty-Token`，`ready`/`live` 保持开放，token 随文件型 reload 轮换。
 - 静态 TLS 证书在 reload 时不会重读 —— 证书轮换需重启网关（SNI 动态证书除外）。
 - upstream TLS 材料按证书文件路径寻址 —— 同路径换发新证书后，reload 沿用旧连接池（旧证书继续生效）；轮换 upstream 证书需更换文件路径再 reload，或重启网关。
 - 请求体最大 16MiB 且全程缓冲在内存 —— 大文件场景不适用，需另行限流/隔离部署。

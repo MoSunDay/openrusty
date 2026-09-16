@@ -387,7 +387,11 @@ fn build_ingress_config(
     // grows a TLS termination section in a later milestone.
     let mut upstreams = base.upstreams.clone();
     let taken: HashSet<String> = upstreams.iter().map(|u| u.name.clone()).collect();
-    upstreams.extend(rendered_upstreams.into_iter().filter(|u| !taken.contains(&u.name)));
+    upstreams.extend(
+        rendered_upstreams
+            .into_iter()
+            .filter(|u| !taken.contains(&u.name)),
+    );
     let mut cfg = base.clone();
     cfg.routes = routes;
     cfg.upstreams = upstreams;

@@ -109,22 +109,18 @@ pub struct TlsPlan {
 ///   value onto [`ProtoMode`];
 /// - the resolver reference is shared, so the returned config never
 ///   pins certificate material: rotation happens entirely inside it.
-pub(crate) fn boot(
-    plan: &TlsPlan,
-    http1_only: bool,
-) -> io::Result<Arc<ServerConfig>> {
+pub(crate) fn boot(plan: &TlsPlan, http1_only: bool) -> io::Result<Arc<ServerConfig>> {
     if let TlsSources::Static { cert, key } | TlsSources::StaticWithIngress { cert, key } =
         &plan.sources
     {
-        let cert_pem = std::fs::read_to_string(cert).map_err(|e| {
-            io::Error::other(format!("tls_cert {}: {e}", cert.display()))
-        })?;
+        let cert_pem = std::fs::read_to_string(cert)
+            .map_err(|e| io::Error::other(format!("tls_cert {}: {e}", cert.display())))?;
         let key_pem = std::fs::read_to_string(key)
             .map_err(|e| io::Error::other(format!("tls_key {}: {e}", key.display())))?;
-        resolver::seed_fallback(&plan.resolver, &openrusty_k8s::render::TlsPair {
-            cert_pem,
-            key_pem,
-        })
+        resolver::seed_fallback(
+            &plan.resolver,
+            &openrusty_k8s::render::TlsPair { cert_pem, key_pem },
+        )
         .map_err(io::Error::other)?;
     }
 

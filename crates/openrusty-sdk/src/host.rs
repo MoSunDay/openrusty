@@ -437,9 +437,9 @@ mod tests {
             }
         });
         assert_eq!(raw.map(|b| b.len()), Some(1040)); // complete, not 256
-        // Probe at 256, then the read_two_phase retry re-probes at 256 and
-        // succeeds on the grown buffer (the host consumes nothing until a
-        // write succeeds, so the repeated probe is lossless).
+                                                      // Probe at 256, then the read_two_phase retry re-probes at 256 and
+                                                      // succeeds on the grown buffer (the host consumes nothing until a
+                                                      // write succeeds, so the repeated probe is lossless).
         assert_eq!(*caps.borrow(), alloc::vec![256, 256, 1040]);
         // Cursor stays valid: Drop must still end it.
         assert_eq!(cursor, 7);

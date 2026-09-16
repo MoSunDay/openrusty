@@ -135,7 +135,10 @@ pub(super) fn seed_fallback(resolver: &DynamicCertResolver, pair: &TlsPair) -> R
 /// Reads the PEMs synchronously: the ingress apply path is a debounce
 /// task off the request path, and PEM parsing is tiny next to the
 /// render it follows.
-pub fn update_from_tls_pairs(resolver: &DynamicCertResolver, pairs: &BTreeMap<String, TlsPair>) -> usize {
+pub fn update_from_tls_pairs(
+    resolver: &DynamicCertResolver,
+    pairs: &BTreeMap<String, TlsPair>,
+) -> usize {
     let mut next: BTreeMap<String, Arc<CertifiedKey>> = BTreeMap::new();
     for (host, pair) in pairs {
         match certified_key(&pair.cert_pem, &pair.key_pem) {
@@ -269,10 +272,7 @@ mod tests {
         let pairs = BTreeMap::from([
             ("good.example.com".to_string(), pair(LEAF_PEM, LEAF_KEY)),
             ("junk.example.com".to_string(), pair(JUNK_PEM, LEAF_KEY)),
-            (
-                "empty.example.com".to_string(),
-                pair("", LEAF_KEY),
-            ),
+            ("empty.example.com".to_string(), pair("", LEAF_KEY)),
         ]);
         let published = update_from_tls_pairs(&resolver, &pairs);
         assert_eq!(published, 1, "only the good entry survives");

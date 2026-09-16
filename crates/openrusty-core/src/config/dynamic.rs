@@ -9,6 +9,23 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::FailPolicy;
 
+/// One `{method, path} -> module` binding served by the dynamic
+/// execution API: requests whose method and path match run `<module>.wasm`
+/// through the dynamic pipeline (intercepted before the proxy routes).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicRoute {
+    /// HTTP method (`"GET"`, `"POST"`, ...); trimmed and ASCII-uppercased
+    /// before matching.
+    pub method: String,
+    /// Request path starting with `/`; a trailing `/*` marks a prefix
+    /// binding (`/api/*` matches `/api` and everything below it).
+    pub path: String,
+    /// Dynamic module name served on match
+    /// (`^[A-Za-z0-9][A-Za-z0-9._-]*$`).
+    pub module: String,
+}
+
 /// One dynamic WASM module served by `POST /api/v1/dynamic/<name>`.
 /// Absent `[dynamic]` section = feature fully disabled (no routes).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -34,6 +51,12 @@ pub struct DynamicConfig {
     /// readable by the module via `cfg_get`.
     #[serde(default)]
     pub settings: BTreeMap<String, HashMap<String, String>>,
+    /// `{method, path} -> module` bindings (`[[dynamic.routes]]`)
+    /// intercepted by the gateway fallback before the proxy routes.
+    /// Reconciled on reload; runtime bindings added through the
+    /// registration face survive (they are not config-owned).
+    #[serde(default)]
+    pub routes: Vec<DynamicRoute>,
 }
 
 fn default_dynamic_timeout_ms() -> u64 {
@@ -57,19 +80,80 @@ impl Default for DynamicConfig {
             on_failure: FailPolicy::default(),
             max_body_bytes: default_dynamic_max_body_bytes(),
             settings: BTreeMap::new(),
+            routes: Vec::new(),
         }
     }
 }
 
-/// Setting keys follow the module-name rule: first char alphanumeric,
-/// then alnum/`.`/`_`/`-` (hand-rolled; no regex dependency).
-fn valid_setting_key(name: &str) -> bool {
+/// Module-name rule shared by `[dynamic.routes].module`,
+/// `[dynamic.settings]` keys and the registration endpoint:
+/// first char alphanumeric, then alnum/`.`/`_`/`-` (hand-rolled; no
+/// regex dependency).
+pub fn valid_module_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphanumeric() => {}
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Setting keys follow the module-name rule.
+fn valid_setting_key(name: &str) -> bool {
+    valid_module_name(name)
+}
+
+/// Longest accepted route path (bindings live in memory and are copied
+/// on every mutation, so they must stay small by construction).
+const MAX_ROUTE_PATH_LEN: usize = 1024;
+
+/// Normalize a route method: trim + ASCII-uppercase; `None` when empty,
+/// longer than 32 bytes, or not an HTTP token (`tchar`).
+pub fn normalize_method(method: &str) -> Option<String> {
+    let m = method.trim();
+    if m.is_empty() || m.len() > 32 || !m.bytes().all(is_tchar) {
+        return None;
+    }
+    Some(m.to_ascii_uppercase())
+}
+
+/// One `tchar` byte (RFC 7230 token character).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Normalize a route path: kept verbatim when it starts with `/`, is at
+/// most [`MAX_ROUTE_PATH_LEN`] bytes and holds no control char, `?` or
+/// `#` (those belong to the query/fragment, never to a matching path).
+/// A trailing `/*` stays: it is the prefix-match marker.
+pub fn normalize_route_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.len() > MAX_ROUTE_PATH_LEN {
+        return None;
+    }
+    if path
+        .bytes()
+        .any(|b| b.is_ascii_control() || matches!(b, b'?' | b'#'))
+    {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Pure validation of the `[dynamic]` invariants the deserializer cannot
@@ -92,6 +176,36 @@ pub(crate) fn validate(d: &DynamicConfig) -> Result<(), ConfigError> {
         if !valid_setting_key(key) {
             return Err(bad(&format!(
                 "dynamic.settings key {key:?} must match ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            )));
+        }
+    }
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for r in &d.routes {
+        let Some(method) = normalize_method(&r.method) else {
+            return Err(bad(&format!(
+                "dynamic.routes method {:?} is not a valid HTTP method",
+                r.method
+            )));
+        };
+        if normalize_route_path(&r.path).is_none() {
+            return Err(bad(&format!(
+                "dynamic.routes path {:?} must start with '/' (trailing '/*' = prefix match)",
+                r.path
+            )));
+        }
+        if !valid_module_name(&r.module) {
+            return Err(bad(&format!(
+                "dynamic.routes module {:?} must match ^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                r.module
+            )));
+        }
+        // Dedupe on the base key: `/api` and `/api/*` name the same
+        // binding slot (one shape replaces the other).
+        let base = r.path.strip_suffix("/*").unwrap_or(&r.path);
+        if !seen.insert((method, base.to_string())) {
+            return Err(bad(&format!(
+                "dynamic.routes duplicate binding {} {}",
+                r.method, r.path
             )));
         }
     }
@@ -251,5 +365,119 @@ upstream = "vllm"
         std::env::remove_var("OPENRUSTY_DYNAMIC_DIR");
         let _ = std::fs::remove_file(&path);
         assert_eq!(cfg.dynamic.unwrap().dir, "build/from-env");
+    }
+    /// `[[dynamic.routes]]` parses with method/path/module and defaults
+    /// to an empty list without the key.
+    #[test]
+    fn routes_parse_and_default() {
+        let cfg = with_dynamic(
+            r#"dir = "build/dynamic"
+
+[[dynamic.routes]]
+method = "get"
+path = "/api/orders"
+module = "orders"
+
+[[dynamic.routes]]
+method = "POST"
+path = "/api/items/*"
+module = "items""#,
+        );
+        let d = cfg.dynamic.expect("section present");
+        assert_eq!(d.routes.len(), 2);
+        assert_eq!(d.routes[0].method, "get");
+        assert_eq!(d.routes[0].path, "/api/orders");
+        assert_eq!(d.routes[0].module, "orders");
+        assert_eq!(d.routes[1].path, "/api/items/*");
+
+        let bare = with_dynamic(r#"dir = "build/dynamic""#);
+        assert!(bare.dynamic.unwrap().routes.is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_route_fields() {
+        for (extra, needle) in [
+            (
+                r#"dir = "d"
+
+[[dynamic.routes]]
+method = ""
+path = "/api"
+module = "m""#,
+                "not a valid HTTP method",
+            ),
+            (
+                r#"dir = "d"
+
+[[dynamic.routes]]
+method = "GET"
+path = "api"
+module = "m""#,
+                "must start with '/'",
+            ),
+            (
+                r#"dir = "d"
+
+[[dynamic.routes]]
+method = "GET"
+path = "/api?x"
+module = "m""#,
+                "must start with '/'",
+            ),
+            (
+                r#"dir = "d"
+
+[[dynamic.routes]]
+method = "GET"
+path = "/api"
+module = "../evil""#,
+                "must match",
+            ),
+        ] {
+            let cfg = with_dynamic(extra);
+            let err = crate::config::validate(&cfg).unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+        }
+    }
+
+    /// Two bindings for the same normalized `(method, path)` collide,
+    /// even when the methods differ only by case.
+    #[test]
+    fn rejects_duplicate_bindings() {
+        let cfg = with_dynamic(
+            r#"dir = "d"
+
+[[dynamic.routes]]
+method = "GET"
+path = "/api"
+module = "a"
+
+[[dynamic.routes]]
+method = "get"
+path = "/api"
+module = "b""#,
+        );
+        let err = crate::config::validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate binding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Normalization helpers: methods trim+uppercase, `?`/`#`/control
+    /// chars and a missing leading `/` reject, `/*` stays verbatim.
+    #[test]
+    fn route_normalization_helpers() {
+        assert_eq!(normalize_method(" get "), Some("GET".to_string()));
+        assert_eq!(normalize_method("PATCH"), Some("PATCH".to_string()));
+        assert_eq!(normalize_method(""), None);
+        assert_eq!(normalize_method("BAD METHOD"), None);
+        assert_eq!(normalize_method("BAD\u{b5}"), None);
+        assert_eq!(normalize_route_path("/api/*"), Some("/api/*".to_string()));
+        assert_eq!(normalize_route_path("api"), None);
+        assert_eq!(normalize_route_path("/a?b"), None);
+        assert_eq!(normalize_route_path("/a#b"), None);
+        assert_eq!(normalize_route_path("/a\tb"), None);
+        assert_eq!(normalize_route_path(&"/a".repeat(1025)), None);
     }
 }

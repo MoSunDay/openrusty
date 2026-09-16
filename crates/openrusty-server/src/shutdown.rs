@@ -22,7 +22,10 @@
 //!    so binary and in-process embedders drive the same path without
 //!    going through OS signals.
 
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -50,7 +53,11 @@ pub struct ShutdownSignal {
 /// A fresh signal in the serving state (`false`, nobody draining).
 pub fn new_signal() -> ShutdownSignal {
     let (tx, rx) = watch::channel(false);
-    ShutdownSignal { tx, rx, in_flight: Arc::new(AtomicUsize::new(0)) }
+    ShutdownSignal {
+        tx,
+        rx,
+        in_flight: Arc::new(AtomicUsize::new(0)),
+    }
 }
 
 /// True once the flag flipped (or the sender is gone, which every accept
@@ -101,7 +108,10 @@ pub async fn run(
     // Phase 1: stop accepting. hyper's graceful shutdown takes over every
     // already accepted connection; running tunnels keep shoveling bytes.
     let _ = tx.send(true);
-    tracing::info!(in_flight = at_signal, "shutdown: phase 1/3 - stop accepting");
+    tracing::info!(
+        in_flight = at_signal,
+        "shutdown: phase 1/3 - stop accepting"
+    );
 
     // Phase 2: bounded wait. Accept tasks end on the flag themselves; the
     // connections end when their peers are done (counter at zero).
@@ -161,7 +171,10 @@ pub async fn run_fast(
 
     // Phase 1: identical to `run` - stop accepting.
     let _ = tx.send(true);
-    tracing::info!(in_flight = at_signal, "shutdown: fast (SIGQUIT) - skipping drain");
+    tracing::info!(
+        in_flight = at_signal,
+        "shutdown: fast (SIGQUIT) - skipping drain"
+    );
 
     // Phase 2 (fast): await only the accept tasks; the in-flight counter
     // is deliberately never polled - that wait is the drain being skipped.
@@ -240,7 +253,6 @@ mod tests {
         run(sig.tx.clone(), tasks, sig.in_flight.clone(), grace).await
     }
 
-
     /// A connection finishing shortly after the flip, decrementing the
     /// shared counter exactly like a drained `serve_conn`.
     fn draining_conn(signal: &ShutdownSignal, delay: Duration) {
@@ -257,7 +269,12 @@ mod tests {
         let sig = new_signal();
         draining_conn(&sig, Duration::from_millis(20));
         draining_conn(&sig, Duration::from_millis(40));
-        let report = drive(&sig, vec![accept_task(sig.rx.clone())], Duration::from_secs(5)).await;
+        let report = drive(
+            &sig,
+            vec![accept_task(sig.rx.clone())],
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(!report.timed_out, "drain must fit the grace window");
         assert_eq!(report.drained, 2);
         assert_eq!(report.forced, 0);
@@ -269,7 +286,12 @@ mod tests {
         let sig = new_signal();
         // A connection that never finishes (peer gone silent).
         sig.in_flight.fetch_add(1, Ordering::Relaxed);
-        let report = drive(&sig, vec![accept_task(sig.rx.clone())], Duration::from_millis(50)).await;
+        let report = drive(
+            &sig,
+            vec![accept_task(sig.rx.clone())],
+            Duration::from_millis(50),
+        )
+        .await;
         assert!(report.timed_out);
         assert_eq!(report.forced, 1);
         assert_eq!(report.drained, 0);
@@ -283,9 +305,12 @@ mod tests {
         // whole grace window, `run_fast` must not wait for it at all.
         sig.in_flight.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        let report =
-            run_fast(sig.tx.clone(), vec![accept_task(sig.rx.clone())], sig.in_flight.clone())
-                .await;
+        let report = run_fast(
+            sig.tx.clone(),
+            vec![accept_task(sig.rx.clone())],
+            sig.in_flight.clone(),
+        )
+        .await;
         // Generous margin: the accept task ends on the flag (awaited to
         // completion inside `run_fast`, hence task_errors == 0), the
         // marker is simply left behind.

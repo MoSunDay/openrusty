@@ -12,13 +12,14 @@ Built on `axum` + `hyper-util` (same-port HTTP/1.1 and h2c) and `wasmtime`.
   `access`, `content`, `balancer`, `header_filter`, `body_filter`, `log`.
   Plugins trap/timeout inside a sandbox; `fail_open` (default) or
   `fail_closed` policy decides the fallback. See `docs/wasm-abi.md`.
-- **Hot reload** — `SIGHUP` or `POST /openrusty/reload` (loopback only):
+- **Hot reload** — `SIGHUP` or `POST /openrusty/reload` (loopback only; optional
+  `[admin] token` adds bearer auth to the admin plane):
   re-reads the config, validates it, compiles every plugin in the background,
   and publishes the new snapshot atomically. Any failure rejects the whole
   reload; in-flight requests finish on the old snapshot; per-plugin KV state
   and upstream health survive reloads.
 - **Gateway basics** — upstreams with smooth weighted round-robin or
-  `ip_hash`, passive + active health checks, failure retries on another peer,
+  `ip_hash`, `least_conn`, passive + active health checks, failure retries on another peer,
   WebSocket pass-through, SSE streaming, request timeouts.
 - **`vllm-kv-scheduler` plugin** — vLLM-style KV-cache affinity: a task key
   extracted from the URL or the request body sticks to one peer; new tasks go to the peer with

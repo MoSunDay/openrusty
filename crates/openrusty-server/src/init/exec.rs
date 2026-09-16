@@ -2,7 +2,7 @@
 //! probe, preflight self-checks, plan execution and the exit-code shell.
 //! The rule surface itself is the pure [`super::build_rules`].
 
-use super::{Backend, COMMENT, InitParams, PROBE_CHAIN, SUBCOMMAND};
+use super::{Backend, InitParams, COMMENT, PROBE_CHAIN, SUBCOMMAND};
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
@@ -75,7 +75,11 @@ fn detect_backend(backend: Backend) -> Result<String, String> {
         Backend::Auto => &["iptables", "iptables-nft", "iptables-legacy"],
     };
     for name in candidates {
-        let ok = Command::new(name).arg("--version").status().map(|s| s.success()).unwrap_or(false);
+        let ok = Command::new(name)
+            .arg("--version")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         tracing::debug!(backend = name, available = ok, "probing iptables command");
         if ok {
             tracing::info!(backend = name, "iptables backend selected");
@@ -93,7 +97,11 @@ fn check_conntrack() -> Result<(), String> {
         tracing::debug!("conntrack facility present");
         return Ok(());
     }
-    let loaded = Command::new("modprobe").arg("nf_conntrack").output().map(|o| o.status.success()).unwrap_or(false);
+    let loaded = Command::new("modprobe")
+        .arg("nf_conntrack")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     if loaded {
         tracing::info!("conntrack loaded via modprobe nf_conntrack");
         Ok(())
@@ -109,7 +117,9 @@ fn check_conntrack() -> Result<(), String> {
 /// taking it down again. Always tears down, even on failure.
 fn check_redirect(bin: &str) -> Result<(), String> {
     let _ = exec(bin, &["-t", "nat", "-N", PROBE_CHAIN]); // tolerated if it exists
-    let probe = format!("-t nat -A {PROBE_CHAIN} -p tcp -m comment --comment {COMMENT} -j REDIRECT --to-ports 1");
+    let probe = format!(
+        "-t nat -A {PROBE_CHAIN} -p tcp -m comment --comment {COMMENT} -j REDIRECT --to-ports 1"
+    );
     let result = exec(bin, &probe.split(' ').collect::<Vec<&str>>()).map_err(|_| {
         "REDIRECT target unavailable: kernel rejected a REDIRECT rule (nat/redirect target missing?)".to_string()
     });
@@ -168,11 +178,22 @@ fn exec_plan(bin: &str, rules: &[String]) -> Result<(usize, usize), String> {
 }
 
 fn exec(bin: &str, args: &[&str]) -> Result<(), String> {
-    let out = Command::new(bin).args(args).output().map_err(|e| format!("spawn {bin}: {e}"))?;
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn {bin}: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let tail: String = stderr.trim().chars().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = stderr
+        .trim()
+        .chars()
+        .rev()
+        .take(160)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     Err(format!("{bin} exited with {}: {tail}", out.status))
 }
