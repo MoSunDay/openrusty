@@ -24,7 +24,7 @@ Commit: abe419f
 
 ## 关键状态与异常
 - 状态：路由匹配结果、所选 peer、重试计数。
-- 观测：`GET /openrusty/metrics` 暴露 Prometheus 文本格式指标：`openrusty_requests_total{route,code}`、`openrusty_request_duration_seconds`（固定桶覆盖 5ms..120s）、`openrusty_upstream_attempts_total{upstream,result}`、`openrusty_plugin_errors_total{plugin,kind}`、`openrusty_peer_healthy{upstream,addr}`、`openrusty_kv_entries{plugin}`。
+- 观测：`GET /openrusty/metrics` 暴露 Prometheus 文本格式指标：`openrusty_requests_total{route,code}`、`openrusty_request_duration_seconds`（固定桶覆盖 5ms..120s）、`openrusty_upstream_attempts_total{upstream,result}`、`openrusty_plugin_errors_total{plugin,kind}`、`openrusty_peer_healthy{upstream,addr}`、`openrusty_kv_entries{plugin}`、`openrusty_plugin_phase_seconds{phase}`（插件各阶段每请求累计墙钟时间直方图）。
 - 异常：无匹配路由 404；全部 peer 不可用/重试耗尽 → 上游错误；路由超时 → 网关超时错误（默认不换 peer 重试；`retry_on_timeout=true` 时按 `retries` 上限换 peer 重试）；`balancer` 插件未选择时回落到配置的均衡算法。
 
 ## 关联逻辑模块

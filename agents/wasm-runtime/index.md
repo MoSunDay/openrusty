@@ -1,4 +1,3 @@
-Commit: 681ad49
 # WASM 插件运行时（openrusty-wasm）
 
 ## 职责
@@ -13,10 +12,18 @@ Commit: 681ad49
 - 契约入口：guest 导出 `orr_on_phase(phase, ctx) -> i32` 与 `orr_alloc`（缺失 `orr_alloc` 在加载期校验失败）；返回值经 `Decision::from_abi` 解码（`0`=Ok、`-5`=Declined、`-4`=Done、`100..=599`=Deny，其余为协议错误）。
 - 沙箱：单次阶段调用受 `plugins.timeout_ms`（wasmtime epoch interruption）与 `plugins.max_memory_mb`（`StoreLimits`）约束；trap/超时/协议错误按 `plugins.on_failure` 降级：`fail_open`（默认）→ `Declined` 放行，`fail_closed` → `Deny(503)`；错误按插件名计数并经 `registry.status()` 暴露。
 - 热重载：`PluginRegistry::reload` 重新读配置、编译并校验全部插件，成功后以 `arc-swap` 原子发布新 `PluginSnapshot`；任一步失败整体拒绝、旧快照保留；`generation` 递增。
-- host KV：键控于插件名（跨重载保留），支持带 TTL 的 `kv_get`/`kv_set`/`kv_del` 与 `kv_scan`；数据经两段式读写（`orr_alloc` 分配、长度不足返回 `-所需长度`）跨边界传递。
+- host KV：键控于插件名（跨重载保留），支持带 TTL 的 `kv_get`/`kv_set`/`kv_del` 与 `kv_scan`；数据经两段式读写跨边界传递（host 写入 guest 自备缓冲，容量不足返回 `-所需长度`）。
 - 响应体写入：第 19 个 import `resp_body_set`（SDK `host::set_resp_body`，1 MiB 上限，同请求覆盖）使 `Done`/`Deny` 短路携带模块写的 body（网关侧映射见 `resp_shortcut.rs`/`dynamic_api.rs`）。
 - 动态执行 API：`DynamicRegistry`（`dynamic.rs`）按 `[dynamic]` 节服务单模块合成管线；编译缓存 stat 驱动（键 `mtime+size`，替换文件下一请求生效、无需 reload）、按名 singleflight、`HostState` 按名跨替换存活；`validate_bytes`（编译+ABI 预检）与 `dir()` 支撑 server 侧注册面（PUT 先验证后原子落盘）；契约见 docs/wasm-abi.md "Dynamic execution API"。
 - guest 侧配套：`openrusty-sdk`（`no_std`：host imports 绑定、guest 分配器、`dispatch!`）与 `openrusty-macros`（`#[phase(...)]`）；一方插件见 `plugins/`。
+
+## 性能特征（2026-09-26 审查 + 优化落地后的当前态）
+- 实例化：加载期 `Linker::instantiate_pre` 预解析导入（`registry.rs` 的 `LoadedPlugin.pre`），每请求仅在新 `Store` 上执行预解析计划，无逐请求导入解析；`plugins.instance_pool_size > 0` 时引擎启用 wasmtime pooling allocator（槽内存按 `max_memory_mb` 预留，槽耗尽 = 实例化失败 → `on_failure`），`=0` 回落 on-demand mmap。仍无 per-request 实例/Store 复用与磁盘编译缓存（审查遗留项，见 [审查](../../features/changelog/2026-09-26/wasm-perf-review.md)与[优化落地](../../features/changelog/2026-09-26/wasm-perf-optimization.md)）。
+- phase 调用仍为同步 wasmtime API、在 async handler 内 inline 执行；曾尝试 `block_in_place` 过渡卸载（server 侧 helper），paired-delta 实测为净回归（每次调用 ~10 µs 的 scheduler run-queue handoff × 每请求 8 阶段，对亚毫秒 phase 占主导）后已完整回退，helper 删除、调用点恢复 inline `session.run_phase`；消除 worker 阻塞的后续路径是 wasmtime `async_support(true)` + `call_async`（epoch interruption 与 async 兼容）。
+- 阶段间 push/pull 以 `mem::take` 所有权转移（`session.rs`），`ctx/peers/resp_headers/req_body/body_chunk` 深拷贝为 0；`req_meta("body")` 借用 refcounted `Bytes` 零拷贝（容量探测也不再重建 payload）。
+- guest `memory` 句柄在实例化时缓存进 `HostData`（`mem.rs` 先取缓存，`get_export` 仅为手动实例化兜底）；`orr_alloc` 仍为未启用的预留——host 从不调用它，host→guest 数据走 two-phase guest 自备缓冲（`docs/wasm-abi.md` 已如实描述）。
+- 观测：per-phase 直方图 `openrusty_plugin_phase_seconds{phase}`（server 侧 `metrics.rs`，每请求每阶段一次观测；wasm 侧 `RequestSession::take_phase_stats()`）。
+- 插件侧 profile：`opt-level="s"`+lto+panic=abort（`plugins/*/Cargo.toml`）；实例化成本下降后是否改 `opt-level=3` 待重测。
 
 ## 核心链路
 1. 启动：`bootstrap` 扫描 `plugins.dir`，按 `plugins.order` + 文件名排序编译校验，发布初始快照。
