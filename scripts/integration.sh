@@ -20,6 +20,11 @@
 # (service uninterrupted across the rotate), systemd socket activation
 # (fd-3 inheritance, zero-refusal restart under load), and SIGQUIT fast
 # shutdown (drain skipped, in-flight forced).
+# Follow-up coverage-audit additions: graceful drain readiness (SIGTERM
+# serves 503 draining on /openrusty/ready while /openrusty/live stays
+# 200 until the grace window expires), the config surface (weighted
+# swrr exact split, host/exact route selection, upstream mTLS with
+# client certs, http1_only inbound), and pipeline resp_body_set.
 # The drill body lives in scripts/integration/*.sh, sourced below in
 # execution order; fragments run in this shell and share the globals
 # and helpers defined here.
@@ -158,8 +163,11 @@ post_body_check() { curl -s --max-time 5 -d 'hello-body' "$GATE/echo" | grep -q 
 . "$(dirname "$0")/integration/70_log_reopen.sh"
 . "$(dirname "$0")/integration/80_socket_activation.sh"
 . "$(dirname "$0")/integration/85_sigquit.sh"
+. "$(dirname "$0")/integration/88_graceful_drain.sh"
 . "$(dirname "$0")/integration/90_admin_auth.sh"
 . "$(dirname "$0")/integration/95_least_conn.sh"
+. "$(dirname "$0")/integration/96_config_surface.sh"
+. "$(dirname "$0")/integration/97_resp_body_set.sh"
 
 
 echo

@@ -59,6 +59,10 @@ check "status: generation >= 1" bash -c "curl -s --max-time 5 $GATE/openrusty/st
 check "status: plugins include vllm-kv-scheduler and kv-probe" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);names={p[\"name\"] for p in d[\"plugins\"]};assert {\"vllm-kv-scheduler\",\"kv-probe\"}<=names'"
 check "status: upstream has 3 peers, 3 healthy" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);u=d[\"upstreams\"][0];assert u[\"peers\"]==3 and u[\"healthy\"]==3'"
 check "status: routes >= 2" bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d[\"routes\"]>=2'"
+# Field shape: app.rs renders uptime as elapsed().as_secs() - a plain
+# non-negative integer, never a float.
+check "status: uptime_secs is a non-negative integer" \
+    bash -c "curl -s --max-time 5 $GATE/openrusty/status | python3 -c 'import sys,json;d=json.load(sys.stdin);u=d[\"uptime_secs\"];assert isinstance(u,int) and not isinstance(u,bool) and u>=0'"
 
 echo "== 19. phases: post_read, rewrite, access =="
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/probe?mode=postread" || true)"

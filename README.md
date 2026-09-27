@@ -79,11 +79,12 @@ the units so freshly built binaries are picked up. Logs live in journald
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
 bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
-bash scripts/integration.sh   # end-to-end drill: 119 checks, sections 1-32
+bash scripts/integration.sh   # end-to-end drill: 192 checks, sections §1-§34 + §70-§97
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports
-(18080/191xx) and walks through `scripts/integration.sh` sections 1-32:
+(18080/191xx) and walks through `scripts/integration.sh` sections §1-§34
+(plus the later numbered fragments §70-§97):
 basic proxy, SSE, h2c, WebSocket, sticky scheduling with TTL release, hot
 reload (SIGHUP / POST, in-flight requests, KV survival, atomic rejection of
 broken plugins, reload under load with zero 5xx), passive health checks,
@@ -109,5 +110,20 @@ exactly one swap lands), the dynamic WASM execution API
 peer/balancer overrides, chain-style body hand-off, replace-without-reload),
 and upstream TLS: https peers forwarded through a
 CA-pinned rustls client, a wrong CA rejected with the gateway's own 502,
-and `insecure_skip_verify` forwarding without an anchor.
-fallback to the default balancer when the field is missing).
+and `insecure_skip_verify` forwarding without an anchor. The later
+numbered fragments keep their file numbers: §33/§34 pin the admin-plane
+token matrix and `least_conn` concurrent-load spreading; §70/§80/§85/§88
+cover log-file rotation with SIGUSR1 reopen, socket-activation restart
+under load with zero refusals, SIGQUIT fast shutdown, and graceful drain
+(`/openrusty/ready` answers 503 `draining` while `/openrusty/live` stays
+200 until the grace window expires). §96 pins the config surface on a
+dedicated gateway: weighted swrr giving an exact 30:10 split over full
+weight-sum cycles, static `host`+`exact` route selection, upstream mTLS
+(client cert presented vs absent -> 502), and `http1_only` refusing the
+h2c prior-knowledge preface. §97 closes the pipeline-side
+`resp_body_set` short-circuit contract through a new kv-probe
+`mode=resp-body` probe (Done+body -> 200, Deny(403)+body -> 403, no body
+-> empty 204). Smaller additions assert the
+`openrusty_plugin_phase_seconds` histogram family, the status
+`uptime_secs` integer shape, and XFF merge with an incoming
+`X-Forwarded-For` value.

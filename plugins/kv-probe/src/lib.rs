@@ -37,6 +37,17 @@
 //! - `scan`         : kv_scan("probe:scan:") sees both scan keys
 //! - `wsheaders`    : the last /ws handshake carried the expected
 //!                    Authorization and Cookie headers
+//! - `resp-body`    : pipeline-side `resp_body_set` + Decision
+//!   short-circuit drill (see below)
+//!
+//! `resp-body` mode (`/probe?mode=resp-body[&text=<t>][&deny=<s>]`):
+//! - `text=<t>` (absent `deny`): body is exactly
+//!   `kv-probe-resp-body:<t>`, Decision::Done -> 200 + body.
+//! - `text=<t>&deny=403`: same body, Decision::Deny(403) -> 403 + body
+//!   (ABI: `Deny(s)` + body -> `s` + body; any 100..=599 status works,
+//!   the drill only uses 403).
+//! - no `text`: no body written, Decision::Done -> empty 204.
+//! - a malformed/out-of-range `deny` denies with 400.
 //!
 //! Flags: `pset`/`pdel` (marker), `phdr` (header echo), `rwdeny` (rewrite
 //! denies 418), `accdeny` (access denies 403), `bmark` (body_filter
@@ -74,6 +85,7 @@ const WS_COOKIE_EXPECT: &str = "session=ws-probe-cookie";
 const PROBE_TTL_MS: i64 = 10_000;
 const SHORT_TTL_MS: i64 = 1_500;
 const RESP_HEADER: &str = "x-kv-probe";
+const RESP_BODY_PREFIX: &str = "kv-probe-resp-body:";
 
 /// Probe modes selectable via the `mode` query parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +114,10 @@ enum ProbeMode {
     /// The last /ws handshake must have carried the expected
     /// Authorization and Cookie headers.
     WsHeaders,
+    /// Pipeline-side `resp_body_set` + Decision short-circuit drill:
+    /// `text=<t>` writes `kv-probe-resp-body:<t>`, `deny=<s>` swaps the
+    /// terminal `Done` for `Deny(s)`.
+    RespBody,
 }
 
 /// Post-read phase: record the request path for cross-phase checks and,
@@ -229,6 +245,7 @@ fn on_content() -> Decision {
         Some(ProbeMode::Scan) => scan(),
         Some(ProbeMode::WsHeaders) => ws_headers(),
         Some(ProbeMode::Balancer) => Decision::Declined,
+        Some(ProbeMode::RespBody) => resp_body(&query),
         None => Decision::Deny(400),
     }
 }
@@ -390,6 +407,44 @@ fn ws_headers() -> Decision {
     }
 }
 
+/// Body written by the `resp-body` mode: exactly
+/// `kv-probe-resp-body:<t>` (pure, so tests pin the wire format).
+fn resp_body_text(text: &str) -> String {
+    alloc::format!("{RESP_BODY_PREFIX}{text}")
+}
+
+/// Terminal decision for the `resp-body` mode from the raw `deny`
+/// parameter value (pure): absent -> `Done` (200 with the body, or the
+/// empty 204 when none was written); a valid `100..=599` status ->
+/// `Deny(s)` (the body, when present, rides along: `s` + body); a
+/// malformed or out-of-range value -> `Deny(400)`.
+fn deny_decision(deny: Option<&str>) -> Decision {
+    match deny {
+        None => Decision::Done,
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(status) if (100..=599).contains(&status) => Decision::Deny(status),
+            _ => Decision::Deny(400),
+        },
+    }
+}
+
+/// `resp-body` mode: exercise pipeline-side `resp_body_set` + Decision
+/// short-circuit semantics. With `text=<t>` the body is exactly
+/// `kv-probe-resp-body:<t>`; without it no body is written, so `Done`
+/// keeps its body-less empty-204 shape. `deny=<s>` swaps the terminal
+/// `Done` for `Deny(s)` on both shapes.
+fn resp_body(query: &str) -> Decision {
+    if let Some(text) = url::query_param(query, "text") {
+        let body = resp_body_text(&text);
+        // Refused by the host (over the 1 MiB cap / unreadable pointer):
+        // fail loudly instead of answering a misleading empty 204.
+        if !host::set_resp_body(body.as_bytes()) {
+            return Decision::Deny(500);
+        }
+    }
+    deny_decision(url::query_param(query, "deny").as_deref())
+}
+
 /// Per-request body_filter bookkeeping key: `<prefix><path>`, plus
 /// `?<query>` when the request has one. Pure, so tests pin the layout.
 fn body_seen_key_for(path: &str, query: &str) -> String {
@@ -443,6 +498,7 @@ fn parse_mode(query: &str) -> Option<ProbeMode> {
         "scan" => Some(ProbeMode::Scan),
         "wsheaders" => Some(ProbeMode::WsHeaders),
         "balancer" => Some(ProbeMode::Balancer),
+        "resp-body" => Some(ProbeMode::RespBody),
         _ => None,
     }
 }
@@ -554,6 +610,84 @@ mod tests {
             parse_mode("a=1&mode=wsheaders&b=2"),
             Some(ProbeMode::WsHeaders)
         );
+    }
+
+    #[test]
+    fn parse_mode_accepts_resp_body() {
+        assert_eq!(parse_mode("mode=resp-body"), Some(ProbeMode::RespBody));
+        assert_eq!(
+            parse_mode("a=1&mode=resp-body&text=t&deny=403"),
+            Some(ProbeMode::RespBody)
+        );
+        // The mode token itself must match exactly.
+        assert_eq!(parse_mode("mode=resp_body"), None);
+        assert_eq!(parse_mode("mode=respbody"), None);
+    }
+
+    #[test]
+    fn resp_body_text_pins_wire_format() {
+        assert_eq!(resp_body_text("hi"), "kv-probe-resp-body:hi");
+        assert_eq!(resp_body_text(""), "kv-probe-resp-body:");
+        assert_eq!(
+            resp_body_text("with space/slash"),
+            "kv-probe-resp-body:with space/slash"
+        );
+        // Percent-decoding happens in `url::query_param`, before the
+        // prefix is attached.
+        assert_eq!(
+            resp_body_text(&url::query_param("text=a%20b", "text").unwrap()),
+            "kv-probe-resp-body:a b"
+        );
+    }
+
+    #[test]
+    fn deny_decision_maps_the_deny_param() {
+        // Absent -> terminal Done (200 + body, or empty 204).
+        assert_eq!(deny_decision(None), Decision::Done);
+        // Valid statuses ride along verbatim.
+        assert_eq!(deny_decision(Some("403")), Decision::Deny(403));
+        assert_eq!(deny_decision(Some("500")), Decision::Deny(500));
+        assert_eq!(deny_decision(Some("100")), Decision::Deny(100));
+        assert_eq!(deny_decision(Some("599")), Decision::Deny(599));
+        // Malformed or out-of-range values have no wire representation.
+        assert_eq!(deny_decision(Some("99")), Decision::Deny(400));
+        assert_eq!(deny_decision(Some("600")), Decision::Deny(400));
+        assert_eq!(deny_decision(Some("0")), Decision::Deny(400));
+        assert_eq!(deny_decision(Some("")), Decision::Deny(400));
+        assert_eq!(deny_decision(Some("403x")), Decision::Deny(400));
+        assert_eq!(deny_decision(Some("forbidden")), Decision::Deny(400));
+    }
+
+    #[test]
+    fn resp_body_mode_decisions_on_host_stubs() {
+        // The host ffi stub mirrors the success contract, so the full
+        // mode handler is testable: text -> Done, text + deny -> Deny(s),
+        // no text -> body-less Done.
+        assert_eq!(resp_body("mode=resp-body&text=hi"), Decision::Done);
+        assert_eq!(
+            resp_body("mode=resp-body&text=hi&deny=403"),
+            Decision::Deny(403)
+        );
+        assert_eq!(resp_body("mode=resp-body"), Decision::Done);
+        assert_eq!(resp_body("mode=resp-body&deny=403"), Decision::Deny(403));
+        // An explicit empty text still writes the prefixed body.
+        assert_eq!(
+            resp_body("mode=resp-body&text=&deny=500"),
+            Decision::Deny(500)
+        );
+        // Bad deny values deny with 400 even when a body was written.
+        assert_eq!(
+            resp_body("mode=resp-body&text=hi&deny=nope"),
+            Decision::Deny(400)
+        );
+    }
+
+    #[test]
+    fn resp_body_mode_uses_abi_documented_codes() {
+        // Done short-circuits as NGX_DONE (-4); Deny(403) crosses the
+        // ABI as the raw status (100..=599), per docs/wasm-abi.md.
+        assert_eq!(Decision::Done.to_abi(), -4);
+        assert_eq!(deny_decision(Some("403")).to_abi(), 403);
     }
 
     #[test]

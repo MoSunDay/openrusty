@@ -76,6 +76,12 @@ check "metrics: plugin errors family" bash -c "echo \"\$METRICS\" | grep -q '# T
 check "metrics: vllm peer node1 healthy" bash -c "echo \"\$METRICS\" | grep -q 'openrusty_peer_healthy{upstream=\"vllm\",addr=\"127.0.0.1:19101\"} 1'"
 check "metrics: kv-probe kv entries" bash -c "echo \"\$METRICS\" | grep -q 'openrusty_kv_entries{plugin=\"kv-probe\"}'"
 check "metrics: +Inf duration bucket" bash -c "echo \"\$METRICS\" | grep -q 'openrusty_request_duration_seconds_bucket{le=\"+Inf\"}'"
+check "metrics: plugin phase histogram family" \
+    bash -c "echo \"\$METRICS\" | grep -q '# TYPE openrusty_plugin_phase_seconds histogram'"
+# kv-probe's log phase ran for every proxied request so far, so the log
+# phase histogram must carry at least one observation by now.
+check "metrics: plugin phase log observations populated" \
+    bash -c "echo \"\$METRICS\" | grep -Eq 'openrusty_plugin_phase_seconds_count\{phase=\"log\"\} [1-9]'"
 
 echo "== 30. concurrent reload race (in-flight gate) =="
 # Two reloads fired at the same instant: the in-flight gate must reject

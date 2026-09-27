@@ -7,6 +7,13 @@ BODY="$(curl -s --max-time 5 "$GATE/echo" || true)"
 check "http1 proxy 200 with node field" test -n "$(echo "$BODY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["node"])' 2>/dev/null)"
 check "POST body forwarded" post_body_check
 check "x-forwarded-for injected" bash -c "curl -s --max-time 5 '$GATE/echo' | grep -qi 'x-forwarded-for'"
+# Merge semantics (proxy::merge_xff): the incoming value is joined with
+# the direct client IP, comma+space separated - pinned by the unit test
+# "merge_xff_appends_client_ip" in crates/openrusty-proxy/src/forward.rs.
+XFF_MERGED="$(curl -s --max-time 5 -H 'X-Forwarded-For: 203.0.113.9' "$GATE/echo" | \
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["headers"].get("x-forwarded-for",""))' 2>/dev/null || true)"
+check "x-forwarded-for merges incoming value with client ip" \
+    test "$XFF_MERGED" = "203.0.113.9, 127.0.0.1"
 
 echo "== 2. SSE streaming =="
 SSE="$(curl -sN --max-time 8 "$GATE/sse?n=3&sleep_ms=30" || true)"

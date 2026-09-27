@@ -38,7 +38,10 @@ netns_teardown() {
     for p in ${PIDS[@]:-}; do kill -9 "$p" 2>/dev/null || true; done
     [ -n "$NS" ] && ip netns del "$NS" >/dev/null 2>&1 || true
     [ -n "$VH" ] && ip link del "$VH" >/dev/null 2>&1 || true
-    [ -n "$TMP" ] && rm -rf "$TMP"
+    # Last statement must succeed even when TMP is still empty (the SKIP
+    # path bails before netns_up sets it): drills end their EXIT-trap
+    # cleanup with this call, so its rc becomes the script's exit status.
+    [ -n "$TMP" ] && rm -rf "$TMP" || true
 }
 
 # Gateway logs are styled by tracing (ANSI escapes wrap field names/values);
