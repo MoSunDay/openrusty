@@ -1,3 +1,4 @@
+Commit: bee611a
 # WASM 插件运行时（openrusty-wasm）
 
 ## 职责
