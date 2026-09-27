@@ -4,6 +4,7 @@ Commit: 86fac98
 ## 能力分组
 - [代理转发与流式协议](./proxying/index.md) —— 同端口 HTTP/1.1+h2c、WebSocket 透传、SSE、路由超时、连接失败换 peer 重试
 - [WASM 插件阶段管线与沙箱](./plugin-pipeline/index.md) —— 8 个 nginx 对齐阶段、Decision 语义、超时/内存收容、fail_open/fail_closed
+- WASM 路径性能优化 —— 加载期 `instantiate_pre` + 实例池（`plugins.instance_pool_size`）、阶段间所有权转移、ABI 边界零拷贝削减、per-phase 指标 `openrusty_plugin_phase_seconds`（[changelog 2026-09-26](./changelog/2026-09-26/wasm-perf-optimization.md)）
 - [热重载](./hot-reload/index.md) —— SIGHUP / `POST /openrusty/reload`，原子发布、失败整体拒绝、在途请求与状态保留
 - [负载均衡与健康检查](./load-balancing/index.md) —— swrr/ip_hash/least_conn、被动健康、故障摘除与恢复
 - [vllm-kv-scheduler 亲和调度](./vllm-kv-scheduler/index.md) —— vLLM 风格 KV-cache 亲和：task key 粘滞、最少任务选择、TTL 释放

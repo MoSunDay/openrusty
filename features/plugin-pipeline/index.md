@@ -12,7 +12,7 @@ Commit: 681ad49
 
 ## 行为与规则
 - Decision 语义（nginx 对齐）：`0`=Ok 已处理继续、`-5`=Declined 放行继续、`-4`=Done 停止阶段链（短路：模块经 `resp_body_set` 写了 body 则 `200 + body`，否则空 204；`body_filter` 中为流结束）、`100..=599`=以该状态码拒绝（可携带 body）。
-- 沙箱：单次阶段调用受 `plugins.timeout_ms` 超时与 `plugins.max_memory_mb` 内存上限约束；越界即被中止，不会拖垮网关。
+- 沙箱：单次阶段调用受 `plugins.timeout_ms` 超时与 `plugins.max_memory_mb` 内存上限约束；越界即被中止，不会拖垮网关。实例经 `plugins.instance_pool_size` 预留槽位池化（默认 1000，槽内存按 `max_memory_mb` 预留；槽耗尽 = 实例化失败走 `on_failure`，`0` = on-demand 分配）。
 - 失败策略 `plugins.on_failure`：`fail_open`（默认）按放行继续，`fail_closed` 按 503 拒绝；每次失败计入该插件错误计数。
 - 插件自由配置经 `[plugins.settings.<name>]` 以字符串键值传入。
 

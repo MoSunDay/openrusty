@@ -12,7 +12,7 @@ Commit: 681ad49
 
 ## 行为与规则
 - `/openrusty/status` 返回 JSON：`generation`、`uptime_secs`、`plugins`（每插件错误计数）、`routes` 数、`upstreams`（每 upstream 的 `peers`/`healthy`）。
-- `/openrusty/metrics` 返回 Prometheus 文本暴露：`openrusty_requests_total`（route/code）、`openrusty_request_duration_seconds` 直方图、`openrusty_upstream_attempts_total`（upstream/result）、`openrusty_plugin_errors_total`、`openrusty_peer_healthy` gauge、`openrusty_kv_entries` gauge。
+- `/openrusty/metrics` 返回 Prometheus 文本暴露：`openrusty_requests_total`（route/code）、`openrusty_request_duration_seconds` 直方图、`openrusty_upstream_attempts_total`（upstream/result）、`openrusty_plugin_errors_total`、`openrusty_peer_healthy` gauge、`openrusty_kv_entries` gauge、`openrusty_plugin_phase_seconds{phase}` 直方图（每请求各插件阶段的累计墙钟时间，桶 25µs..1s）。
 - 重载触发见 [热重载](../hot-reload/index.md)。
 - systemd 单元：
   - `openrusty.service` —— 网关，`WorkingDirectory=/root/openrusty`（配置引用相对插件目录 `build/plugins`），`ExecStart` 读 `config/openrusty.toml`，`Wants`/`After` 三个 echo 实例，`LimitNOFILE=65535`；
