@@ -85,6 +85,14 @@ pub(crate) fn load_plugins(
             plugin: name.clone(),
             detail: e.to_string(),
         })?;
+        // Resolve all imports once here so per-request instantiation only
+        // executes the plan (no import resolution on the request path).
+        let pre = linker
+            .instantiate_pre(&module)
+            .map_err(|e| ReloadError::Abi {
+                plugin: name.clone(),
+                detail: format!("instantiate_pre: {e}"),
+            })?;
         let state = prev_states
             .get(name.as_str())
             .cloned()
@@ -93,6 +101,7 @@ pub(crate) fn load_plugins(
         plugins.push(Arc::new(LoadedPlugin {
             name: name.clone(),
             module,
+            pre,
             state,
             settings,
             timeout: Duration::from_millis(cfg.plugins.timeout_ms),

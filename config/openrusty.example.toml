@@ -31,6 +31,13 @@ order = ["vllm-kv-scheduler"]
 timeout_ms = 50
 # Per-request memory ceiling granted to each plugin instance (MiB).
 max_memory_mb = 16
+# Instance slots in the wasm pooling allocator. Size for
+# (number of plugins) x (peak concurrent requests); exhaustion fails
+# instantiation and applies the on_failure policy. 0 = on-demand
+# allocation (pre-pooling behavior). Each slot pre-reserves linear
+# memory for one instance sized from max_memory_mb (rounded up to a
+# 64 KiB page), so raising max_memory_mb grows the pool's footprint.
+instance_pool_size = 1000
 # Behavior when a plugin traps/times out: fail_open (decision = declined) or fail_closed (decision = deny 503).
 on_failure = "fail_open"
 

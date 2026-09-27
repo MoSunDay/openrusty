@@ -117,19 +117,27 @@ impl HostState {
 
     /// Value for `key`, or `None` if missing or expired (lazy expiry).
     pub fn kv_get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.kv_get_with(key, |v| v.to_vec())
+    }
+
+    /// Run `f` with a borrowed view of the live value for `key` (no copy).
+    /// `None` when missing/expired; stale entries are cleaned exactly like
+    /// [`HostState::kv_get`]. The map entry is locked while `f` runs
+    /// (guest code cannot re-enter during it), so the caller must not
+    /// call back into `HostState` mutators inside `f`.
+    pub fn kv_get_with<R>(&self, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let now = now_ms();
-        let live = self
-            .kv
-            .get(key)
-            .and_then(|e| (!is_expired(e.expires_at, now)).then(|| e.value.clone()));
-        if live.is_none() {
-            // Drop a stale entry if one exists (avoids clobbering a fresh set);
-            // its bytes must leave the quota total with it.
-            if let Some((k, e)) = self.kv.remove_if(key, |_, e| is_expired(e.expires_at, now)) {
-                self.account(0, k.len() + e.value.len());
+        if let Some(e) = self.kv.get(key) {
+            if !is_expired(e.expires_at, now) {
+                return Some(f(&e.value));
             }
         }
-        live
+        // No live entry: drop a stale one if it exists (avoids clobbering
+        // a fresh set); its bytes must leave the quota total with it.
+        if let Some((k, e)) = self.kv.remove_if(key, |_, e| is_expired(e.expires_at, now)) {
+            self.account(0, k.len() + e.value.len());
+        }
+        None
     }
 
     /// Insert/overwrite. `ttl_ms <= 0` means no expiry. Returns `false` -
@@ -394,7 +402,32 @@ mod tests {
         assert_eq!(s.kv_get(b"a"), Some(b"2".to_vec()));
         assert!(s.kv_del(b"a"));
         assert!(!s.kv_del(b"a"));
+
         assert_eq!(s.kv_get(b"a"), None);
+    }
+
+    #[test]
+    fn kv_get_with_borrows_without_copying() {
+        let s = state();
+        // Missing key: None, `f` never runs.
+        assert_eq!(s.kv_get_with(b"m", |_| 1), None);
+        s.kv_set(b"k", b"val".to_vec(), 0);
+        // Live value: the closure sees a borrowed view of the stored
+        // bytes (pointer identity, not a clone).
+        let seen = s
+            .kv_get_with(b"k", |v| {
+                assert_eq!(v, b"val");
+                v.as_ptr()
+            })
+            .unwrap();
+        let stored = s.kv.get(&b"k"[..]).map(|e| e.value.as_ptr()).unwrap();
+        assert_eq!(seen, stored);
+        // Expired entry: None and the stale bytes are lazily released
+        // from the quota, exactly like kv_get.
+        s.kv_set(b"t", b"gone".to_vec(), 1);
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(s.kv_get_with(b"t", |v| v.len()), None);
+        assert_eq!(s.kv_len(), 1); // only "k" is left
     }
 
     #[test]

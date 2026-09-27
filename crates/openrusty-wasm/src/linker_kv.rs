@@ -24,10 +24,11 @@ pub(crate) fn link(linker: &mut Linker<HostData>) -> Result<(), wasmtime::Error>
                 return 0;
             };
             let state = caller.data().state.clone();
-            match state.kv_get(&key) {
-                Some(v) => mem::write_out(&mut caller, out_ptr, out_cap, &v),
-                None => 0, // missing key (or unreadable pointer) => 0 bytes
-            }
+            // Borrowed view straight into the map entry: the value is
+            // written into the guest without the intermediate owned copy.
+            state
+                .kv_get_with(&key, |v| mem::write_out(&mut caller, out_ptr, out_cap, v))
+                .unwrap_or(0) // missing key (or unreadable pointer) => 0 bytes
         },
     )?;
 

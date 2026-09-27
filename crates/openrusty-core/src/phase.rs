@@ -26,6 +26,12 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// Number of phase variants: the 8 nginx-aligned phases above, in id
+    /// order. Phase-indexed arrays (e.g. the per-phase timing slots in
+    /// `openrusty-wasm`'s request session) size themselves with this and
+    /// stay in sync with the enum via the test below.
+    pub const COUNT: usize = 8;
+
     /// Phases that run before a response is produced.
     pub const PRE_PROXY: [Phase; 4] = [
         Phase::PostRead,
@@ -169,6 +175,16 @@ mod tests {
         assert_eq!(Decision::from_abi(-2), None);
         assert_eq!(Decision::from_abi(99), None);
         assert_eq!(Decision::from_abi(600), None);
+    }
+
+    #[test]
+    fn count_matches_the_variant_ids() {
+        // COUNT must cover exactly the 8 contiguous ids 0..=7: every id
+        // below COUNT decodes to a phase, nothing at or above it does.
+        for i in 0..Phase::COUNT as i32 {
+            assert!(Phase::from_i32(i).is_some(), "missing variant for id {i}");
+        }
+        assert_eq!(Phase::from_i32(Phase::COUNT as i32), None);
     }
 
     #[test]

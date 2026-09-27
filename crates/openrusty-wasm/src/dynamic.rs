@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use wasmtime::{Engine, Linker, Module};
+use wasmtime::{Engine, InstancePre, Linker, Module};
 
 /// Longest module name accepted (cache key hygiene, nothing more).
 const MAX_NAME_LEN: usize = 128;
@@ -96,18 +96,22 @@ fn file_version(path: &Path) -> Option<(u64, u32, u64)> {
     Some((dur.as_secs(), dur.subsec_nanos(), md.len()))
 }
 
-/// Read + compile + ABI-validate one module file. Pure apart from file IO;
-/// the error string feeds the 500 response body/log.
+/// Read + compile + ABI-validate one module file and pre-resolve its
+/// imports. Pure apart from file IO; the error string feeds the 500
+/// response body/log.
 fn compile_file(
     engine: &Engine,
     linker: &Linker<HostData>,
     path: &Path,
-) -> Result<(Module, crate::linker::AbiInfo), String> {
+) -> Result<(Module, InstancePre<HostData>, crate::linker::AbiInfo), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let module = Module::new(engine, bytes).map_err(|e| format!("compile failed: {e}"))?;
     let info = validate_module(engine, linker, &module)
         .map_err(|e| format!("abi validation failed: {e}"))?;
-    Ok((module, info))
+    let pre = linker
+        .instantiate_pre(&module)
+        .map_err(|e| format!("instantiate_pre failed: {e}"))?;
+    Ok((module, pre, info))
 }
 
 /// Lock a std mutex without propagating poisoning (a panicked compiler
@@ -211,13 +215,7 @@ impl DynamicRegistry {
             generation: 0,
             plugins: vec![plugin],
         });
-        let mut sess = RequestSession::for_parts(
-            self.engine.clone(),
-            self.linker.clone(),
-            snap,
-            ctx,
-            Vec::new(),
-        );
+        let mut sess = RequestSession::for_parts(self.engine.clone(), snap, ctx, Vec::new());
         sess.set_req_body(body);
 
         // Pre-proxy phases in nginx order; a terminal decision fixes the
@@ -320,7 +318,7 @@ impl DynamicRegistry {
             work()
         };
         self.compiled.fetch_add(1, Ordering::Relaxed);
-        let (module, info) = built.map_err(|e| {
+        let (module, pre, info) = built.map_err(|e| {
             tracing::warn!(plugin = %name, error = %e, "dynamic module rejected");
             ResolveFail::Build(e)
         })?;
@@ -336,6 +334,7 @@ impl DynamicRegistry {
         let plugin = Arc::new(LoadedPlugin {
             name: name.to_string(),
             module,
+            pre,
             state,
             settings,
             timeout: self.timeout,

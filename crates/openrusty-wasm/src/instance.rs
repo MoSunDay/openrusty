@@ -55,10 +55,18 @@ pub struct HostData {
     pub body_last: bool,
     /// Per-store resource limits (memory ceiling), installed by the runner.
     pub limits: StoreLimits,
+    /// Guest linear-memory handle, cached at instantiation by the runner
+    /// so host imports skip the per-call export lookup. Stays `None` for
+    /// embedders that instantiate manually; [`crate::mem::memory_of`]
+    /// falls back to the export lookup then.
+    pub memory: Option<wasmtime::Memory>,
 }
 
 /// Build a fresh `HostData` with empty response/body state and unlimited
-/// store limits (the runner installs the real memory ceiling).
+/// store limits (the runner installs the real memory ceiling). The
+/// request context and peers are whatever the caller seeds: the session
+/// passes [`ReqCtx::empty`] placeholders here and moves the real state
+/// in before the first plugin call.
 pub fn new_host_data(
     ctx: ReqCtx,
     peers: Vec<PeerView>,
@@ -77,6 +85,7 @@ pub fn new_host_data(
         body_chunk: Bytes::new(),
         body_last: false,
         limits: StoreLimitsBuilder::new().build(),
+        memory: None,
     }
 }
 
@@ -120,5 +129,7 @@ mod tests {
         assert!(d.body_chunk.is_empty());
         assert!(!d.body_last);
         assert_eq!(d.peers.len(), 1);
+        // The memory handle is a runner-installed cache, empty here.
+        assert!(d.memory.is_none());
     }
 }

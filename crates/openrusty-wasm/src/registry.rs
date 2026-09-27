@@ -11,18 +11,21 @@ use crate::instance::HostData;
 use crate::linker::build_linker;
 use crate::registry_validate::{discover, load_plugins};
 use arc_swap::{ArcSwap, Guard};
-use openrusty_core::config::{Config, FailPolicy};
+use openrusty_core::config::{Config, FailPolicy, PluginsConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use wasmtime::{Engine, Linker, Module};
+use wasmtime::{Engine, InstancePre, Linker, Module};
 
 /// A compiled, validated plugin plus its per-request parameters.
 pub struct LoadedPlugin {
     pub name: String,
     pub module: Module,
+    /// Import-resolved instantiation plan; per-request instantiation only
+    /// executes it (no per-request import resolution).
+    pub pre: InstancePre<HostData>,
     /// Shared state; survives reloads (keyed by name).
     pub state: Arc<HostState>,
     pub settings: Arc<HashMap<String, String>>,
@@ -61,10 +64,38 @@ pub enum ReloadError {
 /// Engine with epoch interruption (required for phase timeouts) plus its
 /// epoch ticker. Dropping the ticker stops and joins the bump thread, so
 /// an engine built here never leaks it.
-pub fn new_engine() -> Result<EpochTicker, wasmtime::Error> {
-    let mut cfg = wasmtime::Config::new();
-    cfg.epoch_interruption(true);
-    Ok(EpochTicker::new(Engine::new(&cfg)?))
+///
+/// With `cfg.instance_pool_size > 0` the engine uses wasmtime's pooling
+/// instance allocator: instances come from pre-reserved slots instead of
+/// per-instantiation mmap, so slot reuse makes instantiation cheap at the
+/// cost of a fixed-size pool (exhaustion fails instantiation, which flows
+/// into the plugin failure policy).
+pub fn new_engine(cfg: &PluginsConfig) -> Result<EpochTicker, wasmtime::Error> {
+    let mut cfg_engine = wasmtime::Config::new();
+    cfg_engine.epoch_interruption(true);
+    if cfg.instance_pool_size > 0 {
+        let mut pool = wasmtime::PoolingAllocationConfig::new();
+        let slot_bytes = memory_slot_bytes(cfg.max_memory_mb);
+        pool.total_memories(cfg.instance_pool_size)
+            .total_core_instances(cfg.instance_pool_size)
+            .total_tables(cfg.instance_pool_size)
+            .total_stacks(cfg.instance_pool_size)
+            .max_memory_size(slot_bytes);
+        cfg_engine.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pool));
+    }
+    Ok(EpochTicker::new(Engine::new(&cfg_engine)?))
+}
+
+/// Per-slot linear-memory byte size for the pooling allocator:
+/// `max_memory_mb` MiB rounded up to the wasm page size (64 KiB), clamped
+/// to at most 4 GiB minus one page (wasmtime requires a pool slot below
+/// the default 4 GiB memory reservation). Pure.
+fn memory_slot_bytes(max_memory_mb: u32) -> usize {
+    const WASM_PAGE: usize = 64 * 1024;
+    const MAX_SLOT: usize = 4 * 1024 * 1024 * 1024 - WASM_PAGE;
+    let bytes = (max_memory_mb as usize).saturating_mul(1024 * 1024);
+    // Round up to a page, then clamp.
+    ((bytes + WASM_PAGE - 1) / WASM_PAGE * WASM_PAGE).min(MAX_SLOT)
 }
 
 pub struct PluginRegistry {
@@ -78,7 +109,7 @@ impl PluginRegistry {
     /// A missing or empty directory is not fatal: an empty snapshot
     /// (generation 0) is published and a warning is logged.
     pub fn bootstrap(cfg: &Config) -> Result<Arc<Self>, ReloadError> {
-        let ticker = new_engine().map_err(|e| ReloadError::Abi {
+        let ticker = new_engine(&cfg.plugins).map_err(|e| ReloadError::Abi {
             plugin: "engine".into(),
             detail: e.to_string(),
         })?;
@@ -223,7 +254,10 @@ fn order_plugins(files: &[String], order: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::RequestSession;
     use openrusty_core::config::{PluginsConfig, ServerConfig};
+    use openrusty_core::phase::{Decision, Phase};
+    use openrusty_core::ReqCtx;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -441,5 +475,78 @@ mod tests {
         assert!(reg.reload(&cfg).await.is_err());
         assert_eq!(reg.snapshot().generation, 1);
         assert_eq!(reg.snapshot().plugins.len(), 1);
+    }
+
+    fn ctx() -> ReqCtx {
+        ReqCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            version: "HTTP/1.1".into(),
+            client_addr: "127.0.0.1:1".parse().unwrap(),
+            headers: Vec::new(),
+            route_index: None,
+            upstream: None,
+            peer_index: None,
+            attempts: 0,
+            tried: Vec::new(),
+        }
+    }
+
+    /// Two live sessions x two plugins fill the pool exactly: every
+    /// instantiation must succeed with slots reused across sessions,
+    /// proving the pooling allocator works end to end.
+    #[test]
+    fn pooling_engine_serves_two_concurrent_sessions() {
+        let dir = TmpDir::new("registry-pool");
+        dir.write("a.wasm", OK_WAT.as_bytes());
+        dir.write("b.wasm", OK_WAT.as_bytes());
+        let mut cfg = test_cfg(dir.0.to_str().unwrap(), &[]);
+        cfg.plugins.instance_pool_size = 4;
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        assert_eq!(reg.snapshot().plugins.len(), 2);
+
+        // Both sessions stay alive at once (4 pooled instances total).
+        let mut s1 = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        let mut s2 = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        assert_eq!(s1.run_phase(Phase::PostRead), Decision::Ok);
+        assert_eq!(s2.run_phase(Phase::PostRead), Decision::Ok);
+        drop((s1, s2));
+
+        // Freed slots are recycled by later sessions.
+        let mut s3 = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        assert_eq!(s3.run_phase(Phase::PostRead), Decision::Ok);
+    }
+
+    /// `instance_pool_size = 0` disables pooling (on-demand allocation)
+    /// and must keep serving sessions exactly as before.
+    #[test]
+    fn on_demand_engine_still_serves_sessions() {
+        let dir = TmpDir::new("registry-ondemand");
+        dir.write("a.wasm", OK_WAT.as_bytes());
+        dir.write("b.wasm", OK_WAT.as_bytes());
+        let mut cfg = test_cfg(dir.0.to_str().unwrap(), &[]);
+        cfg.plugins.instance_pool_size = 0;
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        assert_eq!(reg.snapshot().plugins.len(), 2);
+        let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), Vec::new());
+        assert_eq!(sess.run_phase(Phase::PostRead), Decision::Ok);
+    }
+
+    #[test]
+    fn memory_slot_bytes_rounds_to_page_and_clamps() {
+        // Exact MiB multiples stay page-aligned unchanged.
+        assert_eq!(memory_slot_bytes(16), 16 * 1024 * 1024);
+        assert_eq!(memory_slot_bytes(1), 1024 * 1024);
+        // 0 MiB is a valid (if useless) zero-size slot.
+        assert_eq!(memory_slot_bytes(0), 0);
+        // 4 GiB worth of MiB clamps below the 4 GiB memory reservation,
+        // losing at most one page (the rounding of the clamp target).
+        assert_eq!(memory_slot_bytes(4096), 4 * 1024 * 1024 * 1024 - 64 * 1024);
+        // Anything beyond keeps the clamp (no overflow).
+        assert_eq!(
+            memory_slot_bytes(u32::MAX),
+            4 * 1024 * 1024 * 1024 - 64 * 1024
+        );
     }
 }

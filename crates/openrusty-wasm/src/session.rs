@@ -2,19 +2,18 @@
 //! pinned snapshot. Instances are created lazily on first use.
 
 use crate::host_state::HostState;
-use crate::instance::{new_host_data, HeaderEdit, HostData, PeerView};
+use crate::instance::{new_host_data, HeaderEdit, PeerView};
 use crate::registry::{LoadedPlugin, PluginRegistry, PluginSnapshot};
 use crate::runner::{self, PluginRt};
 use bytes::Bytes;
 use openrusty_core::phase::{Decision, Phase};
 use openrusty_core::ReqCtx;
 use std::sync::Arc;
-use wasmtime::{Engine, Linker, Trap};
+use wasmtime::{Engine, Trap};
 
 /// One request flowing through the plugin chain.
 pub struct RequestSession {
     engine: Engine,
-    linker: Linker<HostData>,
     snap: Arc<PluginSnapshot>,
     ctx: ReqCtx,
     peers: Vec<PeerView>,
@@ -32,6 +31,13 @@ pub struct RequestSession {
     /// Buffered request body, pushed into each instance before its call.
     /// Empty until the server seeds it (content phase onward).
     req_body: Bytes,
+    /// Per-phase accumulated wasm wall time (nanoseconds), indexed by
+    /// `phase as usize`; drained by [`RequestSession::take_phase_stats`].
+    phase_ns: [u64; Phase::COUNT],
+    /// Per-phase plugin invocation counts, indexed like `phase_ns`
+    /// (instantiation failures included: they burn the timeout budget
+    /// the same way a slow call does).
+    phase_calls: [u64; Phase::COUNT],
 }
 
 impl RequestSession {
@@ -41,14 +47,14 @@ impl RequestSession {
         ctx: ReqCtx,
         peers: Vec<PeerView>,
     ) -> Self {
-        Self::for_parts(reg.engine().clone(), reg.linker().clone(), snap, ctx, peers)
+        Self::for_parts(reg.engine().clone(), snap, ctx, peers)
     }
 
     /// [`RequestSession::new`] for callers that already hold the engine
-    /// and linker (e.g. embedders sharing one registry's runtime).
+    /// (e.g. embedders sharing one registry's runtime). Instances come
+    /// from each plugin's pre-resolved imports, so no linker is needed.
     pub fn for_parts(
         engine: Engine,
-        linker: Linker<HostData>,
         snap: Arc<PluginSnapshot>,
         ctx: ReqCtx,
         peers: Vec<PeerView>,
@@ -56,7 +62,6 @@ impl RequestSession {
         let rts = snap.plugins.iter().map(|_| None).collect();
         RequestSession {
             engine,
-            linker,
             snap,
             ctx,
             peers,
@@ -66,6 +71,8 @@ impl RequestSession {
             resp_headers: Vec::new(),
             resp_body: None,
             req_body: Bytes::new(),
+            phase_ns: [0; Phase::COUNT],
+            phase_calls: [0; Phase::COUNT],
         }
     }
 
@@ -135,9 +142,14 @@ impl RequestSession {
     /// (log never aborts; its terminal decisions are ignored).
     pub fn run_phase(&mut self, phase: Phase) -> Decision {
         let is_log = matches!(phase, Phase::Log);
+        // Stats slot for this phase (Phase ids are dense 0..COUNT).
+        let slot = phase as usize;
         let mut last = Decision::Declined;
         for i in 0..self.snap.plugins.len() {
             let plugin = self.snap.plugins[i].clone();
+            // One measurement per plugin per phase: instantiation (when
+            // lazily needed) plus the runner call. No allocation.
+            let started = std::time::Instant::now();
             if self.rts[i].is_none() {
                 match self.instantiate_one(&plugin) {
                     Ok(rt) => self.rts[i] = Some(rt),
@@ -154,6 +166,7 @@ impl RequestSession {
                         plugin.state.record_error(kind);
                         tracing::warn!(plugin = %plugin.name, error = %e, "plugin instantiation failed");
                         let fallback = runner::fallback_decision(plugin.fail_policy);
+                        self.record_phase_time(slot, started);
                         last = fallback;
                         if fallback.is_terminal() && !is_log {
                             return fallback;
@@ -163,29 +176,45 @@ impl RequestSession {
                 }
             }
             let rt = self.rts[i].as_mut().expect("just instantiated");
-            // Push shared per-request state into the instance.
+            // Push shared per-request state into the instance by
+            // ownership transfer: `mem::take` moves the real data in
+            // (zero copies) and leaves default empties behind.
+            //
+            // Invariant: the take-back below is the symmetric half and
+            // MUST run in the same loop iteration with no `return` or
+            // `continue` between the two brackets - between phases the
+            // session (not the host data) holds the real ctx/peers/
+            // resp_headers, which the server reads and mutates via
+            // `session.ctx()`.
             let hd = rt.host_data_mut();
-            hd.ctx = self.ctx.clone();
-            hd.peers = self.peers.clone();
-            hd.resp_headers = self.resp_headers.clone();
-            hd.req_body = self.req_body.clone();
-            hd.body_chunk = self.body_chunk.clone();
+            hd.ctx = std::mem::take(&mut self.ctx);
+            hd.peers = std::mem::take(&mut self.peers);
+            hd.resp_headers = std::mem::take(&mut self.resp_headers);
+            hd.req_body = std::mem::take(&mut self.req_body);
+            hd.body_chunk = std::mem::take(&mut self.body_chunk);
             hd.body_last = self.body_last;
 
             let decision = runner::run_phase(rt, plugin.timeout, plugin.fail_policy, phase);
 
-            // Pull mutated state back out.
-            let hd = rt.host_data();
-            self.ctx = hd.ctx.clone();
-            self.resp_headers = hd.resp_headers.clone();
+            // Pull mutated state back out (the take-back half of the
+            // bracket above): the session owns the real data again and
+            // the host data is left with empties for the next push.
+            let hd = rt.host_data_mut();
+            self.ctx = std::mem::take(&mut hd.ctx);
+            self.peers = std::mem::take(&mut hd.peers);
+            self.resp_headers = std::mem::take(&mut hd.resp_headers);
+            self.req_body = std::mem::take(&mut hd.req_body);
+            self.body_chunk = std::mem::take(&mut hd.body_chunk);
+            self.body_last = hd.body_last;
             // Host data is not seeded with the session's body, so a
             // plugin that writes none must not clobber a body written by
             // an earlier plugin in the chain (last writer wins; an
             // untouched `None` preserves what is already carried).
             if hd.resp_body.is_some() {
-                self.resp_body = hd.resp_body.clone();
+                self.resp_body = hd.resp_body.take();
             }
 
+            self.record_phase_time(slot, started);
             last = decision;
             if decision.is_terminal() && !is_log {
                 return decision;
@@ -194,14 +223,46 @@ impl RequestSession {
         last
     }
 
+    /// Fold one plugin invocation's wall time (started to now) into the
+    /// per-phase nanosecond total and bump the invocation count.
+    fn record_phase_time(&mut self, slot: usize, started: std::time::Instant) {
+        self.phase_ns[slot] += started.elapsed().as_nanos() as u64;
+        self.phase_calls[slot] += 1;
+    }
+
+    /// Drain per-phase totals accumulated by [`RequestSession::run_phase`]:
+    /// `(phase name, plugin invocations, total wall time)`. Only phases that
+    /// ran are included, in phase-id order. Draining is destructive: a
+    /// second call yields nothing, so a request records its stats once.
+    pub fn take_phase_stats(&mut self) -> Vec<(&'static str, u64, std::time::Duration)> {
+        let mut out = Vec::new();
+        for i in 0..Phase::COUNT {
+            if self.phase_calls[i] == 0 {
+                continue;
+            }
+            let phase = Phase::from_i32(i as i32).expect("phase ids are dense");
+            out.push((
+                phase.name(),
+                self.phase_calls[i],
+                std::time::Duration::from_nanos(self.phase_ns[i]),
+            ));
+            self.phase_calls[i] = 0;
+            self.phase_ns[i] = 0;
+        }
+        out
+    }
+
     fn instantiate_one(&self, p: &LoadedPlugin) -> Result<PluginRt, wasmtime::Error> {
+        // Host data is seeded with placeholders: the first phase push
+        // moves the real ctx/peers in before any plugin call, so an
+        // instantiation failure cannot lose session state.
         let host = new_host_data(
-            self.ctx.clone(),
-            self.peers.clone(),
+            ReqCtx::empty(),
+            Vec::new(),
             p.state.clone(),
             p.settings.clone(),
         );
-        runner::instantiate(&self.engine, &self.linker, &p.module, host, p.memory_mb)
+        runner::instantiate(&p.pre, &self.engine, host, p.memory_mb)
     }
 }
 
@@ -399,6 +460,50 @@ mod tests {
         assert!(sess.take_header_edits().is_empty());
     }
 
+    /// Echo module: copies `req_meta("body")` into `resp_body_set` on
+    /// every call, so each phase's outcome directly reflects the request
+    /// body the session pushed in.
+    const ECHO_BODY_MOD: &str = r#"
+(module
+  (import "openrusty" "req_meta" (func $meta (param i32 i32 i32 i32) (result i32)))
+  (import "openrusty" "resp_body_set" (func $set (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "body")
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    (local $len i32)
+    (local.set $len (call $meta (i32.const 0) (i32.const 4) (i32.const 64) (i32.const 1024)))
+    (if (i32.lt_s (local.get $len) (i32.const 0))
+      (then unreachable))
+    (drop (call $set (i32.const 64) (local.get $len)))
+    i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+
+    #[tokio::test]
+    async fn ownership_transfer_round_trips_session_state() {
+        // Push/pull moves the real state in and out per call; between
+        // phases the session must hold it again (the server reads and
+        // mutates `session.ctx()` there). If the take-back half were
+        // missing, the second run below would see an empty body.
+        let dir = TmpDir::new("pullback");
+        dir.write("echo.wasm", ECHO_BODY_MOD);
+        let cfg = test_cfg(dir.0.to_str().unwrap(), &[]);
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), peers());
+        sess.set_req_body(Bytes::from_static(b"hello body"));
+        for phase in [Phase::Access, Phase::Content, Phase::Log] {
+            assert_eq!(sess.run_phase(phase), Decision::Ok);
+            // ctx and peers came back intact...
+            assert_eq!(sess.ctx().path, "/v1/models");
+            assert_eq!(sess.ctx().route_index, Some(0));
+            assert_eq!(sess.ctx().upstream.as_deref(), Some("vllm"));
+            assert_eq!(sess.ctx().peer_index, None);
+            // ...and the seeded body reached the plugin through the push
+            // (an empty echo would mean the session lost it).
+            assert_eq!(sess.take_resp_body().as_deref(), Some(&b"hello body"[..]));
+        }
+    }
+
     /// Content-phase module: writes a body but returns Ok (non-terminal).
     const CHAIN_BODY_OK_MOD: &str = r#"
 (module
@@ -473,5 +578,30 @@ mod tests {
         assert_eq!(sess.run_phase(Phase::Access), Decision::Deny(503));
         let nomem = &sess.plugins()[1];
         assert_eq!(plugin_state(nomem).error_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn phase_stats_track_runs_and_drain_once() {
+        let dir = TmpDir::new("stats");
+        dir.write("ok.wasm", &ret_module(0));
+        let cfg = test_cfg(dir.0.to_str().unwrap(), &["ok"]);
+        let reg = PluginRegistry::bootstrap(&cfg).unwrap();
+        let mut sess = RequestSession::new(&reg, reg.snapshot(), ctx(), peers());
+
+        // Fresh session: nothing ran yet.
+        assert!(sess.take_phase_stats().is_empty());
+        assert_eq!(sess.run_phase(Phase::Access), Decision::Ok);
+
+        let stats = sess.take_phase_stats();
+        // Only the phase that ran, carrying its invocation count and a
+        // non-negative duration.
+        assert_eq!(stats.len(), 1, "one phase recorded: {stats:?}");
+        assert_eq!(stats[0].0, Phase::Access.name());
+        assert!(stats[0].1 >= 1, "at least one plugin invocation");
+        assert!(stats[0].2 >= std::time::Duration::ZERO);
+
+        // Draining is destructive: the second take is empty (a request
+        // records its stats exactly once).
+        assert!(sess.take_phase_stats().is_empty());
     }
 }

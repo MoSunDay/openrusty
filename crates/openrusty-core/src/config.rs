@@ -126,6 +126,11 @@ pub struct PluginsConfig {
     pub on_failure: FailPolicy,
     /// Free-form per-plugin settings: plugin name -> key/value map.
     pub settings: BTreeMap<String, HashMap<String, String>>,
+    /// Instance slots in the engine's pooling allocator (one slot per live
+    /// plugin instance; size for plugin count x peak concurrency). 0 disables
+    /// pooling and falls back to on-demand allocation.
+    #[serde(default = "default_instance_pool_size")]
+    pub instance_pool_size: u32,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -134,6 +139,10 @@ fn default_timeout_ms() -> u64 {
 
 fn default_max_memory_mb() -> u32 {
     16
+}
+
+fn default_instance_pool_size() -> u32 {
+    1000
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

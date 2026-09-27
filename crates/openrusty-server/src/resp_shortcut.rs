@@ -90,8 +90,9 @@ mod tests {
     use super::*;
     use crate::pipeline::handle_request;
     use crate::testutil::{boot_state, TmpDir};
+    use openrusty_core::config::PluginsConfig;
     use openrusty_core::ReqCtx;
-    use openrusty_wasm::{build_linker, new_engine, PluginSnapshot};
+    use openrusty_wasm::{new_engine, PluginSnapshot};
     use std::sync::Arc;
 
     /// Body-read ceiling for the assertions below (bodies are tiny).
@@ -129,9 +130,8 @@ mod tests {
     /// A session with no plugins and no body: `for_parts` on an empty
     /// snapshot, so no registry or wasm module is needed.
     fn bare_session() -> RequestSession {
-        let ticker = new_engine().unwrap();
+        let ticker = new_engine(&PluginsConfig::default()).unwrap();
         let engine = ticker.engine().clone();
-        let linker = build_linker(&engine).unwrap();
         let ctx = ReqCtx {
             method: "GET".into(),
             path: "/".into(),
@@ -147,7 +147,6 @@ mod tests {
         };
         RequestSession::for_parts(
             engine,
-            linker,
             Arc::new(PluginSnapshot {
                 generation: 0,
                 plugins: Vec::new(),

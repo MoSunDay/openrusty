@@ -30,6 +30,25 @@ pub struct ReqCtx {
 }
 
 impl ReqCtx {
+    /// Minimal placeholder context (all-empty fields). Used to seed wasm
+    /// host state whose real context is pushed before the first plugin
+    /// call (see `RequestSession::instantiate_one`).
+    pub fn empty() -> ReqCtx {
+        ReqCtx {
+            method: String::new(),
+            path: String::new(),
+            query: String::new(),
+            version: String::new(),
+            client_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            headers: Vec::new(),
+            route_index: None,
+            upstream: None,
+            peer_index: None,
+            attempts: 0,
+            tried: Vec::new(),
+        }
+    }
+
     /// Client IP without the port (works for v4 and bracketed v6 alike).
     /// Returns an owned `String`; the context never leaks memory.
     pub fn client_ip(&self) -> String {
@@ -54,6 +73,14 @@ impl ReqCtx {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// The default is the all-empty placeholder ([`ReqCtx::empty`]); the real
+/// request facts are filled in per request.
+impl Default for ReqCtx {
+    fn default() -> Self {
+        ReqCtx::empty()
     }
 }
 
@@ -100,6 +127,26 @@ mod tests {
         let mut v6 = ctx.clone();
         v6.client_addr = "[2001:db8::1]:9000".parse().unwrap();
         assert_eq!(v6.client_ip(), "2001:db8::1");
+    }
+
+    #[test]
+    fn empty_is_all_default_fields() {
+        let e = ReqCtx::empty();
+        assert_eq!(e.method, "");
+        assert_eq!(e.path, "");
+        assert_eq!(e.query, "");
+        assert_eq!(e.version, "");
+        assert_eq!(e.client_addr, "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        assert!(e.headers.is_empty());
+        assert_eq!(e.route_index, None);
+        assert_eq!(e.upstream, None);
+        assert_eq!(e.peer_index, None);
+        assert_eq!(e.attempts, 0);
+        assert!(e.tried.is_empty());
+        // `Default` (used by ownership-transfer push/pull in the wasm
+        // session) is the same placeholder.
+        assert_eq!(e.client_addr, ReqCtx::default().client_addr);
+        assert_eq!(ReqCtx::default().headers, Vec::new());
     }
 
     #[test]
