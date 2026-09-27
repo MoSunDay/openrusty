@@ -69,7 +69,7 @@ pub async fn proxy_websocket(
 ) -> Response {
     // h2c connections have no HTTP/1-style upgrade extension.
     if req.version() == hyper::Version::HTTP_2 {
-        finish_log(&mut session, 502);
+        finish_log(&state, &mut session, 502);
         return text_response(502, "502 websocket requires http/1.1\n");
     }
     // Extracted while req is still intact; resolves once we answer 101.
@@ -102,11 +102,11 @@ pub async fn proxy_websocket(
         let idx = match pick_peer(&state, &up_rt, &mut session) {
             Pick::Peer(i) => i,
             Pick::Deny(s) => {
-                finish_log(&mut session, s);
+                finish_log(&state, &mut session, s);
                 return text_response(s, format!("{s}\n"));
             }
             Pick::None => {
-                finish_log(&mut session, 502);
+                finish_log(&state, &mut session, 502);
                 return text_response(502, "502 no healthy upstream\n");
             }
         };
@@ -126,7 +126,7 @@ pub async fn proxy_websocket(
             .method(req.method().clone())
             .uri(format!("{scheme}://{uri_authority}{path_and_query}"));
         let Some(headers) = out.headers_mut() else {
-            finish_log(&mut session, 502);
+            finish_log(&state, &mut session, 502);
             return text_response(502, "502 bad request\n");
         };
         for (name, value) in handshake_headers(&client_headers, &peer.addr.to_string(), &client_ip)
@@ -142,7 +142,7 @@ pub async fn proxy_websocket(
         let outbound = match out.body(http_body_util::Full::new(bytes::Bytes::new())) {
             Ok(r) => r,
             Err(_) => {
-                finish_log(&mut session, 502);
+                finish_log(&state, &mut session, 502);
                 return text_response(502, "502 bad request\n");
             }
         };
@@ -217,7 +217,7 @@ pub async fn proxy_websocket(
         // A healthy peer answered with a definitive non-101 (bad client
         // request, auth failure, ...). That is not a peer failure: no
         // retry, pass the refusal through as a 502.
-        finish_log(&mut session, 502);
+        finish_log(&state, &mut session, 502);
         return text_response(
             502,
             format!("502 upstream refused upgrade ({})\n", out_resp.status()),
@@ -246,20 +246,24 @@ pub async fn proxy_websocket(
     // Outbound upgrade future; resolves once the 101 is on the wire.
     let out_upgraded = hyper::upgrade::on(&mut out_resp);
     let Ok(resp) = resp.body(Body::empty()) else {
-        finish_log(&mut session, 502);
+        finish_log(&state, &mut session, 502);
         return text_response(502, "502 bad response\n");
     };
 
-    // Tunnel task: owns the session; log phase runs when it closes.
+    // Tunnel task: owns the session; log phase runs when it closes. The
+    // metrics handle is captured up front (the tunnel outlives the
+    // handshake future) so the tunnel's log drain records the request's
+    // per-phase stats exactly once.
     let session = Arc::new(Mutex::new(session));
     let log_session = session.clone();
+    let log_metrics = state.metrics.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let in_io = match on_upgrade.await {
             Ok(io) => io,
             Err(e) => {
                 tracing::warn!(error = %e, "client websocket upgrade failed");
-                run_ws_log(&log_session);
+                run_ws_log(&log_session, &log_metrics);
                 return;
             }
         };
@@ -267,7 +271,7 @@ pub async fn proxy_websocket(
             Ok(io) => io,
             Err(e) => {
                 tracing::warn!(error = %e, "upstream websocket upgrade failed");
-                run_ws_log(&log_session);
+                run_ws_log(&log_session, &log_metrics);
                 return;
             }
         };
@@ -279,7 +283,7 @@ pub async fn proxy_websocket(
         if let Err(e) = res {
             tracing::warn!(error = %e, "websocket tunnel error");
         }
-        run_ws_log(&log_session);
+        run_ws_log(&log_session, &log_metrics);
         tracing::info!(
             ms = started.elapsed().as_millis() as u64,
             "websocket closed"
@@ -289,10 +293,16 @@ pub async fn proxy_websocket(
     resp
 }
 
-/// Run the log phase for a finished (or failed) WebSocket session.
-fn run_ws_log(session: &Mutex<RequestSession>) {
+/// Run the log phase for a finished (or failed) WebSocket session and
+/// record its per-phase stats: the success path never calls `finish_log`
+/// (the session moved into the tunnel), so this is the single drain.
+fn run_ws_log(session: &Mutex<RequestSession>, metrics: &crate::metrics::Metrics) {
     if let Ok(mut s) = session.lock() {
         s.run_phase(Phase::Log);
+        let stats = s.take_phase_stats();
+        if !stats.is_empty() {
+            metrics.record_phases(stats);
+        }
     }
 }
 

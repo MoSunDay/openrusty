@@ -11,7 +11,7 @@
 //! loop and the egress runtime), so it renders straight from the snapshot
 //! like the request/attempts counters - no live view involved.
 
-use super::{MetricsSnapshot, DURATION_BUCKETS};
+use super::{MetricsSnapshot, DURATION_BUCKETS, PHASE_BUCKETS};
 use std::collections::HashMap;
 
 /// Escape a label value per the exposition format: backslash, double-quote
@@ -46,7 +46,7 @@ fn format_sum(v: f64) -> String {
 /// Families appear in a fixed order: request counters, duration histogram,
 /// upstream attempts, plugin errors, transparent connection counters,
 /// dynamic module counters (omitted while empty - optional feature),
-/// peer health gauge, KV gauge. Label
+/// peer health gauge, KV gauge, plugin phase histogram. Label
 /// combinations within a family are sorted; buckets use the fixed
 /// [`DURATION_BUCKETS`] order with `+Inf` implied by `_count`.
 ///
@@ -196,6 +196,42 @@ pub fn render(
         out.push_str(&format!(
             "openrusty_kv_entries{{plugin=\"{}\"}} {n}\n",
             escape_label(&plugin)
+        ));
+    }
+
+    // openrusty_plugin_phase_seconds (histogram, appended after every
+    // pre-existing family so contains-based assertions on the exposition
+    // above stay stable). Phases sorted by name for deterministic output;
+    // buckets use the fixed PHASE_BUCKETS order with `+Inf` implied by
+    // `_count`. Each observation is one request's total wasm wall time in
+    // that phase.
+    out.push_str(
+        "# HELP openrusty_plugin_phase_seconds Total wall time spent in each plugin phase per request.\n",
+    );
+    out.push_str("# TYPE openrusty_plugin_phase_seconds histogram\n");
+    let mut phases: Vec<_> = snap.phases.iter().collect();
+    phases.sort_by(|a, b| a.0.cmp(b.0));
+    for (phase, h) in phases {
+        for (b, n) in PHASE_BUCKETS.iter().zip(h.buckets.iter()) {
+            out.push_str(&format!(
+                "openrusty_plugin_phase_seconds_bucket{{phase=\"{}\",le=\"{b}\"}} {n}\n",
+                escape_label(phase)
+            ));
+        }
+        out.push_str(&format!(
+            "openrusty_plugin_phase_seconds_bucket{{phase=\"{}\",le=\"+Inf\"}} {}\n",
+            escape_label(phase),
+            h.count
+        ));
+        out.push_str(&format!(
+            "openrusty_plugin_phase_seconds_sum{{phase=\"{}\"}} {}\n",
+            escape_label(phase),
+            format_sum(h.sum)
+        ));
+        out.push_str(&format!(
+            "openrusty_plugin_phase_seconds_count{{phase=\"{}\"}} {}\n",
+            escape_label(phase),
+            h.count
         ));
     }
 
@@ -372,5 +408,43 @@ mod tests {
         assert!(inbound < outbound, "(role, outcome) must be sorted");
         assert!(out.find("role=\"inbound\",outcome=\"tunnel\"").unwrap() > inbound);
         assert!(first < gauge, "transparent family must precede the gauge");
+    }
+
+    /// The plugin phase histogram renders appended after the existing
+    /// families: one bucket series per recorded phase (sorted by name),
+    /// fixed PHASE_BUCKETS order, `+Inf`/`_sum`/`_count` closing each
+    /// phase.
+    #[test]
+    fn phase_histogram_renders_appended_and_sorted() {
+        let m = Metrics::new();
+        m.record_phase("log", 50e-6);
+        m.record_phase("access", 100e-6);
+        m.record_phase("access", 2.5e-3);
+        let out = render(&m.snapshot(), &[], &[], &[]);
+
+        // Buckets in fixed order per phase, cumulative.
+        assert!(out
+            .contains("openrusty_plugin_phase_seconds_bucket{phase=\"access\",le=\"0.000025\"} 0"));
+        assert!(
+            out.contains("openrusty_plugin_phase_seconds_bucket{phase=\"access\",le=\"0.0001\"} 1")
+        );
+        assert!(
+            out.contains("openrusty_plugin_phase_seconds_bucket{phase=\"access\",le=\"0.0025\"} 2")
+        );
+        assert!(
+            out.contains("openrusty_plugin_phase_seconds_bucket{phase=\"access\",le=\"+Inf\"} 2")
+        );
+        assert!(out.contains("openrusty_plugin_phase_seconds_count{phase=\"access\"} 2"));
+        assert!(out.contains("openrusty_plugin_phase_seconds_count{phase=\"log\"} 1"));
+        // Sum with trailing zeros trimmed: 0.0026.
+        assert!(out.contains("openrusty_plugin_phase_seconds_sum{phase=\"access\"} 0.0026"));
+        assert!(out.contains("openrusty_plugin_phase_seconds_sum{phase=\"log\"} 0.00005"));
+
+        // Phases sorted by name; the whole family sits after the KV gauge.
+        let access = out.find("phase=\"access\"").unwrap();
+        let log = out.find("phase=\"log\"").unwrap();
+        let kv = out.find("# HELP openrusty_kv_entries").unwrap();
+        assert!(access < log, "phases must render sorted by name");
+        assert!(kv < access, "phase family must render after existing ones");
     }
 }

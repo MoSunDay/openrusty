@@ -20,6 +20,51 @@ pub const DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
 ];
 
+/// Fixed histogram buckets for `openrusty_plugin_phase_seconds`, the
+/// per-request wall time of each plugin phase: microsecond-scale (wasm
+/// phase calls are bounded by the plugin timeout, tens of milliseconds
+/// by default), so the boundaries are far finer than the request
+/// histogram's. Same cumulative convention as [`DURATION_BUCKETS`].
+pub const PHASE_BUCKETS: &[f64] = &[
+    25e-6, 50e-6, 100e-6, 250e-6, 500e-6, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 0.1, 0.25, 0.5,
+    1.0,
+];
+
+/// Histogram state for one plugin phase (`openrusty_plugin_phase_seconds`):
+/// cumulative bucket counts aligned with [`PHASE_BUCKETS`], observation
+/// count and sum. Plain data; updates go through [`Metrics::record_phase`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhaseHist {
+    /// `buckets[i]` counts observations `<= PHASE_BUCKETS[i]`.
+    pub buckets: Vec<u64>,
+    /// `openrusty_plugin_phase_seconds_count{phase=...}` (observations).
+    pub count: u64,
+    /// `openrusty_plugin_phase_seconds_sum{phase=...}`.
+    pub sum: f64,
+}
+
+impl PhaseHist {
+    fn empty() -> PhaseHist {
+        PhaseHist {
+            buckets: vec![0; PHASE_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+
+    /// Record one observation into the cumulative buckets plus
+    /// `_count`/`_sum`; values beyond every boundary feed count/sum only.
+    fn observe(&mut self, seconds: f64) {
+        self.count += 1;
+        self.sum += seconds;
+        if let Some(i) = phase_bucket_index(seconds) {
+            for b in self.buckets.iter_mut().skip(i) {
+                *b += 1;
+            }
+        }
+    }
+}
+
 /// Upstream attempt `result` label values, shared with the proxy/balancer
 /// wiring that calls [`Metrics::record_attempt`].
 pub const RESULT_SUCCESS: &str = "success";
@@ -64,6 +109,8 @@ struct MetricsState {
     transparent: HashMap<(String, String), u64>,
     /// `openrusty_dynamic_requests_total{module,code}`.
     dynamic: HashMap<(String, u16), u64>,
+    /// `openrusty_plugin_phase_seconds{phase}` histograms.
+    phases: HashMap<String, PhaseHist>,
     /// Cumulative per-bucket counts: `buckets[i]` counts observations
     /// `<= DURATION_BUCKETS[i]`. Length always matches the constant.
     buckets: Vec<u64>,
@@ -81,6 +128,7 @@ impl MetricsState {
             plugin_errors: HashMap::new(),
             transparent: HashMap::new(),
             dynamic: HashMap::new(),
+            phases: HashMap::new(),
             buckets: vec![0; DURATION_BUCKETS.len()],
             count: 0,
             sum: 0.0,
@@ -190,6 +238,38 @@ impl Metrics {
         *s.dynamic.entry((module.to_string(), code)).or_insert(0) += 1;
     }
 
+    /// Record one plugin phase observation: the per-request wall time a
+    /// phase's plugin invocations spent in wasm (drained from the request
+    /// session via `take_phase_stats`). One observation per phase per
+    /// request, bucketed into [`PHASE_BUCKETS`] exactly like
+    /// [`Metrics::record_request_timed`] treats the request duration.
+    pub fn record_phase(&self, phase: &str, seconds: f64) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.phases
+            .entry(phase.to_string())
+            .or_insert_with(PhaseHist::empty)
+            .observe(seconds);
+    }
+
+    /// Batching variant of [`Metrics::record_phase`] for the drained
+    /// session stats `(phase name, plugin invocations, total wall time)`.
+    /// The invocation count is already folded into the observed duration
+    /// (each request contributes one observation per phase it ran), so it
+    /// is accepted but not recorded separately; this keeps the call site a
+    /// single lock acquisition for the whole request.
+    pub fn record_phases<'a, I>(&self, phases: I)
+    where
+        I: IntoIterator<Item = (&'a str, u64, std::time::Duration)>,
+    {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (phase, _invocations, total) in phases {
+            s.phases
+                .entry(phase.to_string())
+                .or_insert_with(PhaseHist::empty)
+                .observe(total.as_secs_f64());
+        }
+    }
+
     /// Cheap clone of all state for rendering. The caller can keep the
     /// snapshot while the collector keeps recording.
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -200,6 +280,7 @@ impl Metrics {
             plugin_errors: s.plugin_errors.clone(),
             transparent: s.transparent.clone(),
             dynamic: s.dynamic.clone(),
+            phases: s.phases.clone(),
             buckets: s.buckets.clone(),
             count: s.count,
             sum: s.sum,
@@ -227,6 +308,8 @@ pub struct MetricsSnapshot {
     pub transparent: HashMap<(String, String), u64>,
     /// `openrusty_dynamic_requests_total{module,code}` -> count.
     pub dynamic: HashMap<(String, u16), u64>,
+    /// `openrusty_plugin_phase_seconds{phase}` histograms.
+    pub phases: HashMap<String, PhaseHist>,
     /// Cumulative per-bucket counts, aligned with [`DURATION_BUCKETS`].
     pub buckets: Vec<u64>,
     /// `openrusty_request_duration_seconds_count`.
@@ -239,6 +322,11 @@ pub struct MetricsSnapshot {
 /// value exceeds every boundary (then it only feeds `_count`/`_sum`).
 fn bucket_index(seconds: f64) -> Option<usize> {
     DURATION_BUCKETS.iter().position(|b| seconds <= *b)
+}
+
+/// [`bucket_index`] for the plugin-phase buckets ([`PHASE_BUCKETS`]).
+fn phase_bucket_index(seconds: f64) -> Option<usize> {
+    PHASE_BUCKETS.iter().position(|b| seconds <= *b)
 }
 
 pub use metrics_render::render;
@@ -327,6 +415,48 @@ mod tests {
         assert_eq!(s.count, 1);
         assert_eq!(s.attempts.len(), 0);
         assert_eq!(s.sum, 0.5);
+    }
+
+    #[test]
+    fn phase_records_feed_cumulative_buckets_and_count_sum() {
+        let m = Metrics::new();
+        m.record_phase("access", 25e-6); // bucket 0 (<= 25us)
+        m.record_phase("access", 100e-6); // bucket 2 (<= 100us)
+        m.record_phase("access", 5.0); // beyond every boundary: count/sum only
+        let s = m.snapshot();
+        let access = &s.phases["access"];
+        assert_eq!(access.buckets.len(), PHASE_BUCKETS.len());
+        assert_eq!(access.count, 3);
+        assert_eq!(access.buckets[0], 1); // <= 25us
+        assert_eq!(access.buckets[1], 1); // <= 50us: unchanged
+        assert_eq!(access.buckets[2], 2); // <= 100us
+        assert!((access.sum - 5.000125).abs() < 1e-9);
+        // Other phases stay untouched until recorded.
+        assert!(!s.phases.contains_key("rewrite"));
+    }
+
+    #[test]
+    fn record_phases_matches_record_phase_exactly() {
+        let split = Metrics::new();
+        let batched = Metrics::new();
+        let stats = vec![
+            ("access", 2u64, std::time::Duration::from_nanos(120_000)),
+            ("log", 1u64, std::time::Duration::from_secs_f64(0.0002)),
+        ];
+        for (name, _, d) in &stats {
+            split.record_phase(name, d.as_secs_f64());
+        }
+        batched.record_phases(stats);
+        let a = split.snapshot().phases;
+        let b = batched.snapshot().phases;
+        assert_eq!(a.len(), b.len());
+        for (k, v) in &a {
+            assert_eq!(b.get(k), Some(v), "mismatch for {k:?}");
+            assert_eq!(v.count, 1);
+        }
+        // 120us lands in the 250us bucket, 200us in the 250us bucket too.
+        assert_eq!(a["access"].buckets[3], 1);
+        assert_eq!(a["log"].buckets[3], 1);
     }
 
     /// Deep equality of two snapshots: every family, buckets and scalars.

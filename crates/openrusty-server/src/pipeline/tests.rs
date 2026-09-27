@@ -326,3 +326,84 @@ async fn route_label_is_pinned_from_the_serving_snapshot() {
     assert!(routes.contains(&"unknown"), "missing 404 label: {routes:?}");
     assert!(routes.contains(&"/v2"), "missing '/v2' label: {routes:?}");
 }
+
+/// A plugin that declines every phase except access, where it denies
+/// with 403 (phase ids: post_read=0, rewrite=1, access=2).
+const DENY_ACCESS_WAT: &str = r#"(module
+    (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+      (if (i32.eq (local.get $phase) (i32.const 2))
+        (then (return (i32.const 403))))
+      i32.const -5)
+    (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
+    (memory (export "memory") 1))"#;
+
+/// A short-circuited request (access deny) drains its per-phase stats in
+/// `finish_log` -- the only drain point on that path, since no
+/// `FilteredBody` was ever created: every phase it ran records exactly
+/// one observation.
+#[tokio::test]
+async fn short_circuit_request_records_phase_stats_once() {
+    let dir = TmpDir::new("phase-deny");
+    dir.write_plugin("deny.wasm", DENY_ACCESS_WAT.as_bytes());
+    dir.write_config(&dir.standard_config());
+    let state = boot_state(&dir);
+    let req = hyper::Request::builder()
+        .uri("/")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (resp, _) = handle_request(state.clone(), "127.0.0.1:40002".parse().unwrap(), req).await;
+    assert_eq!(resp.status(), 403);
+
+    let phases = state.metrics.snapshot().phases;
+    for phase in ["post_read", "rewrite", "access", "log"] {
+        assert_eq!(
+            phases[phase].count, 1,
+            "{phase} must record exactly one observation"
+        );
+    }
+    // The chain stopped at the deny: no content/balancer/filter phases.
+    assert!(!phases.contains_key("content"), "{phases:?}");
+}
+
+/// A proxied request records every phase exactly once: the pre-body
+/// phases on the way in, the filter phases while the body streams, and
+/// the single drain in `FilteredBody`'s log run (never `finish_log` too).
+#[tokio::test]
+async fn proxied_request_records_phase_stats_once() {
+    let upstream = crate::testutil::spawn_echo_upstream().await;
+    let dir = TmpDir::new("phase-stats");
+    dir.write_plugin("probe.wasm", crate::testutil::OK_WAT.as_bytes());
+    dir.write_config(
+        &dir.standard_config()
+            .replace("127.0.0.1:9001", &format!("127.0.0.1:{upstream}")),
+    );
+    let state = boot_state(&dir);
+    let req = hyper::Request::builder()
+        .uri("/")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (resp, _) = handle_request(state.clone(), "127.0.0.1:40003".parse().unwrap(), req).await;
+    assert_eq!(resp.status(), 200);
+    // Consuming the streamed body drives body_filter and its log run.
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"hello");
+
+    let phases = state.metrics.snapshot().phases;
+    for phase in [
+        "post_read",
+        "rewrite",
+        "access",
+        "content",
+        "balancer",
+        "header_filter",
+        "body_filter",
+        "log",
+    ] {
+        assert_eq!(
+            phases[phase].count, 1,
+            "{phase} must record exactly one observation"
+        );
+    }
+}

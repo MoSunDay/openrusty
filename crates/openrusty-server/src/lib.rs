@@ -10,9 +10,9 @@
 //! [`reload::apply_config`].
 //!
 //! Not part of the public API: `testutil` (scratch dirs, `OK_WAT`,
-//! `boot_state`) is compiled only for this crate's own tests, and
+//! `boot_state`) is compiled only for this crate's own tests,
 //! `metrics_render` stays a private submodule of [`metrics`] (its render
-//! entry point is re-exported as [`metrics::render`]).
+//! point is re-exported as [`metrics::render`]).
 
 pub mod active_probe;
 pub mod admin_auth;

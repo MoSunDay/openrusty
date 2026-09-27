@@ -32,6 +32,9 @@ pub struct FilteredBody {
     last_sent: bool,
     /// True once the log phase ran; guards against double runs.
     log_done: bool,
+    /// Collector for the drained per-phase stats (`None` keeps the old
+    /// behavior for tests constructing a body without metrics).
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl FilteredBody {
@@ -40,6 +43,7 @@ impl FilteredBody {
         inner: Incoming,
         status: u16,
         peer: String,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
     ) -> Self {
         FilteredBody {
             inner: Some(inner),
@@ -50,6 +54,7 @@ impl FilteredBody {
             bytes: 0,
             last_sent: false,
             log_done: false,
+            metrics,
         }
     }
 }
@@ -63,10 +68,27 @@ fn run_filter(session: &Mutex<RequestSession>, chunk: Bytes, last: bool) {
     }
 }
 
-/// Run the log phase and emit the access-log line.
-fn run_log(session: &Mutex<RequestSession>, status: u16, peer: &str, started: Instant, bytes: u64) {
+/// Run the log phase, drain the request's per-phase stats and emit the
+/// access-log line.
+fn run_log(
+    session: &Mutex<RequestSession>,
+    metrics: Option<&Arc<crate::metrics::Metrics>>,
+    status: u16,
+    peer: &str,
+    started: Instant,
+    bytes: u64,
+) {
     if let Ok(mut s) = session.lock() {
         s.run_phase(Phase::Log);
+        // This is the single drain point for a streamed proxied response:
+        // `finish_log` never ran for it, and the guarded `log_done` flag
+        // keeps this to exactly one record per request.
+        if let Some(m) = metrics {
+            let stats = s.take_phase_stats();
+            if !stats.is_empty() {
+                m.record_phases(stats);
+            }
+        }
     }
     tracing::info!(
         status,
@@ -110,6 +132,7 @@ impl HttpBody for FilteredBody {
                     this.log_done = true;
                     run_log(
                         &this.session,
+                        this.metrics.as_ref(),
                         this.status,
                         &this.peer,
                         this.started,
@@ -128,6 +151,7 @@ impl HttpBody for FilteredBody {
                     this.log_done = true;
                     run_log(
                         &this.session,
+                        this.metrics.as_ref(),
                         this.status,
                         &this.peer,
                         this.started,
@@ -153,6 +177,7 @@ impl Drop for FilteredBody {
             self.log_done = true;
             run_log(
                 &self.session,
+                self.metrics.as_ref(),
                 self.status,
                 &self.peer,
                 self.started,
