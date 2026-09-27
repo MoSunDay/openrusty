@@ -21,7 +21,7 @@ Commit: 681ad49
   - 脚本幂等：重复执行会重写单元文件并 restart 全部单元，从而加载新构建的二进制；所有单元 enabled + active，开机自启。
 - 生产上游拓扑：`config/openrusty.toml` 的 upstream `vllm` 指向 node03 llama-server 集群（`192.168.31.224:9001-9003`，一卡一实例 ×3，Qwen3.8-27B-UD-Q4_K_M，`-c 150000 --no-kv-offload`（KV cache 放系统内存，约 5.3GB/实例）、q8_0 KV、MTP 投机解码（`--spec-type draft-mtp`，约 727MiB 显存/卡）），由 node03 上的模板单元 `llama-server@<gpu>:<port>.service` 管理；路由超时 120000ms（V100 生成较慢）。本地 echo 实例仅保留演示用途，生产配置不再引用。
 - 配置加载顺序：命令行参数 1 > 环境变量 `OPENRUSTY_CONFIG` > `config/openrusty.toml`；示例见 `config/openrusty.example.toml`。
-- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，152 checks，覆盖代理/流式协议、调度、热重载、被动+主动健康、retry_on_timeout、收容、路由超时、kv-probe 全阶段、status/metrics 形状、env 配置启动、并发 reload 竞争、动态 WASM 执行 API、upstream TLS、`-t` 干跑、日志 reopen、socket activation 压载重启 0 拒连、SIGQUIT 快退、管理面 token 鉴权、least_conn 并发分布等）；三层均由 `.github/workflows/ci.yml` 在 CI 中门禁（断言退出码，不断言 check 数）。
+- 三层验证：`cargo test --workspace`（单元）；`scripts/build-plugins.sh`（插件单测 + wasm 构建）；`scripts/integration.sh`（e2e 演练，192 checks，覆盖代理/流式协议、调度（含不等权 swrr 精确分布、least_conn 并发分布）、热重载、被动+主动健康、retry_on_timeout、收容、路由超时、kv-probe 全阶段、status/metrics 形状（含 `openrusty_plugin_phase_seconds` 指标族、`uptime_secs`）、XFF 合并语义、env 配置启动、并发 reload 竞争、动态 WASM 执行 API、upstream TLS（含 mTLS 双向认证）、host/exact 静态路由、`http1_only` 入站、管线 `resp_body_set` 短路、优雅排空 ready 503、`-t` 干跑、日志 reopen、socket activation 压载重启 0 拒连、SIGQUIT 快退、管理面 token 鉴权等）；三层均由 `.github/workflows/ci.yml` 在 CI 中门禁（断言退出码，不断言 check 数）；另有 `k8s-e2e` job 挂入 4 个环境门控演练（cluster-e2e / sidecar-e2e / local-netns / local-egress，托管 runner 上自 SKIP 中性退出，本地具备环境则真跑，用于防门禁与 bash 语法腐化）。
 
 ## 信号语义
 | 信号 | 行为 |

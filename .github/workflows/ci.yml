@@ -40,3 +40,41 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/integration.sh
+
+  # The four environment-gated e2e drills, so they stop being local-only.
+  # Each prints SKIP(...) and stays neutral when its environment is
+  # missing (hosted runner: no kubeconfig, no apiserver, no root), acting
+  # as a zero-cost guard against gate + bash-syntax bitrot; on a machine
+  # with the right environment they run for real. No toolchain step:
+  # every cargo use sits behind one of these gates.
+  k8s-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Self-skipping: kubectl+helm exist on the runner but no kubeconfig
+      # -> G1 gap -> SKIP(cluster-e2e) groups, exit 0, no cluster calls.
+      - name: cluster-e2e drill (ingress; skips without a kubeconfig)
+        run: bash scripts/cluster-e2e.sh
+      # No self-skip path of its own: S1 counts a missing apiserver as a
+      # FAIL (exit 1, minutes of futile retries), so gate the run on the
+      # same /readyz probe S1 uses; bash -n is the always-on part.
+      - name: sidecar-e2e drill (k3s; skips without an apiserver)
+        run: |
+          bash -n scripts/sidecar-e2e.sh
+          if command -v kubectl >/dev/null 2>&1 &&
+            kubectl get --raw=/readyz --request-timeout=10s >/dev/null 2>&1; then
+            exec bash scripts/sidecar-e2e.sh
+          fi
+          echo "SKIP(sidecar-e2e): no apiserver /readyz on this runner - syntax check only"
+      # env_gates skips via skip() -> exit 0 (netns_teardown tolerates a
+      # still-empty TMP on the skip path), so the raw rc stands: a SKIP
+      # is neutral, anything else - a real assertion FAIL - fails the job.
+      - name: local netns drill (skips without root + netns)
+        run: |
+          bash -n scripts/local-netns-test.sh
+          bash scripts/local-netns-test.sh
+      - name: local egress drill (skips without root + netns)
+        run: |
+          bash -n scripts/local-egress-test.sh
+          bash scripts/local-egress-test.sh
