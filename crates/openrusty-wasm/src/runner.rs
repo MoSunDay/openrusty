@@ -1,5 +1,9 @@
 //! Execute one phase in one plugin instance under timeout + failure policy.
 //!
+//! Instantiation starts from a pre-resolved `InstancePre` (see
+//! [`crate::registry`]): imports are resolved once at plugin load time, so
+//! the per-request path only executes the plan under the memory ceiling.
+//!
 //! Timeouts use wasmtime epoch interruption: an engine-scoped ticker
 //! ([`crate::epoch`]) bumps the engine epoch every `TICK_MS`, and every
 //! call sets its own store deadline (`set_epoch_deadline`) covering
@@ -11,7 +15,7 @@ use crate::instance::HostData;
 use openrusty_core::config::FailPolicy;
 use openrusty_core::phase::{Decision, Phase};
 use std::time::Duration;
-use wasmtime::{Engine, Linker, Memory, Module, Store, StoreLimitsBuilder, Trap, TypedFunc};
+use wasmtime::{Engine, InstancePre, Memory, Store, StoreLimitsBuilder, Trap, TypedFunc};
 
 /// Epoch budget for instantiating a module (the phase-call timeout does not
 /// exist yet at that point). A module whose start section loops forever
@@ -46,33 +50,27 @@ impl PluginRt {
     }
 }
 
-/// Instantiate `module` for one request with a per-store memory ceiling.
+/// Instantiate one request's plugin instance from a pre-resolved
+/// [`InstancePre`] (imports were resolved once at load time; this only
+/// executes the plan) with a per-store memory ceiling.
 ///
 /// Instantiation is bounded by [`INSTANTIATE_TIMEOUT`] (the epoch must be
 /// advancing for the budget to fire): a `(start (loop (br 0)))` module
 /// fails with an epoch trap instead of hanging the caller.
 pub fn instantiate(
+    pre: &InstancePre<HostData>,
     engine: &Engine,
-    linker: &Linker<HostData>,
-    module: &Module,
     host_data: HostData,
     memory_limit_mb: u32,
 ) -> Result<PluginRt, wasmtime::Error> {
-    instantiate_with_budget(
-        engine,
-        linker,
-        module,
-        host_data,
-        memory_limit_mb,
-        INSTANTIATE_TIMEOUT,
-    )
+    instantiate_with_budget(pre, engine, host_data, memory_limit_mb, INSTANTIATE_TIMEOUT)
 }
 
-/// [`instantiate`] with an explicit instantiation epoch budget.
+/// [`instantiate`] with an explicit instantiation epoch budget. The
+/// `engine` must be the one `pre` was built against (it backs the store).
 pub fn instantiate_with_budget(
+    pre: &InstancePre<HostData>,
     engine: &Engine,
-    linker: &Linker<HostData>,
-    module: &Module,
     host_data: HostData,
     memory_limit_mb: u32,
     budget: Duration,
@@ -86,12 +84,15 @@ pub fn instantiate_with_budget(
     store.limiter(|d| &mut d.limits);
     store.epoch_deadline_trap();
     store.set_epoch_deadline(ticks_for(budget));
-    let inst = linker.instantiate(&mut store, module)?;
+    let inst = pre.instantiate(&mut store)?;
     let on_phase = inst.get_typed_func::<(i32, i32), i32>(&mut store, abi::EXPORT_ON_PHASE)?;
     let alloc = inst.get_typed_func::<i32, i32>(&mut store, abi::EXPORT_ALLOC)?;
     let memory = inst
         .get_memory(&mut store, abi::MEMORY_EXPORT)
         .ok_or_else(|| wasmtime::Error::msg("module exports no memory"))?;
+    // Cache the handle in the store data so host imports resolve guest
+    // memory without the per-call export lookup (mem::memory_of).
+    store.data_mut().memory = Some(memory);
     Ok(PluginRt {
         store,
         on_phase,
@@ -196,9 +197,11 @@ mod tests {
     use crate::instance::new_host_data;
     use crate::linker::build_linker;
     use crate::registry::new_engine;
+    use openrusty_core::config::PluginsConfig;
     use openrusty_core::ReqCtx;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use wasmtime::Module;
 
     const OK_MOD: &str = r#"
 (module
@@ -260,20 +263,21 @@ mod tests {
 "#;
 
     fn test_ticker() -> EpochTicker {
-        new_engine().unwrap()
+        new_engine(&PluginsConfig::default()).unwrap()
     }
 
     /// One instance on `engine`, ready for a phase run.
     fn rt_on(engine: &Engine, src: &str, mem_mb: u32) -> PluginRt {
         let linker = build_linker(engine).unwrap();
         let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
+        let pre = linker.instantiate_pre(&module).unwrap();
         let host = new_host_data(
             ctx(),
             Vec::new(),
             Arc::new(HostState::new("t".into())),
             Arc::new(HashMap::new()),
         );
-        instantiate(engine, &linker, &module, host, mem_mb).unwrap()
+        instantiate(&pre, engine, host, mem_mb).unwrap()
     }
 
     /// A ticker plus one instance on its engine. The ticker MUST stay
@@ -310,6 +314,14 @@ mod tests {
             Decision::Ok
         );
         assert_eq!(rt.host_data().state.error_count(), 0);
+    }
+
+    #[test]
+    fn instantiation_caches_the_memory_handle() {
+        // The store data carries the guest memory so imports skip the
+        // per-call export lookup (mem::memory_of reads this cache).
+        let (_ticker, rt) = setup(OK_MOD, 16);
+        assert!(rt.host_data().memory.is_some());
     }
 
     #[test]
@@ -502,6 +514,7 @@ mod tests {
         let engine = ticker.engine();
         let linker = build_linker(engine).unwrap();
         let module = Module::new(engine, wat::parse_str(START_LOOP).unwrap()).unwrap();
+        let pre = linker.instantiate_pre(&module).unwrap();
         let host = new_host_data(
             ctx(),
             Vec::new(),
@@ -509,14 +522,8 @@ mod tests {
             Arc::new(HashMap::new()),
         );
         let started = std::time::Instant::now();
-        let err = match instantiate_with_budget(
-            engine,
-            &linker,
-            &module,
-            host,
-            16,
-            Duration::from_millis(250),
-        ) {
+        let err = match instantiate_with_budget(&pre, engine, host, 16, Duration::from_millis(250))
+        {
             Ok(_) => panic!("infinite start section must fail instantiation"),
             Err(err) => err,
         };

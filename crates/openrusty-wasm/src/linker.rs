@@ -114,15 +114,25 @@ pub fn build_linker(engine: &Engine) -> Result<Linker<HostData>, wasmtime::Error
                 return -1;
             };
             let d = caller.data_mut();
-            d.resp_edits
-                .push(HeaderEdit::Set(name.clone(), val.clone()));
-            match d
+            // Locate the live header by the borrowed name first so the
+            // strings only clone when two owners really need them: the
+            // replace path keeps one value copy for the live header and
+            // moves both strings into the edit record; the append path
+            // needs the pair twice, so one clone each.
+            let pos = d
                 .resp_headers
-                .iter_mut()
-                .find(|(n, _)| n.eq_ignore_ascii_case(&name))
-            {
-                Some(entry) => entry.1 = val,             // replace in place
-                None => d.resp_headers.push((name, val)), // append new
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(&name));
+            match pos {
+                Some(i) => {
+                    let val_for_live = val.clone();
+                    d.resp_edits.push(HeaderEdit::Set(name, val));
+                    d.resp_headers[i].1 = val_for_live;
+                }
+                None => {
+                    d.resp_headers.push((name.clone(), val.clone()));
+                    d.resp_edits.push(HeaderEdit::Set(name, val));
+                }
             }
             0
         },
@@ -136,9 +146,12 @@ pub fn build_linker(engine: &Engine) -> Result<Linker<HostData>, wasmtime::Error
                 return -1;
             };
             let d = caller.data_mut();
-            d.resp_edits.push(HeaderEdit::Del(name.clone()));
+            // Borrow-first: filter the live headers while the name is
+            // still borrowed, then move it into the edit record (no
+            // clone at all).
             d.resp_headers
                 .retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+            d.resp_edits.push(HeaderEdit::Del(name));
             0
         },
     )?;
@@ -283,7 +296,7 @@ fn probe_host_data() -> HostData {
 mod tests {
     use super::*;
     use crate::runner;
-    use openrusty_core::config::FailPolicy;
+    use openrusty_core::config::{FailPolicy, PluginsConfig};
     use openrusty_core::phase::{Decision, Phase};
     use std::time::{Duration, Instant};
 
@@ -293,11 +306,12 @@ mod tests {
     /// the ticker stays alive for the instance's lifetime so phase runs
     /// can use epoch deadlines).
     fn rt_on(src: &str) -> (crate::epoch::EpochTicker, crate::runner::PluginRt) {
-        let ticker = crate::registry::new_engine().unwrap();
+        let ticker = crate::registry::new_engine(&PluginsConfig::default()).unwrap();
         let engine = ticker.engine();
         let linker = build_linker(engine).unwrap();
         let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();
-        let rt = runner::instantiate(engine, &linker, &module, probe_host_data(), 16).unwrap();
+        let pre = linker.instantiate_pre(&module).unwrap();
+        let rt = runner::instantiate(&pre, engine, probe_host_data(), 16).unwrap();
         (ticker, rt)
     }
 
@@ -400,6 +414,52 @@ mod tests {
         assert!(rt.host_data().resp_body.is_none());
     }
 
+    /// `resp_header_set` replaces case-insensitively (or appends) and
+    /// `resp_header_del` removes; every call still records one edit in
+    /// call order (the server replays them after header_filter).
+    #[test]
+    fn resp_header_set_and_del_keep_semantics() {
+        const HDR_MOD: &str = r#"
+(module
+  (import "openrusty" "resp_header_set" (func $set (param i32 i32 i32 i32) (result i32)))
+  (import "openrusty" "resp_header_del" (func $del (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "X-Keep")
+  (data (i32.const 16) "one")
+  (data (i32.const 32) "two")
+  (data (i32.const 48) "X-New")
+  (func (export "orr_on_phase") (param i32 i32) (result i32)
+    ;; replace the existing header (case-insensitive name match)
+    (drop (call $set (i32.const 0) (i32.const 6) (i32.const 16) (i32.const 3)))
+    ;; append a brand-new header
+    (drop (call $set (i32.const 48) (i32.const 5) (i32.const 32) (i32.const 3)))
+    ;; delete the header replaced above
+    (drop (call $del (i32.const 0) (i32.const 6)))
+    i32.const 0)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))
+"#;
+        let (_ticker, mut rt) = rt_on(HDR_MOD);
+        rt.host_data_mut().resp_headers = vec![("x-keep".into(), "zero".into())];
+        assert_eq!(
+            runner::run_phase(&mut rt, CALM, FailPolicy::FailOpen, Phase::HeaderFilter),
+            Decision::Ok
+        );
+        // Appended header survives, the replaced-then-deleted one is gone.
+        assert_eq!(
+            rt.host_data().resp_headers,
+            vec![("X-New".to_string(), "two".to_string())]
+        );
+        // Edits are recorded once per call, in call order.
+        assert_eq!(
+            rt.host_data().resp_edits,
+            vec![
+                HeaderEdit::Set("X-Keep".into(), "one".into()),
+                HeaderEdit::Set("X-New".into(), "two".into()),
+                HeaderEdit::Del("X-Keep".into()),
+            ]
+        );
+    }
+
     /// Regression: a module whose start section loops forever must fail
     /// validation within the probe's epoch budget instead of hanging the
     /// reload forever.
@@ -413,7 +473,7 @@ mod tests {
             (memory (export "memory") 1))"#;
         // The probe budget needs an epoch-interrupted engine AND its
         // ticker (the real registry engine is built exactly that way).
-        let ticker = crate::registry::new_engine().unwrap();
+        let ticker = crate::registry::new_engine(&PluginsConfig::default()).unwrap();
         let engine = ticker.engine();
         let linker = build_linker(engine).unwrap();
         let module = Module::new(engine, wat::parse_str(src).unwrap()).unwrap();

@@ -1,14 +1,22 @@
 //! Guest linear-memory helpers used by the linker imports.
 //!
-//! Memory is resolved lazily on every call via the caller's `memory`
-//! export; all helpers are defensive and never panic on hostile pointers.
+//! Memory is resolved per call: the handle cached at instantiation (see
+//! [`crate::runner`]) when present, else the caller's `memory` export.
+//! All helpers are defensive and never panic on hostile pointers.
 
 use crate::abi;
 use crate::instance::HostData;
 use wasmtime::{Caller, Memory};
 
-/// Find the guest memory export for the current call.
+/// Find the guest memory for the current call: the handle cached in the
+/// store data first (set by the runner at instantiation), falling back
+/// to the export lookup for embedders that instantiate manually.
 pub fn memory_of(caller: &mut Caller<'_, HostData>) -> Option<Memory> {
+    // Copy the handle out of the store data (Memory is Copy) before the
+    // caller is used mutably by the fallback below.
+    if let Some(mem) = caller.data().memory {
+        return Some(mem);
+    }
     caller
         .get_export(abi::MEMORY_EXPORT)
         .and_then(|e| e.into_memory())

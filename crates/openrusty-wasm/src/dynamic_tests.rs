@@ -3,6 +3,7 @@
 use super::*;
 use crate::linker::build_linker;
 use crate::registry::new_engine;
+use openrusty_core::config::PluginsConfig;
 use openrusty_core::ReqCtx;
 use std::fs;
 use std::path::PathBuf;
@@ -44,7 +45,7 @@ fn cfg(dir: &str) -> DynamicConfig {
 
 /// Registry plus the ticker keeping its engine's epoch alive.
 fn registry(dir: &str) -> (crate::epoch::EpochTicker, Arc<DynamicRegistry>) {
-    let ticker = new_engine().unwrap();
+    let ticker = new_engine(&PluginsConfig::default()).unwrap();
     let linker = build_linker(ticker.engine()).unwrap();
     let reg = DynamicRegistry::new(ticker.engine().clone(), linker, &cfg(dir));
     (ticker, reg)
