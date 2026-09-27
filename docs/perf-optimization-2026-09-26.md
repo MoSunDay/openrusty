@@ -179,6 +179,19 @@ bash scripts/bench.sh
   消除; `openrusty_plugin_phase_seconds` 各阶段 sum/count 同步下降可作归因
   佐证。P1b 不在其中(已回退, 见 §3)。
 
+### 7.1 集成演练 173/174 的"存量失败"根因(2026-09-27 复盘)
+
+本轮与基线 worktree 都稳定复现的唯一失败 `capped tasks spread over all 3
+nodes`(30_plugins_probe.sh 第 23 节)已定位为**环境端口污染, 非代码缺陷**:
+宿主机上常驻的 agent 进程以 ~2s 周期轮询 `127.0.0.1:18080/api/nodes/channel`
+(默认 GATE_PORT)。第 23 节把 extract 切到 `path:1` 并设 `max_tasks_per_node=1`
+后, 这些轮询的 path 首段 `api` 成为 task key, 以 2s 周期不断续期
+`aff:api`(TTL 6s, 永远存活), 提前占满一个节点的 cap 槽; 第三个探针任务
+pk-c 面对三节点全满只能 Declined 交给默认 SWRR, 扩散断言随之失败。sticky 与
+fallback 断言不受影响, 与观察完全一致。换未被轮询的端口复跑
+(`GATE_PORT=18099 ./scripts/integration.sh`)得 **174/174 全绿**。演练本机端口
+有后台流量时, 请用 `GATE_PORT` 覆盖默认值。
+
 ## 8. 未做与后续(future work)
 
 | 项 | 一句话理由 |

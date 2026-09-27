@@ -27,6 +27,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 TMP="$(mktemp -d /tmp/openrusty-it.XXXXXX)"
+# 本机若有常驻进程轮询默认端口(会污染第 23 节的调度扩散断言,
+# 见 docs/perf-optimization-2026-09-26.md §7.1), 用 GATE_PORT 换端口。
 GATE_PORT="${GATE_PORT:-18080}"
 GATE="http://127.0.0.1:$GATE_PORT"
 PIDS=()
