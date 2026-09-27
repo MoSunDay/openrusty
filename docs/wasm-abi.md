@@ -3,7 +3,14 @@
 Plugins are `cdylib` crates compiled to `wasm32-unknown-unknown` (no WASI).
 One `.wasm` file = one plugin. The host instantiates each module once per
 request with a fresh `Store` (memory limits enforced per store); compiled
-`Module`s are cached and hot-swapped atomically on reload.
+`Module`s are cached and hot-swapped atomically on reload. Import
+resolution happens once at load time (`Linker::instantiate_pre` produces a
+pre-resolved plan kept on the snapshot); per-request instantiation only
+executes that plan. With `plugins.instance_pool_size > 0` the engine
+allocates instances from a fixed pool of pre-reserved slots (per-slot
+memory derived from `plugins.max_memory_mb`); pool exhaustion fails the
+instantiation, which flows into the plugin `on_failure` policy. `0` keeps
+the on-demand allocation strategy.
 
 ## Module shape
 
@@ -11,9 +18,15 @@ request with a fresh `Store` (memory limits enforced per store); compiled
   name required; `memory` index 0).
 - No WASI imports are linked. Only the `openrusty` import namespace below.
 - Guest allocator: the guest exports `orr_alloc(size: i32) -> i32` (returns a
-  pointer) and may export `orr_dealloc(ptr: i32, size: i32)`. The host uses
-  `orr_alloc` for every host->guest data hand-off. Missing `orr_alloc` fails
-  ABI validation at load time; `orr_dealloc` is optional.
+  pointer) and may export `orr_dealloc(ptr: i32, size: i32)`. The host does
+  NOT call `orr_alloc` today: every host->guest data hand-off uses the
+  two-phase guest-provided-buffer protocol described under "Host imports"
+  below (imports take `(out_ptr, out_cap)` and return bytes written or
+  `-required`; the guest allocates the buffer itself). `orr_alloc` is still
+  a REQUIRED export - a module missing it fails ABI validation at load
+  time - and remains reserved for a future host-push fast path where the
+  host would allocate guest-side buffers for its writes. `orr_dealloc` is
+  optional.
 
 ## Guest export
 
