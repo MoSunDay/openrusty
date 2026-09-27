@@ -1,3 +1,4 @@
+Commit: 7fdc55d
 # K8s 三形态：sidecar / ingress / egress
 
 ## 能力概述
@@ -31,6 +32,7 @@
 - `openrusty iptables-init`：nat REDIRECT 参数面（OPENRUSTY_IN/OPENRUSTY_OUT custom chain、owner 豁免第一条、幂等、preflight 自检、--dry-run）。
 - `openrusty inject`：静态注入（v1 边界：单 YAML 文档、opaque-ports 仅透传 env），见 [docs/inject.md](../../docs/inject.md)。
 - Helm chart 三件套（ingress / egress-gateway / demo），`scripts/chart-lint.sh`（30 checks）+ chart-vs-CLI 一致性演练。
+- CI 守护：`.github/workflows/ci.yml` 的 `k8s-e2e` job 挂载 `cluster-e2e.sh` / `sidecar-e2e.sh`（k3s 集群 sidecar e2e）/ `local-netns-test.sh` / `local-egress-test.sh`：除 sidecar-e2e 外均自带无环境 SKIP（中性 exit 0）；sidecar-e2e 无自 SKIP 路径，job 内以 `kubectl /readyz` 探针守门。用于防门禁与 bash 语法腐化。
 - 生命周期：三段式 shutdown（SIGTERM 与 `POST /openrusty/shutdown` 同一路径）；`/openrusty/ready` draining 时 503、`/openrusty/live` 恒 200；`shutdown_grace_ms`（默认 5000）。
 
 ## 不含什么（P2/P3 边界）
