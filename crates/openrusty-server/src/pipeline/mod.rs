@@ -21,9 +21,17 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub(crate) use crate::pipeline_peer::{pick_peer, release_peer, Pick};
 
-/// Run the log phase exactly once for a short-circuited request.
-pub(crate) fn finish_log(session: &mut RequestSession, status: u16) {
+/// Run the log phase exactly once for a short-circuited request, then
+/// drain the session's per-phase stats into the metrics collector (the
+/// short-circuit paths never create a `FilteredBody`, so this is the one
+/// drain point for them; the empty-after-drain semantics of
+/// `take_phase_stats` keep a second drain a no-op).
+pub(crate) fn finish_log(state: &AppState, session: &mut RequestSession, status: u16) {
     session.run_phase(Phase::Log);
+    let stats = session.take_phase_stats();
+    if !stats.is_empty() {
+        state.metrics.record_phases(stats);
+    }
     let attempts = session.ctx().attempts;
     tracing::info!(status, path = %session.ctx().path, attempts, "request finished");
 }
@@ -281,7 +289,7 @@ pub async fn handle_request(
     for phase in [Phase::PostRead, Phase::Rewrite, Phase::Access] {
         match session.run_phase(phase) {
             Decision::Deny(s) => {
-                finish_log(&mut session, s);
+                finish_log(&state, &mut session, s);
                 return (
                     crate::resp_shortcut::deny_response(&session, s),
                     Some(route_label),
@@ -289,7 +297,7 @@ pub async fn handle_request(
             }
             Decision::Done => {
                 let status = crate::resp_shortcut::log_status(&session, 204);
-                finish_log(&mut session, status);
+                finish_log(&state, &mut session, status);
                 return (
                     crate::resp_shortcut::done_response(&session),
                     Some(route_label),
@@ -313,7 +321,7 @@ pub async fn handle_request(
     let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
         Ok(b) => b,
         Err(_) => {
-            finish_log(&mut session, 413);
+            finish_log(&state, &mut session, 413);
             return (
                 text_response(413, "413 payload too large\n"),
                 Some(route_label),
@@ -327,7 +335,7 @@ pub async fn handle_request(
     // 9. Content phase.
     match session.run_phase(Phase::Content) {
         Decision::Deny(s) => {
-            finish_log(&mut session, s);
+            finish_log(&state, &mut session, s);
             return (
                 crate::resp_shortcut::deny_response(&session, s),
                 Some(route_label),
@@ -335,7 +343,7 @@ pub async fn handle_request(
         }
         Decision::Done => {
             let status = crate::resp_shortcut::log_status(&session, 204);
-            finish_log(&mut session, status);
+            finish_log(&state, &mut session, status);
             return (
                 crate::resp_shortcut::done_response(&session),
                 Some(route_label),
@@ -356,14 +364,14 @@ pub async fn handle_request(
         let idx = match pick_peer(&state, &up_rt, &mut session) {
             Pick::Peer(i) => i,
             Pick::Deny(s) => {
-                finish_log(&mut session, s);
+                finish_log(&state, &mut session, s);
                 return (text_response(s, format!("{s}\n")), Some(route_label));
             }
             Pick::None => {
                 // No candidate: either nothing is healthy or every peer was
                 // already tried. Either way the retry loop must stop here.
                 state.metrics.record_attempt(&up_rt.up.name, RESULT_NO_PEER);
-                finish_log(&mut session, 502);
+                finish_log(&state, &mut session, 502);
                 return (
                     text_response(502, "502 no healthy upstream\n"),
                     Some(route_label),
@@ -422,7 +430,7 @@ pub async fn handle_request(
                     );
                     continue;
                 }
-                finish_log(&mut session, 502);
+                finish_log(&state, &mut session, 502);
                 return (
                     text_response(502, format!("502 upstream error: {e}\n")),
                     Some(route_label),
@@ -451,7 +459,7 @@ pub async fn handle_request(
                     );
                     continue;
                 }
-                finish_log(&mut session, 502);
+                finish_log(&state, &mut session, 502);
                 return (
                     text_response(502, "502 upstream timeout\n"),
                     Some(route_label),
@@ -460,7 +468,7 @@ pub async fn handle_request(
         }
     }
     let Some(resp) = resp else {
-        finish_log(&mut session, 502);
+        finish_log(&state, &mut session, 502);
         return (
             text_response(502, "502 no upstream responded\n"),
             Some(route_label),
@@ -481,7 +489,7 @@ pub async fn handle_request(
     }
     session.set_resp_headers(seeded);
     if let Decision::Deny(s) = session.run_phase(Phase::HeaderFilter) {
-        finish_log(&mut session, s);
+        finish_log(&state, &mut session, s);
         return (text_response(s, format!("{s}\n")), Some(route_label));
     }
     let final_headers = session.resp_headers().to_vec();
@@ -491,7 +499,13 @@ pub async fn handle_request(
         .addr
         .to_string();
     let session = Arc::new(Mutex::new(session));
-    let filtered = FilteredBody::new(session, resp.into_body(), status, peer_name);
+    let filtered = FilteredBody::new(
+        session,
+        resp.into_body(),
+        status,
+        peer_name,
+        Some(state.metrics.clone()),
+    );
 
     let mut builder = Response::builder().status(status);
     if let Some(hm) = builder.headers_mut() {
