@@ -10,7 +10,7 @@ Commit: 681ad49
 
 ## 关键设计
 - 路由表：`/openrusty/status`（GET）、`/openrusty/reload`（POST）、`/openrusty/metrics`（GET）先于业务路由匹配，其余请求进入 `handle_request` 代理管线；启动配置含 `[dynamic]` 节（或 env `OPENRUSTY_DYNAMIC_DIR`）时另挂 `POST /api/v1/dynamic/{name}`（挂载是启动期语义，reload 只能在该节变化时重建 registry、不能挂/摘路由）与管理面注册接口 `PUT/DELETE /openrusty/dynamic/{name}`、`GET /openrusty/dynamic`（`dynamic_admin.rs`，同样受 `[admin]` token 守卫；PUT 先验证后原子落盘、可选 `method`+`path` 参数即绑即用）。
-- 业务路由按 `path_prefix` 最长前缀匹配；无匹配返回 404（404 前依 `[plugins] log_on_no_route`，默认 `true`，仍执行 `log` 阶段插件，插件响应头/体短路语义与有路由一致）。
+- 业务路由按 `path_prefix` 最长前缀匹配；无匹配返回 404（依 `[plugins] log_on_no_route`，默认 `true`，404/502 前仍执行 `log` 阶段——插件 Decision 被丢弃、仅副作用留痕 host KV/访问日志/phase 指标，响应恒为纯 404，对齐 nginx "log 阶段不可改响应"）。
 - 请求侧按 `Phase::PRE_PROXY` 顺序执行 `post_read`/`rewrite`/`access`/`content`；任一阶段出现 `Deny` 即短路返回；`Done`/`Deny` 短路在 `resp_shortcut.rs` 统一映射：模块经 `resp_body_set` 写了 body 则 `200/s + body`（模块头原样），否则 `Done` 为空 204、`Deny` 为空体——无 body 分支同样应用模块经 `resp_header_set` 写入的头（204 不注入默认 content-type）。
 - `content` 的默认处理器是代理转发：每次 upstream 尝试前先运行 `balancer` 阶段（插件可接管 peer 选择）；连接级失败换 peer 重试；转发取 `session.ctx()` 的 post-phase path/query/headers，插件 `req_set_*` 的改写由此直达 upstream。
 - 响应侧：`header_filter` 一次、`body_filter` 每个数据块一次（`Done` 表示流结束）、请求收尾运行 `log`。
