@@ -23,6 +23,7 @@
 //! - `probe:ws_auth`   -> Authorization header of the last /ws handshake
 //! - `probe:ws_cookie` -> Cookie header of the last /ws handshake
 //! - `probe:log_ran`   -> "1" once the log phase marked (TTL = 10s)
+//! - `probe:log404`    -> "1" once the log phase ran unrouted (TTL = 10s)
 //! - `probe:scan:a|b`  -> transient keys for the `scan` mode
 //!
 //! Modes (`/probe?mode=<m>`):
@@ -34,6 +35,7 @@
 //! - `rewritecheck` : rewrite recorded this very request's path
 //! - `bodycheck`    : body_filter accumulator ended "<n>:1", n > 0
 //! - `logcheck`     : the log phase marker is present
+//! - `l404check`    : the no-route log marker is echoed into `X-Log404`
 //! - `scan`         : kv_scan("probe:scan:") sees both scan keys
 //! - `wsheaders`    : the last /ws handshake carried the expected
 //!                    Authorization and Cookie headers
@@ -50,8 +52,10 @@
 //! - a malformed/out-of-range `deny` denies with 400.
 //!
 //! Flags: `pset`/`pdel` (marker), `phdr` (header echo), `rwdeny` (rewrite
-//! denies 418), `accdeny` (access denies 403), `bmark` (body_filter
-//! accumulates), `lmark` (log phase marker).
+//! denies 418), `rwuri`/`rwhdr` (rewrite-phase request edits), `accdeny`
+//! (access denies 403), `redir` (access answers 302), `bmark` (body_filter
+//! accumulates), `lmark` (log phase marker), `l404` (log phase also sets
+//! the no-route marker).
 #![no_std]
 
 extern crate alloc;
@@ -86,6 +90,13 @@ const PROBE_TTL_MS: i64 = 10_000;
 const SHORT_TTL_MS: i64 = 1_500;
 const RESP_HEADER: &str = "x-kv-probe";
 const RESP_BODY_PREFIX: &str = "kv-probe-resp-body:";
+const RW_URI: &str = "/rewritten/by/plugin";
+const RW_QUERY: &str = "rw=1";
+const RW_HEADER: &str = "X-Rw-Probe";
+const RW_DROP_HEADER: &str = "X-Rw-Drop";
+const REDIRECT_TO: &str = "/moved/by/plugin";
+const LOG_404_KEY: &str = "probe:log404";
+const LOG_404_HEADER: &str = "X-Log404";
 
 /// Probe modes selectable via the `mode` query parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +129,9 @@ enum ProbeMode {
     /// `text=<t>` writes `kv-probe-resp-body:<t>`, `deny=<s>` swaps the
     /// terminal `Done` for `Deny(s)`.
     RespBody,
+    /// Echo the no-route log-phase marker (or `-` when absent) into
+    /// `X-Log404` and short-circuit so the header reaches the client.
+    Log404Check,
 }
 
 /// Post-read phase: record the request path for cross-phase checks and,
@@ -146,7 +160,8 @@ fn record_ws_handshake_headers() {
     }
 }
 
-/// Rewrite phase: record the request path; `rwdeny` aborts with 418.
+/// Rewrite phase: record the request path; `rwdeny` aborts with 418;
+/// `rwuri`/`rwhdr` apply the request edits.
 #[openrusty_sdk::phase(rewrite)]
 fn on_rewrite() -> Decision {
     let query = host::req_meta_str("query").unwrap_or_default();
@@ -156,15 +171,41 @@ fn on_rewrite() -> Decision {
     if flag(&query, "rwdeny") {
         return Decision::Deny(418);
     }
+    apply_req_rewrite(&query)
+}
+
+/// Rewrite-phase request edits: `rwuri` swaps in the probe URI + query
+/// pair, `rwhdr` sets `X-Rw-Probe` and drops `X-Rw-Drop`. A host refusal
+/// denies with 500 (the constants are ABI-valid, so refusal is a host
+/// bug), mirroring the resp-body mode's fail-loud contract.
+fn apply_req_rewrite(query: &str) -> Decision {
+    if flag(query, "rwuri") && !(host::set_req_uri(RW_URI) && host::set_req_query(RW_QUERY)) {
+        return Decision::Deny(500);
+    }
+    if flag(query, "rwhdr") {
+        if !host::set_req_header(RW_HEADER, "yes") {
+            return Decision::Deny(500);
+        }
+        host::del_req_header(RW_DROP_HEADER);
+    }
     Decision::Declined
 }
 
-/// Access phase: `accdeny` aborts with 403.
+/// Access phase: `accdeny` aborts with 403, `redir` answers 302.
 #[openrusty_sdk::phase(access)]
 fn on_access() -> Decision {
     let query = host::req_meta_str("query").unwrap_or_default();
     if flag(&query, "accdeny") {
-        Decision::Deny(403)
+        return Decision::Deny(403);
+    }
+    redirect_decision(&query)
+}
+
+/// Access-phase redirect: `redir` answers 302 -> REDIRECT_TO via the
+/// host helper (which coerces off-range statuses), others decline.
+fn redirect_decision(query: &str) -> Decision {
+    if flag(query, "redir") {
+        host::respond_redirect(302, REDIRECT_TO)
     } else {
         Decision::Declined
     }
@@ -224,7 +265,11 @@ fn on_content() -> Decision {
             && host::req_meta("header:user-agent")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
-        return if ok { Decision::Done } else { Decision::Deny(409) };
+        return if ok {
+            Decision::Done
+        } else {
+            Decision::Deny(409)
+        };
     }
     let path = host::req_meta_str("path").unwrap_or_default();
     if !path.starts_with("/probe") {
@@ -246,6 +291,7 @@ fn on_content() -> Decision {
         Some(ProbeMode::WsHeaders) => ws_headers(),
         Some(ProbeMode::Balancer) => Decision::Declined,
         Some(ProbeMode::RespBody) => resp_body(&query),
+        Some(ProbeMode::Log404Check) => log404_check(),
         None => Decision::Deny(400),
     }
 }
@@ -302,13 +348,13 @@ fn on_body_filter() -> Decision {
         .map(|raw| String::from_utf8_lossy(&raw).into_owned())
         .unwrap_or_default();
     let (seen, _) = parse_body_seen(&current).unwrap_or((0, false));
-    let marker =
-        alloc::format!("{}:{}", seen + chunk.len() as u64, u8::from(last));
+    let marker = alloc::format!("{}:{}", seen + chunk.len() as u64, u8::from(last));
     host::kv_set(&key, marker.as_bytes(), PROBE_TTL_MS);
     Decision::Declined
 }
 
-/// Log phase: with `lmark`, drop the marker and emit a log line.
+/// Log phase: with `lmark`, drop the marker and emit a log line; with
+/// `l404`, additionally record the no-route marker for `l404check`.
 #[openrusty_sdk::phase(log)]
 fn on_log() -> Decision {
     let query = host::req_meta_str("query").unwrap_or_default();
@@ -316,7 +362,22 @@ fn on_log() -> Decision {
         host::kv_set(LOG_RAN_KEY, b"1", PROBE_TTL_MS);
         host::log(host::LogLevel::Info, "kv-probe log phase marker");
     }
+    if flag(&query, "l404") {
+        host::kv_set(LOG_404_KEY, b"1", PROBE_TTL_MS);
+    }
     Decision::Declined
+}
+
+/// `l404check` mode: echo the no-route log-phase marker (or `-` when
+/// absent) into `X-Log404` and short-circuit, so the header survives to
+/// the client (the gateway's proxy path reseeds plugin resp headers).
+fn log404_check() -> Decision {
+    let value = match host::kv_get(LOG_404_KEY) {
+        Some(raw) => String::from_utf8_lossy(&raw).into_owned(),
+        None => String::from("-"),
+    };
+    host::set_resp_header(LOG_404_HEADER, &value);
+    Decision::Done
 }
 
 openrusty_sdk::dispatch! {
@@ -396,10 +457,8 @@ fn body_check() -> Decision {
 /// Done when the last `/ws` handshake carried the expected
 /// Authorization and Cookie headers.
 fn ws_headers() -> Decision {
-    let auth_ok =
-        host::kv_get(WS_AUTH_KEY).as_deref() == Some(WS_AUTH_EXPECT.as_bytes());
-    let cookie_ok = host::kv_get(WS_COOKIE_KEY).as_deref()
-        == Some(WS_COOKIE_EXPECT.as_bytes());
+    let auth_ok = host::kv_get(WS_AUTH_KEY).as_deref() == Some(WS_AUTH_EXPECT.as_bytes());
+    let cookie_ok = host::kv_get(WS_COOKIE_KEY).as_deref() == Some(WS_COOKIE_EXPECT.as_bytes());
     if auth_ok && cookie_ok {
         Decision::Done
     } else {
@@ -499,6 +558,7 @@ fn parse_mode(query: &str) -> Option<ProbeMode> {
         "wsheaders" => Some(ProbeMode::WsHeaders),
         "balancer" => Some(ProbeMode::Balancer),
         "resp-body" => Some(ProbeMode::RespBody),
+        "l404check" => Some(ProbeMode::Log404Check),
         _ => None,
     }
 }
@@ -521,206 +581,4 @@ fn flag(query: &str, name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-
-    #[test]
-    fn flag_accepts_only_one() {
-        assert!(flag("pset=1", "pset"));
-        assert!(flag("a=2&pset=1&b=3", "pset"));
-        assert!(flag("pset=1&b=3", "pset"));
-        assert!(flag("a=2&pset=1", "pset"));
-    }
-
-    #[test]
-    fn flag_rejects_other_values() {
-        assert!(!flag("pset=", "pset"));
-        assert!(!flag("pset", "pset"));
-        assert!(!flag("pset=0", "pset"));
-        assert!(!flag("pset=11", "pset"));
-        assert!(!flag("pset=true", "pset"));
-        assert!(!flag("other=1", "pset"));
-        assert!(!flag("", "pset"));
-    }
-
-    #[test]
-    fn parse_mode_maps_all_modes() {
-        assert_eq!(parse_mode("mode=setgetdel"), Some(ProbeMode::SetGetDel));
-        assert_eq!(parse_mode("mode=absent"), Some(ProbeMode::Absent));
-        assert_eq!(parse_mode("mode=ttl-set"), Some(ProbeMode::TtlSet));
-        assert_eq!(parse_mode("mode=ttl-check"), Some(ProbeMode::TtlCheck));
-        assert_eq!(parse_mode("mode=postread"), Some(ProbeMode::PostRead));
-        assert_eq!(
-            parse_mode("mode=rewritecheck"),
-            Some(ProbeMode::RewriteCheck)
-        );
-        assert_eq!(parse_mode("mode=bodycheck"), Some(ProbeMode::BodyCheck));
-        assert_eq!(parse_mode("mode=logcheck"), Some(ProbeMode::LogCheck));
-        assert_eq!(parse_mode("mode=scan"), Some(ProbeMode::Scan));
-        assert_eq!(
-            parse_mode("mode=wsheaders"),
-            Some(ProbeMode::WsHeaders)
-        );
-        assert_eq!(
-            parse_mode("mode=balancer"),
-            Some(ProbeMode::Balancer)
-        );
-        assert_eq!(
-            parse_mode("a=1&mode=absent&b=2"),
-            Some(ProbeMode::Absent)
-        );
-    }
-
-    #[test]
-    fn valid_peer_view_requires_three_healthy_peers() {
-        let peer = |name: &str, healthy: bool| host::PeerInfo {
-            name: String::from(name),
-            addr: String::from("127.0.0.1:19101"),
-            healthy,
-        };
-        let three = vec![peer("n1", true), peer("n2", true), peer("n3", true)];
-        assert_eq!(valid_peer_view(&three), Some(0));
-        let two = vec![peer("n1", true), peer("n2", true)];
-        assert_eq!(valid_peer_view(&two), None);
-        let one_down = vec![peer("n1", true), peer("n2", false), peer("n3", true)];
-        assert_eq!(valid_peer_view(&one_down), None);
-        let four = vec![
-            peer("n1", true),
-            peer("n2", true),
-            peer("n3", true),
-            peer("n4", true),
-        ];
-        assert_eq!(valid_peer_view(&four), None);
-    }
-
-    #[test]
-    fn parse_mode_rejects_unknown_or_missing() {
-        assert_eq!(parse_mode("mode=bogus"), None);
-        assert_eq!(parse_mode("mode="), None);
-        assert_eq!(parse_mode("mode"), None);
-        assert_eq!(parse_mode("other=setgetdel"), None);
-        assert_eq!(parse_mode(""), None);
-    }
-
-    #[test]
-    fn parse_mode_accepts_wsheaders() {
-        assert_eq!(parse_mode("mode=wsheaders"), Some(ProbeMode::WsHeaders));
-        assert_eq!(
-            parse_mode("a=1&mode=wsheaders&b=2"),
-            Some(ProbeMode::WsHeaders)
-        );
-    }
-
-    #[test]
-    fn parse_mode_accepts_resp_body() {
-        assert_eq!(parse_mode("mode=resp-body"), Some(ProbeMode::RespBody));
-        assert_eq!(
-            parse_mode("a=1&mode=resp-body&text=t&deny=403"),
-            Some(ProbeMode::RespBody)
-        );
-        // The mode token itself must match exactly.
-        assert_eq!(parse_mode("mode=resp_body"), None);
-        assert_eq!(parse_mode("mode=respbody"), None);
-    }
-
-    #[test]
-    fn resp_body_text_pins_wire_format() {
-        assert_eq!(resp_body_text("hi"), "kv-probe-resp-body:hi");
-        assert_eq!(resp_body_text(""), "kv-probe-resp-body:");
-        assert_eq!(
-            resp_body_text("with space/slash"),
-            "kv-probe-resp-body:with space/slash"
-        );
-        // Percent-decoding happens in `url::query_param`, before the
-        // prefix is attached.
-        assert_eq!(
-            resp_body_text(&url::query_param("text=a%20b", "text").unwrap()),
-            "kv-probe-resp-body:a b"
-        );
-    }
-
-    #[test]
-    fn deny_decision_maps_the_deny_param() {
-        // Absent -> terminal Done (200 + body, or empty 204).
-        assert_eq!(deny_decision(None), Decision::Done);
-        // Valid statuses ride along verbatim.
-        assert_eq!(deny_decision(Some("403")), Decision::Deny(403));
-        assert_eq!(deny_decision(Some("500")), Decision::Deny(500));
-        assert_eq!(deny_decision(Some("100")), Decision::Deny(100));
-        assert_eq!(deny_decision(Some("599")), Decision::Deny(599));
-        // Malformed or out-of-range values have no wire representation.
-        assert_eq!(deny_decision(Some("99")), Decision::Deny(400));
-        assert_eq!(deny_decision(Some("600")), Decision::Deny(400));
-        assert_eq!(deny_decision(Some("0")), Decision::Deny(400));
-        assert_eq!(deny_decision(Some("")), Decision::Deny(400));
-        assert_eq!(deny_decision(Some("403x")), Decision::Deny(400));
-        assert_eq!(deny_decision(Some("forbidden")), Decision::Deny(400));
-    }
-
-    #[test]
-    fn resp_body_mode_decisions_on_host_stubs() {
-        // The host ffi stub mirrors the success contract, so the full
-        // mode handler is testable: text -> Done, text + deny -> Deny(s),
-        // no text -> body-less Done.
-        assert_eq!(resp_body("mode=resp-body&text=hi"), Decision::Done);
-        assert_eq!(
-            resp_body("mode=resp-body&text=hi&deny=403"),
-            Decision::Deny(403)
-        );
-        assert_eq!(resp_body("mode=resp-body"), Decision::Done);
-        assert_eq!(resp_body("mode=resp-body&deny=403"), Decision::Deny(403));
-        // An explicit empty text still writes the prefixed body.
-        assert_eq!(
-            resp_body("mode=resp-body&text=&deny=500"),
-            Decision::Deny(500)
-        );
-        // Bad deny values deny with 400 even when a body was written.
-        assert_eq!(
-            resp_body("mode=resp-body&text=hi&deny=nope"),
-            Decision::Deny(400)
-        );
-    }
-
-    #[test]
-    fn resp_body_mode_uses_abi_documented_codes() {
-        // Done short-circuits as NGX_DONE (-4); Deny(403) crosses the
-        // ABI as the raw status (100..=599), per docs/wasm-abi.md.
-        assert_eq!(Decision::Done.to_abi(), -4);
-        assert_eq!(deny_decision(Some("403")).to_abi(), 403);
-    }
-
-    #[test]
-    fn body_seen_key_is_derived_per_request() {
-        assert_eq!(
-            body_seen_key_for("/echo", "bmark=1"),
-            "probe:body_seen:/echo?bmark=1"
-        );
-        assert_eq!(body_seen_key_for("/echo", ""), "probe:body_seen:/echo");
-        // Distinct requests (different tags) must never share a key.
-        assert_ne!(
-            body_seen_key_for("/echo", "bmark=1&btag=a"),
-            body_seen_key_for("/echo", "bmark=1&btag=b")
-        );
-    }
-
-    #[test]
-    fn parse_body_seen_accepts_valid_values() {
-        assert_eq!(parse_body_seen("0:0"), Some((0, false)));
-        assert_eq!(parse_body_seen("123:0"), Some((123, false)));
-        assert_eq!(parse_body_seen("1:1"), Some((1, true)));
-        assert_eq!(parse_body_seen("4096:1"), Some((4096, true)));
-    }
-
-    #[test]
-    fn parse_body_seen_rejects_malformed_values() {
-        assert_eq!(parse_body_seen(""), None);
-        assert_eq!(parse_body_seen("123"), None);
-        assert_eq!(parse_body_seen(":1"), None);
-        assert_eq!(parse_body_seen("1:"), None);
-        assert_eq!(parse_body_seen("x:1"), None);
-        assert_eq!(parse_body_seen("1:2"), None);
-        assert_eq!(parse_body_seen("-1:1"), None);
-        assert_eq!(parse_body_seen("1:1:1"), None);
-    }
-}
+mod tests;

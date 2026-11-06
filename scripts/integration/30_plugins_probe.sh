@@ -1,6 +1,8 @@
 # integration drill section 30: kv-probe content/kv_del/TTL, ws handshake
 # header passthrough, memory ceiling, status shape, phases (post_read,
-# rewrite, access, body_filter, log), KV scan, path-key cap (sections 16-23).
+# rewrite, access, body_filter, log), rewrite-phase request edits
+# reaching the upstream (set_req_uri/query/header), access-phase
+# first-class redirect, KV scan, path-key cap (sections 16-23).
 
 echo "== 16. kv-probe: content phase, kv_del, TTL release =="
 cp build/plugins/kv-probe.wasm "$TMP/plugins/"
@@ -73,6 +75,34 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?rwdeny=1
 check "rewrite phase can deny (418)" test "$CODE" = "418"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?accdeny=1" || true)"
 check "access phase can deny (403)" test "$CODE" = "403"
+
+# Request rewrite reaches the upstream: `rwuri` swaps in the probe
+# URI+query pair, `rwhdr` sets X-Rw-Probe and drops X-Rw-Drop. The echo
+# upstream's JSON echo exposes path/query/headers, so the forwarded
+# facts are asserted end to end. The rewrite REPLACES the query, so
+# these flags must ride alone (never with mode=/redir probes).
+RW_CODE="$(curl -s -o "$TMP/rw-echo.json" -w '%{http_code}' --max-time 8 \
+    -H 'X-Rw-Drop: 1' "$GATE/probe?rwuri=1&rwhdr=1" || true)"
+check "rewrite: upstream saw the rewritten path + query" \
+    bash -c "test '$RW_CODE' = 200 && python3 -c 'import json;d=json.load(open(\"$TMP/rw-echo.json\"));assert d[\"path\"]==\"/rewritten/by/plugin\" and d[\"query\"]==\"rw=1\"'"
+check "rewrite: upstream saw the set header, dropped one removed" \
+    bash -c "python3 -c 'import json;h=json.load(open(\"$TMP/rw-echo.json\"))[\"headers\"];assert h.get(\"x-rw-probe\")==\"yes\" and \"x-rw-drop\" not in h'"
+
+# First-class redirect: the access phase answers 302 itself (plugin
+# response, never proxied; the body is the gateway's "<status>" text,
+# not the echo JSON), and the plugin-written Location header reaches
+# the client: deny_response() applies plugin resp headers on both its
+# body-carrying and body-less branches (crates/openrusty-server/src/
+# resp_shortcut.rs), matching docs/wasm-abi.md ("Deny short-circuit
+# responses do apply plugin-written response headers") and the SDK's
+# respond_redirect promise.
+REDIR_CODE="$(curl -s -o "$TMP/redir.out" -D "$TMP/redir.hdr" -w '%{http_code}' \
+    --max-time 8 "$GATE/probe?redir=1" || true)"
+check "access: redir answers 302 (plugin short-circuit)" test "$REDIR_CODE" = "302"
+check "access: redirect is plugin-generated, not proxied" \
+    bash -c "grep -qx '302' '$TMP/redir.out' && ! grep -q '\"node\"' '$TMP/redir.out'"
+check "access: redirect Location header reaches the client" \
+    grep -qi '^location: /moved/by/plugin' "$TMP/redir.hdr"
 
 echo "== 20. phase: body_filter =="
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$GATE/echo?bmark=1" || true)"

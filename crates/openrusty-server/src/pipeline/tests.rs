@@ -1,6 +1,7 @@
 use super::*;
 use crate::testutil::{boot_state, TmpDir};
 use axum::extract::ConnectInfo;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 #[test]
@@ -406,4 +407,221 @@ async fn proxied_request_records_phase_stats_once() {
             "{phase} must record exactly one observation"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rewritten request facts reaching the upstream
+// ---------------------------------------------------------------------------
+
+/// Rewrite-phase plugin (phase ids: post_read=0, rewrite=1): rewrites the
+/// URI, query, one header it sets (and one it replaces, case-blind), and
+/// deletes another. Every import must report success (`unreachable`
+/// traps otherwise, which the fail-open policy would hide as a skip).
+const REWRITE_WAT: &str = r#"(module
+  (import "openrusty" "req_set_uri" (func $set_uri (param i32 i32) (result i32)))
+  (import "openrusty" "req_set_query" (func $set_query (param i32 i32) (result i32)))
+  (import "openrusty" "req_set_header" (func $set_hdr (param i32 i32 i32 i32) (result i32)))
+  (import "openrusty" "req_del_header" (func $del_hdr (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "/rewritten")
+  (data (i32.const 16) "k=v")
+  (data (i32.const 32) "X-Rw")
+  (data (i32.const 48) "yes")
+  (data (i32.const 64) "X-Drop")
+  (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+    (if (i32.eq (local.get $phase) (i32.const 1))
+      (then
+        (if (i32.ne (call $set_uri (i32.const 0) (i32.const 10)) (i32.const 0))
+          (then unreachable))
+        (if (i32.ne (call $set_query (i32.const 16) (i32.const 3)) (i32.const 0))
+          (then unreachable))
+        (if (i32.ne
+              (call $set_hdr (i32.const 32) (i32.const 4) (i32.const 48) (i32.const 3))
+              (i32.const 0))
+          (then unreachable))
+        (if (i32.ne (call $del_hdr (i32.const 64) (i32.const 6)) (i32.const 0))
+          (then unreachable))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))"#;
+
+/// One-shot upstream that captures the request head it received and
+/// answers 200 "ok": the raw head (request line + headers) is delivered
+/// through the returned receiver, so a test can assert on the facts the
+/// gateway actually forwarded.
+async fn spawn_capture_upstream() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut head = String::new();
+        let mut buf = [0u8; 4096];
+        while !head.contains("\r\n\r\n") {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+        let _ = tx.send(head);
+        let resp = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    });
+    (port, rx)
+}
+
+/// Parse a captured request head into its request line and header pairs
+/// (names lowercased for case-blind comparison). Pure.
+fn parse_head(head: &str) -> (String, Vec<(String, String)>) {
+    let mut lines = head.split("\r\n\r\n").next().unwrap_or("").split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (request_line, headers)
+}
+
+/// Rewrite-phase rewrites (req_set_uri/req_set_query/req_set_header/
+/// req_del_header) must reach the upstream: `handle_request` builds the
+/// outgoing request from the session's post-phase context, never from
+/// the pre-phase clone. The upstream's captured facts are the proof.
+#[tokio::test]
+async fn rewritten_request_facts_reach_the_upstream() {
+    let (upstream, rx) = spawn_capture_upstream().await;
+    let dir = TmpDir::new("fwd-rewrite");
+    dir.write_plugin("rw.wasm", REWRITE_WAT.as_bytes());
+    dir.write_config(
+        &dir.standard_config()
+            .replace("127.0.0.1:9001", &format!("127.0.0.1:{upstream}")),
+    );
+    let state = boot_state(&dir);
+    let req = hyper::Request::builder()
+        .uri("/original?old=1")
+        .header("x-rw", "no")
+        .header("X-Drop", "bye")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (resp, label) = handle_request(state, "127.0.0.1:40010".parse().unwrap(), req).await;
+    assert_eq!(label.as_deref(), Some("/"));
+    assert_eq!(resp.status(), 200);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"ok");
+
+    let (line, headers) = parse_head(&rx.await.unwrap());
+    // Path AND query are the rewritten ones; the originals never leaked.
+    assert_eq!(line, "GET /rewritten?k=v HTTP/1.1");
+    // req_set_header replaced the incoming value: exactly one X-Rw, with
+    // the rewritten value; req_del_header removed X-Drop entirely.
+    let rw: Vec<&str> = headers
+        .iter()
+        .filter(|(n, _)| n == "x-rw")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(rw, vec!["yes"], "one X-Rw with the rewritten value");
+    assert!(
+        headers.iter().all(|(n, _)| n != "x-drop"),
+        "X-Drop must not reach the upstream: {headers:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Log phase on unrouted 404 (log_on_no_route)
+// ---------------------------------------------------------------------------
+
+/// Log-phase marker (phase id: log=7): declines every other phase and
+/// writes one KV entry in the log phase -- the observable side effect
+/// proving the log phase actually ran.
+const LOG_KV_WAT: &str = r#"(module
+  (import "openrusty" "kv_set" (func $set (param i32 i32 i32 i32 i64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "hit")
+  (data (i32.const 16) "1")
+  (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+    (if (i32.eq (local.get $phase) (i32.const 7))
+      (then
+        (drop (call $set (i32.const 0) (i32.const 3) (i32.const 16) (i32.const 1)
+          (i64.const -1)))))
+    i32.const -5)
+  (func (export "orr_alloc") (param i32) (result i32) i32.const 0))"#;
+
+/// Unrouted 404 with `log_on_no_route = true` and a plugin snapshot
+/// loaded: the response is 404 AND the log phase ran (one phase-stats
+/// observation plus the plugin's KV marker), while no pre-proxy phase
+/// ever starts on the unrouted path.
+#[tokio::test]
+async fn unrouted_404_runs_log_phase_when_enabled() {
+    let dir = TmpDir::new("no-route-log");
+    dir.write_plugin("logkv.wasm", LOG_KV_WAT.as_bytes());
+    dir.write_config(
+        &dir.prefix_only_config()
+            .replace("[plugins]", "[plugins]\nlog_on_no_route = true"),
+    );
+    let state = boot_state(&dir);
+    let req = hyper::Request::builder()
+        .uri("/definitely/not/routed")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (resp, label) =
+        handle_request(state.clone(), "127.0.0.1:40011".parse().unwrap(), req).await;
+    assert_eq!(resp.status(), 404);
+    assert_eq!(label, None);
+
+    let phases = state.metrics.snapshot().phases;
+    assert_eq!(
+        phases["log"].count, 1,
+        "log phase must run once: {phases:?}"
+    );
+    for phase in ["post_read", "rewrite", "access", "content"] {
+        assert!(
+            !phases.contains_key(phase),
+            "unrouted requests never start {phase}: {phases:?}"
+        );
+    }
+    // The plugin's log-phase KV marker landed.
+    let kv: Vec<usize> = state
+        .registry
+        .metric_view()
+        .iter()
+        .map(|(_, _, n)| *n)
+        .collect();
+    assert_eq!(kv, vec![1], "one KV entry from the log phase");
+}
+
+/// Counter-case: with `log_on_no_route = false` the same unrouted 404
+/// runs no phase at all -- no log phase stats, no KV side effect.
+#[tokio::test]
+async fn unrouted_404_skips_log_phase_when_disabled() {
+    let dir = TmpDir::new("no-route-nolog");
+    dir.write_plugin("logkv.wasm", LOG_KV_WAT.as_bytes());
+    dir.write_config(
+        &dir.prefix_only_config()
+            .replace("[plugins]", "[plugins]\nlog_on_no_route = false"),
+    );
+    let state = boot_state(&dir);
+    let req = hyper::Request::builder()
+        .uri("/definitely/not/routed")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (resp, label) =
+        handle_request(state.clone(), "127.0.0.1:40012".parse().unwrap(), req).await;
+    assert_eq!(resp.status(), 404);
+    assert_eq!(label, None);
+
+    let phases = state.metrics.snapshot().phases;
+    assert!(
+        !phases.contains_key("log"),
+        "log phase must not run: {phases:?}"
+    );
+    let kv: Vec<usize> = state
+        .registry
+        .metric_view()
+        .iter()
+        .map(|(_, _, n)| *n)
+        .collect();
+    assert_eq!(kv, vec![0], "no KV marker without the log phase");
 }

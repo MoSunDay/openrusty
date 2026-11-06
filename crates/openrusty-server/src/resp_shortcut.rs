@@ -3,7 +3,7 @@
 //! `resp_header_set`) to an `axum` response. Shared by the proxy pipeline
 //! (`Done`/`Deny` short-circuits); the dynamic API reuses them later.
 
-use crate::pipeline::{empty_response, text_response};
+use crate::pipeline::empty_response;
 use axum::body::Body;
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::response::Builder;
@@ -19,10 +19,15 @@ fn carried_body(sess: &RequestSession) -> Option<&Bytes> {
 
 /// Apply the plugin's response headers to a builder: every header wins
 /// except `content-length` (axum derives it from the body); invalid
-/// names/values are skipped. A default
-/// `content-type: text/plain; charset=utf-8` is added only when the
-/// plugin did not set one itself.
-fn with_plugin_headers(mut builder: Builder, sess: &RequestSession) -> Builder {
+/// names/values are skipped. When `default_content_type` is set and the
+/// plugin did not set a `content-type` itself, a default
+/// `content-type: text/plain; charset=utf-8` is added — body-carrying
+/// responses only; an empty 204 must not gain one.
+fn with_plugin_headers(
+    mut builder: Builder,
+    sess: &RequestSession,
+    default_content_type: bool,
+) -> Builder {
     let has_content_type = sess
         .resp_headers()
         .iter()
@@ -41,7 +46,7 @@ fn with_plugin_headers(mut builder: Builder, sess: &RequestSession) -> Builder {
             hm.append(n, v);
         }
     }
-    if !has_content_type {
+    if default_content_type && !has_content_type {
         builder = builder.header("content-type", "text/plain; charset=utf-8");
     }
     builder
@@ -50,29 +55,33 @@ fn with_plugin_headers(mut builder: Builder, sess: &RequestSession) -> Builder {
 /// One body-carrying short-circuit: the status, the plugin body and the
 /// plugin headers.
 fn body_response(sess: &RequestSession, status: u16, body: Bytes) -> Response {
-    with_plugin_headers(Response::builder().status(status), sess)
+    with_plugin_headers(Response::builder().status(status), sess, true)
         .body(Body::from(body))
         .unwrap_or_else(|_| empty_response(500))
 }
 
 /// Response for a `Decision::Done` short-circuit. A plugin body upgrades
-/// the usual empty 204 to a 200 carrying that body (plus the plugin's
-/// response headers); no body keeps the empty 204.
+/// the usual empty 204 to a 200 carrying that body; without a body the
+/// empty 204 stands — either way the plugin's response headers are
+/// applied (no default content-type on the bodyless 204).
 pub fn done_response(sess: &RequestSession) -> Response {
     match carried_body(sess) {
         Some(body) => body_response(sess, 200, body.clone()),
-        None => empty_response(204),
+        None => with_plugin_headers(Response::builder().status(204), sess, false)
+            .body(Body::empty())
+            .unwrap_or_else(|_| empty_response(204)),
     }
 }
 
 /// Response for a `Decision::Deny(status)` short-circuit. A plugin body
-/// replaces the plain `"<status>\n"` text with that status and body (plus
-/// the plugin's response headers); no body keeps the plain text.
+/// replaces the plain `"<status>\n"` text with that status and body;
+/// without a body the plain text stands. Both carry the plugin's
+/// response headers (e.g. the `Location` written by `respond_redirect`).
 pub fn deny_response(sess: &RequestSession, status: u16) -> Response {
-    match carried_body(sess) {
-        Some(body) => body_response(sess, status, body.clone()),
-        None => text_response(status, format!("{status}\n")),
-    }
+    let body = carried_body(sess)
+        .cloned()
+        .unwrap_or_else(|| Bytes::from(format!("{status}\n")));
+    body_response(sess, status, body)
 }
 
 /// Status to log for a `Done` short-circuit: 200 when the plugin wrote a
@@ -126,6 +135,20 @@ mod tests {
       i32.const -4)
     (func (export "orr_alloc") (param i32) (result i32) i32.const 0)
     (memory (export "memory") 1))"#;
+
+    /// Access-phase `respond_redirect` shape: a `Location` header plus a
+    /// body-less `Deny(302)` — the header must reach the client.
+    const REDIR_WAT: &str = r#"(module
+    (import "openrusty" "resp_header_set" (func $hdr (param i32 i32 i32 i32) (result i32)))
+    (memory (export "memory") 1)
+    (data (i32.const 0) "Location")
+    (data (i32.const 16) "/moved/by/plugin")
+    (func (export "orr_on_phase") (param $phase i32) (param $ctx i32) (result i32)
+      (if (i32.ne (local.get $phase) (i32.const 2))
+        (then (return (i32.const -5))))
+      (drop (call $hdr (i32.const 0) (i32.const 8) (i32.const 16) (i32.const 16)))
+      i32.const 302)
+    (func (export "orr_alloc") (param i32) (result i32) i32.const 0))"#;
 
     /// A session with no plugins and no body: `for_parts` on an empty
     /// snapshot, so no registry or wasm module is needed.
@@ -216,5 +239,57 @@ mod tests {
             .await
             .unwrap();
         assert!(body.is_empty());
+    }
+
+    /// Body-less Deny with a plugin header (the `respond_redirect`
+    /// shape): status kept, header applied, plain `"<status>\n"` body,
+    /// default content-type still injected.
+    #[tokio::test]
+    async fn deny_without_body_applies_plugin_headers() {
+        let mut sess = bare_session();
+        sess.set_resp_headers(vec![("Location".into(), "/moved/by/plugin".into())]);
+        let resp = deny_response(&sess, 302);
+        assert_eq!(resp.status(), 302);
+        assert_eq!(resp.headers().get("location").unwrap(), &"/moved/by/plugin");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            &"text/plain; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), READ_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"302\n");
+    }
+
+    /// Body-less Done with a plugin header (kv-probe `l404check` shape):
+    /// 204, header survives, empty body, and no default content-type is
+    /// injected onto the bodyless 204.
+    #[tokio::test]
+    async fn done_without_body_applies_plugin_headers() {
+        let mut sess = bare_session();
+        sess.set_resp_headers(vec![("X-Log404".into(), "1".into())]);
+        let resp = done_response(&sess);
+        assert_eq!(resp.status(), 204);
+        assert_eq!(log_status(&sess, 204), 204);
+        assert_eq!(resp.headers().get("x-log404").unwrap(), &"1");
+        assert!(resp.headers().get("content-type").is_none());
+        let body = axum::body::to_bytes(resp.into_body(), READ_LIMIT)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    /// End-to-end: an access-phase plugin redirect (Location header +
+    /// body-less Deny(302), exactly what `respond_redirect` produces)
+    /// answers 302 with the `Location` header on the wire.
+    #[tokio::test]
+    async fn deny_redirect_carries_location_header() {
+        let resp = serve_with_plugin("shortcut-deny-redir", REDIR_WAT).await;
+        assert_eq!(resp.status(), 302);
+        assert_eq!(resp.headers().get("location").unwrap(), &"/moved/by/plugin");
+        let body = axum::body::to_bytes(resp.into_body(), READ_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"302\n");
     }
 }

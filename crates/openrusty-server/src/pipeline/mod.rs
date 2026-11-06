@@ -192,6 +192,33 @@ fn route_timeout(timeout_ms: u64) -> Option<Duration> {
     (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
 }
 
+/// Assemble the request context. The `routing` pair is `(route_index,
+/// upstream)`, both `None` until routing resolves them (shared by the
+/// unrouted 404/502 paths, which never fill one or both of the pair).
+fn req_ctx(
+    method: String,
+    path: String,
+    query: String,
+    version: String,
+    client_addr: SocketAddr,
+    headers: Vec<(String, String)>,
+    routing: (Option<usize>, Option<String>),
+) -> ReqCtx {
+    ReqCtx {
+        method,
+        path,
+        query,
+        version,
+        client_addr,
+        headers,
+        route_index: routing.0,
+        upstream: routing.1,
+        peer_index: None,
+        attempts: 0,
+        tried: Vec::new(),
+    }
+}
+
 /// Full request lifecycle for one proxied request.
 ///
 /// Returns the response plus the route label for the request metrics: the
@@ -213,11 +240,6 @@ pub async fn handle_request(
     let method = req.method().clone();
     let method_str = method.as_str().to_string();
     let path = req.uri().path().to_string();
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| path.clone());
     let query = req.uri().query().unwrap_or_default().to_string();
     let version = match req.version() {
         hyper::Version::HTTP_2 => "HTTP/2",
@@ -239,6 +261,19 @@ pub async fn handle_request(
     // catch-alls), then longest prefix, first wins on ties.
     let host = request_host(&headers);
     let Some(route_idx) = match_route(&rt.routes, host.as_deref(), &path) else {
+        if state.static_config.plugins.log_on_no_route {
+            let ctx = req_ctx(
+                method_str,
+                path,
+                query,
+                version,
+                remote,
+                headers,
+                (None, None),
+            );
+            let mut session = RequestSession::new(&state.registry, snap, ctx, Vec::new());
+            finish_log(&state, &mut session, 404);
+        }
         return (text_response(404, "404 not found\n"), None);
     };
     let route = rt.routes[route_idx].clone();
@@ -246,25 +281,34 @@ pub async fn handle_request(
     // snapshot the request is served with, not from a later registry read).
     let route_label = route.path_prefix.clone();
     let Some(up_rt) = rt.upstreams.get(&route.upstream).cloned() else {
+        if state.static_config.plugins.log_on_no_route {
+            let ctx = req_ctx(
+                method_str,
+                path,
+                query,
+                version,
+                remote,
+                headers,
+                (Some(route_idx), Some(route.upstream.clone())),
+            );
+            let mut session = RequestSession::new(&state.registry, snap, ctx, Vec::new());
+            finish_log(&state, &mut session, 502);
+        }
         return (
             text_response(502, "502 unknown upstream\n"),
             Some(route_label),
         );
     };
 
-    let ctx = ReqCtx {
-        method: method_str.clone(),
+    let ctx = req_ctx(
+        method_str.clone(),
         path,
         query,
         version,
-        client_addr: remote,
-        headers: headers.clone(),
-        route_index: Some(route_idx),
-        upstream: Some(up_rt.up.name.clone()),
-        peer_index: None,
-        attempts: 0,
-        tried: Vec::new(),
-    };
+        remote,
+        headers,
+        (Some(route_idx), Some(up_rt.up.name.clone())),
+    );
 
     // 4. Peer views with current health.
     // (`now` is only the routing-time view; health records below re-read
@@ -307,8 +351,10 @@ pub async fn handle_request(
         }
     }
 
-    // 7. WebSocket branch, before the body is touched.
-    if proxy::is_websocket_upgrade(&method_str, &headers) {
+    // 7. WebSocket branch, before the body is touched. Post-phase
+    // headers, so a plugin rewrite can enable (or break) the upgrade.
+    let ws_headers = session.ctx().headers.clone();
+    if proxy::is_websocket_upgrade(&method_str, &ws_headers) {
         // WebSocket upgrades are routed responses too.
         return (
             crate::ws::proxy_websocket(state, session, up_rt, req, route_timeout(route.timeout_ms))
@@ -352,7 +398,18 @@ pub async fn handle_request(
         _ => {}
     }
 
-    // 10. Proxy attempts with retries.
+    // 10. Proxy attempts with retries. The forwarded facts come from the
+    // session's post-phase context, so plugin rewrites (req_set_uri/
+    // req_set_query/req_set_header/req_del_header) reach the upstream.
+    let fwd_path_and_query = {
+        let ctx = session.ctx();
+        if ctx.query.is_empty() {
+            ctx.path.clone()
+        } else {
+            format!("{}?{}", ctx.path, ctx.query)
+        }
+    };
+    let fwd_headers = session.ctx().headers.clone();
     let attempts = up_rt.up.retries + 1;
     let timeout = route_timeout(route.timeout_ms);
     let client_ip = remote.ip().to_string();
@@ -383,8 +440,8 @@ pub async fn handle_request(
         let peer = up_rt.up.peers[idx];
         let fwd = proxy::ForwardRequest {
             method: method.clone(),
-            path_and_query: path_and_query.clone(),
-            headers: headers.clone(),
+            path_and_query: fwd_path_and_query.clone(),
+            headers: fwd_headers.clone(),
             body: body.clone(),
             client_ip: client_ip.clone(),
         };

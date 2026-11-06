@@ -14,7 +14,8 @@ Commit: bee611a
 - 沙箱：单次阶段调用受 `plugins.timeout_ms`（wasmtime epoch interruption）与 `plugins.max_memory_mb`（`StoreLimits`）约束；trap/超时/协议错误按 `plugins.on_failure` 降级：`fail_open`（默认）→ `Declined` 放行，`fail_closed` → `Deny(503)`；错误按插件名计数并经 `registry.status()` 暴露。
 - 热重载：`PluginRegistry::reload` 重新读配置、编译并校验全部插件，成功后以 `arc-swap` 原子发布新 `PluginSnapshot`；任一步失败整体拒绝、旧快照保留；`generation` 递增。
 - host KV：键控于插件名（跨重载保留），支持带 TTL 的 `kv_get`/`kv_set`/`kv_del` 与 `kv_scan`；数据经两段式读写跨边界传递（host 写入 guest 自备缓冲，容量不足返回 `-所需长度`）。
-- 响应体写入：第 19 个 import `resp_body_set`（SDK `host::set_resp_body`，1 MiB 上限，同请求覆盖）使 `Done`/`Deny` 短路携带模块写的 body（网关侧映射见 `resp_shortcut.rs`/`dynamic_api.rs`）。
+- 请求改写：第 20-23 个 import `req_set_uri`/`req_set_query`/`req_set_header`/`req_del_header`（`linker_rewrite.rs`，SDK `host::set_req_*`）——立即改写 session ctx 并以 `ReqEdit` 双轨记录（`take_req_edits` 暂无消费者，供未来审计）；uri/query ≤8KiB，uri 禁 `?#`/控制符、query 禁前导 `?`，非法入参返回 -1 且零副作用；`content-length` 受保护（set 拒绝、del 无操作）；头替换大小写不敏感全量替换。
+- 响应体写入：import `resp_body_set`（SDK `host::set_resp_body`，1 MiB 上限，同请求覆盖）使 `Done`/`Deny` 短路携带模块写的 body（网关侧映射见 `resp_shortcut.rs`/`dynamic_api.rs`）。
 - 动态执行 API：`DynamicRegistry`（`dynamic.rs`）按 `[dynamic]` 节服务单模块合成管线；编译缓存 stat 驱动（键 `mtime+size`，替换文件下一请求生效、无需 reload）、按名 singleflight、`HostState` 按名跨替换存活；`validate_bytes`（编译+ABI 预检）与 `dir()` 支撑 server 侧注册面（PUT 先验证后原子落盘）；契约见 docs/wasm-abi.md "Dynamic execution API"。
 - guest 侧配套：`openrusty-sdk`（`no_std`：host imports 绑定、guest 分配器、`dispatch!`）与 `openrusty-macros`（`#[phase(...)]`）；一方插件见 `plugins/`。
 
@@ -34,7 +35,7 @@ Commit: bee611a
 ## 依赖与接口
 - 依赖 wasmtime、arc-swap、dashmap、`openrusty-core`。
 - 对外接口：`PluginRegistry::bootstrap/reload/snapshot/status`、`run_phase`、host KV、`DynamicRegistry::invoke`。
-- 代码锚点：`crates/openrusty-wasm/src/{registry,registry_validate,runner,linker,linker_req,linker_kv,host_state,session,mem,dynamic}.rs`。
+- 代码锚点：`crates/openrusty-wasm/src/{registry,registry_validate,runner,linker,linker_req,linker_kv,linker_rewrite,host_state,session,mem,dynamic}.rs`。
 
 ## 关联模块
 - [网关请求管线](../gateway-pipeline/index.md)

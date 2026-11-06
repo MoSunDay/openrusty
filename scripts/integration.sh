@@ -24,7 +24,12 @@
 # serves 503 draining on /openrusty/ready while /openrusty/live stays
 # 200 until the grace window expires), the config surface (weighted
 # swrr exact split, host/exact route selection, upstream mTLS with
-# client certs, http1_only inbound), and pipeline resp_body_set.
+# client certs, http1_only inbound), pipeline resp_body_set,
+# rewrite-phase request edits reaching the upstream (set_req_uri/
+# query + set/del req headers), access-phase first-class redirects
+# (302 plugin short-circuit; the Location header itself is dropped by
+# the gateway's body-less Deny path - see the note in section 19), and
+# the plugin log phase on unrouted 404s (log_on_no_route = true).
 # The drill body lives in scripts/integration/*.sh, sourced below in
 # execution order; fragments run in this shell and share the globals
 # and helpers defined here.
@@ -168,6 +173,7 @@ post_body_check() { curl -s --max-time 5 -d 'hello-body' "$GATE/echo" | grep -q 
 . "$(dirname "$0")/integration/95_least_conn.sh"
 . "$(dirname "$0")/integration/96_config_surface.sh"
 . "$(dirname "$0")/integration/97_resp_body_set.sh"
+. "$(dirname "$0")/integration/98_no_route_log.sh"
 
 
 echo

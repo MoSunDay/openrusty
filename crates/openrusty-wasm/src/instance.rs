@@ -26,6 +26,16 @@ pub enum HeaderEdit {
     Del(String),
 }
 
+/// A deferred request-fact mutation recorded by a plugin; also applied
+/// immediately to `ctx` for in-chain visibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReqEdit {
+    SetUri(String),
+    SetQuery(String),
+    SetHeader(String, String),
+    DelHeader(String),
+}
+
 /// Data carried by one wasmtime `Store` for the duration of one request.
 pub struct HostData {
     /// Request facts + mutable routing state (peer_index is written by
@@ -39,6 +49,9 @@ pub struct HostData {
     pub settings: Arc<HashMap<String, String>>,
     /// Header edits requested by the plugin (applied by the server).
     pub resp_edits: Vec<HeaderEdit>,
+    /// Request-fact edits requested by the plugin (applied by the server
+    /// when forwarding; `ctx` is kept in sync for in-chain visibility).
+    pub req_edits: Vec<ReqEdit>,
     /// Current response headers; seeded by the server before header_filter
     /// and kept in sync by the resp_header_* imports.
     pub resp_headers: Vec<(String, String)>,
@@ -79,6 +92,7 @@ pub fn new_host_data(
         state,
         settings,
         resp_edits: Vec::new(),
+        req_edits: Vec::new(),
         resp_headers: Vec::new(),
         resp_body: None,
         req_body: Bytes::new(),
@@ -123,6 +137,7 @@ mod tests {
             Arc::new(HashMap::new()),
         );
         assert!(d.resp_edits.is_empty());
+        assert!(d.req_edits.is_empty());
         assert!(d.resp_headers.is_empty());
         assert!(d.resp_body.is_none());
         assert!(d.req_body.is_empty());

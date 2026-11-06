@@ -2,7 +2,7 @@
 //! pinned snapshot. Instances are created lazily on first use.
 
 use crate::host_state::HostState;
-use crate::instance::{new_host_data, HeaderEdit, PeerView};
+use crate::instance::{new_host_data, HeaderEdit, PeerView, ReqEdit};
 use crate::registry::{LoadedPlugin, PluginRegistry, PluginSnapshot};
 use crate::runner::{self, PluginRt};
 use bytes::Bytes;
@@ -132,6 +132,15 @@ impl RequestSession {
         let mut out = Vec::new();
         for rt in self.rts.iter_mut().flatten() {
             out.append(&mut rt.host_data_mut().resp_edits);
+        }
+        out
+    }
+
+    /// Drain all request-fact edits recorded by plugins so far.
+    pub fn take_req_edits(&mut self) -> Vec<ReqEdit> {
+        let mut out = Vec::new();
+        for rt in self.rts.iter_mut().flatten() {
+            out.append(&mut rt.host_data_mut().req_edits);
         }
         out
     }

@@ -16,12 +16,13 @@ pub mod session;
 
 mod linker_kv;
 mod linker_req;
+mod linker_rewrite;
 mod registry_validate;
 
 pub use dynamic::{valid_name, DynOutcome, DynamicRegistry, ResolveError};
 pub use epoch::{ticks_for, EpochTicker, TICK_MS};
 pub use host_state::HostState;
-pub use instance::{new_host_data, HeaderEdit, HostData, PeerView};
+pub use instance::{new_host_data, HeaderEdit, HostData, PeerView, ReqEdit};
 pub use linker::{build_linker, validate_module, AbiError, AbiInfo};
 pub use registry::{new_engine, LoadedPlugin, PluginRegistry, PluginSnapshot, ReloadError};
 pub use runner::{fallback_decision, instantiate, run_phase, ErrorKind, PhaseOutcome, PluginRt};

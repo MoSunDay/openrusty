@@ -22,6 +22,11 @@ extern "C" {
     pub fn req_peer_get(idx: i32, op: i32, oc: i32) -> i32;
     pub fn balancer_set_peer(idx: i32) -> i32;
 
+    pub fn req_set_uri(ptr: i32, len: i32) -> i32;
+    pub fn req_set_query(ptr: i32, len: i32) -> i32;
+    pub fn req_set_header(np: i32, nl: i32, vp: i32, vl: i32) -> i32;
+    pub fn req_del_header(np: i32, nl: i32) -> i32;
+
     pub fn kv_get(kp: i32, kl: i32, op: i32, oc: i32) -> i32;
     pub fn kv_set(kp: i32, kl: i32, vp: i32, vl: i32, ttl_ms: i64) -> i32;
     pub fn kv_del(kp: i32, kl: i32) -> i32;
@@ -75,6 +80,32 @@ pub unsafe fn req_peer_get(_idx: i32, _op: i32, _oc: i32) -> i32 {
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unused)]
 pub unsafe fn balancer_set_peer(_idx: i32) -> i32 {
+    0
+}
+
+// The stubs mirror the success contract (`0`), so host-side logic tests
+// behave like the gateway.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+pub unsafe fn req_set_uri(_ptr: i32, _len: i32) -> i32 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+pub unsafe fn req_set_query(_ptr: i32, _len: i32) -> i32 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+pub unsafe fn req_set_header(_np: i32, _nl: i32, _vp: i32, _vl: i32) -> i32 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+pub unsafe fn req_del_header(_np: i32, _nl: i32) -> i32 {
     0
 }
 

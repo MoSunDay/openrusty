@@ -47,6 +47,10 @@ order = ["vllm-kv-scheduler"]
 timeout_ms = 250
 max_memory_mb = 16
 on_failure = "fail_open"
+# nginx-aligned: the plugin log phase also runs for requests that
+# never routed (404) or hit an unknown upstream (502). Explicit here
+# for clarity (it is the default); section 98 drills the behaviour.
+log_on_no_route = true
 
 [plugins.settings.vllm-kv-scheduler]
 extract = "query:task"

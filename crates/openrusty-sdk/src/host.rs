@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ffi;
+use crate::Decision;
 
 /// Log severity passed to `host_log`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,37 @@ fn item_is(items: &[&[u8]], idx: usize, expect: &[u8]) -> bool {
 /// host accepted the choice.
 pub fn set_peer(idx: u32) -> bool {
     unsafe { ffi::balancer_set_peer(idx as i32) == 0 }
+}
+
+/// Rewrite the request path (must start with `/`, no `?`/`#`, max 8 KiB).
+/// Applied to the context immediately and used when forwarding upstream.
+/// True when the host accepted the value.
+pub fn set_req_uri(path: &str) -> bool {
+    unsafe { ffi::req_set_uri(path.as_ptr() as i32, path.len() as i32) == 0 }
+}
+
+/// Replace the request query string (empty clears it; no leading `?`,
+/// max 8 KiB). True when the host accepted the value.
+pub fn set_req_query(query: &str) -> bool {
+    unsafe { ffi::req_set_query(query.as_ptr() as i32, query.len() as i32) == 0 }
+}
+
+/// Set/replace-all a request header (rewrite/access phases). The host
+/// refuses the protected `content-length` header. True when accepted.
+pub fn set_req_header(name: &str, val: &str) -> bool {
+    unsafe {
+        ffi::req_set_header(
+            name.as_ptr() as i32,
+            name.len() as i32,
+            val.as_ptr() as i32,
+            val.len() as i32,
+        ) == 0
+    }
+}
+
+/// Remove every case-insensitive match of a request header.
+pub fn del_req_header(name: &str) {
+    unsafe { ffi::req_del_header(name.as_ptr() as i32, name.len() as i32) };
 }
 
 /// Read a key from the shared KV store. `None` when missing (`0` return);
@@ -269,6 +301,19 @@ pub fn set_resp_header(name: &str, val: &str) {
 /// Remove an upstream response header.
 pub fn del_resp_header(name: &str) {
     unsafe { ffi::resp_header_del(name.as_ptr() as i32, name.len() as i32) };
+}
+
+/// nginx `return <status> <location>` semantics: set the `Location`
+/// response header and deny with a 3xx status. A status outside
+/// `300..=399` has no redirect meaning, so it is coerced to 302.
+pub fn respond_redirect(status: u16, location: &str) -> Decision {
+    let code = if (300..=399).contains(&status) {
+        status
+    } else {
+        302
+    };
+    set_resp_header("Location", location);
+    Decision::Deny(code)
 }
 
 /// Write the response body carried by a short-circuited response
@@ -535,5 +580,27 @@ mod tests {
     fn set_resp_body_reports_acceptance() {
         assert!(set_resp_body(b"hello"));
         assert!(set_resp_body(&[]));
+    }
+
+    /// Same stub contract (`0` = accepted) as [`set_peer`]; the `-1`
+    /// refusal only exists on the gateway side (openrusty-wasm linker
+    /// tests).
+    #[test]
+    fn req_edit_wrappers_report_host_acceptance() {
+        assert!(set_req_uri("/rewritten"));
+        assert!(set_req_query("a=1"));
+        assert!(set_req_query(""));
+        assert!(set_req_header("X-Rw-Probe", "yes"));
+        del_req_header("X-Rw-Drop");
+    }
+
+    #[test]
+    fn respond_redirect_coerces_non_3xx_to_302() {
+        assert_eq!(respond_redirect(302, "/a"), Decision::Deny(302));
+        assert_eq!(respond_redirect(307, "/a"), Decision::Deny(307));
+        assert_eq!(respond_redirect(399, "/a"), Decision::Deny(399));
+        for status in [0u16, 1, 99, 200, 299, 400, 404, 500, u16::MAX] {
+            assert_eq!(respond_redirect(status, "/a"), Decision::Deny(302));
+        }
     }
 }

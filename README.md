@@ -79,7 +79,7 @@ the units so freshly built binaries are picked up. Logs live in journald
 ```bash
 cargo test --workspace        # unit tests (balancers, TTL, ABI, sandbox, reload)
 bash scripts/build-plugins.sh # per-plugin unit tests + wasm build
-bash scripts/integration.sh   # end-to-end drill: 192 checks, sections §1-§34 + §70-§97
+bash scripts/integration.sh   # end-to-end drill: 203 checks, sections §1-§34 + §70-§98
 ```
 
 The integration drill starts echo upstreams and the gateway on test ports

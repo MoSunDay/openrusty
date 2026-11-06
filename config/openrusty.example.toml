@@ -40,6 +40,8 @@ max_memory_mb = 16
 instance_pool_size = 1000
 # Behavior when a plugin traps/times out: fail_open (decision = declined) or fail_closed (decision = deny 503).
 on_failure = "fail_open"
+# Run the log phase even for requests that never routed (404) or hit an unknown upstream (502); false restores the old skip.
+log_on_no_route = true
 
 # Per-plugin free-form settings, visible to the plugin as key/value strings.
 [plugins.settings.vllm-kv-scheduler]

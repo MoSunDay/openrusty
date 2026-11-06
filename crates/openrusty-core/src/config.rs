@@ -131,6 +131,10 @@ pub struct PluginsConfig {
     /// pooling and falls back to on-demand allocation.
     #[serde(default = "default_instance_pool_size")]
     pub instance_pool_size: u32,
+    /// Run the plugin log phase even for requests that never routed (404)
+    /// or hit an unknown upstream (502); nginx's log phase always runs.
+    #[serde(default = "default_log_on_no_route")]
+    pub log_on_no_route: bool,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -143,6 +147,10 @@ fn default_max_memory_mb() -> u32 {
 
 fn default_instance_pool_size() -> u32 {
     1000
+}
+
+fn default_log_on_no_route() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -490,6 +498,7 @@ upstream = "vllm"
         validate(&cfg).unwrap();
         assert_eq!(cfg.plugins.timeout_ms, 50);
         assert_eq!(cfg.plugins.on_failure, FailPolicy::FailOpen);
+        assert!(cfg.plugins.log_on_no_route);
         assert_eq!(cfg.upstreams[0].balancer, BalancerKind::Swrr);
         // No [[server.listeners]] written: derive a single inbound listener from
         // server.listen (the historical single-socket shape).

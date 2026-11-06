@@ -9,6 +9,7 @@ use crate::host_state::{self, HostState};
 use crate::instance::{new_host_data, HeaderEdit, HostData};
 use crate::linker_kv;
 use crate::linker_req;
+use crate::linker_rewrite;
 use crate::mem;
 use bytes::Bytes;
 use openrusty_core::ReqCtx;
@@ -72,6 +73,7 @@ pub fn build_linker(engine: &Engine) -> Result<Linker<HostData>, wasmtime::Error
 
     linker_req::link(&mut linker)?;
     linker_kv::link(&mut linker)?;
+    linker_rewrite::link(&mut linker)?;
     linker.func_wrap(
         abi::NS,
         abi::RESP_HEADER_GET,

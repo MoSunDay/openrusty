@@ -69,7 +69,10 @@ Routing happens before any plugin phase: the request path is matched against
 the configured `[[routes]]` by longest prefix (first match wins on ties), and
 the matched route index and upstream name are set on the request context
 before `post_read` runs. When no route matches, the request is answered with
-404 and no plugin phase runs at all — `log` included.
+404 and no plugin phase runs except — at most — `log`:
+`plugins.log_on_no_route` (default `true`) runs the log phase even for
+requests that never routed (404) or hit an unknown upstream (502), matching
+nginx where the log phase always runs; `false` restores the old skip.
 
 `body_filter` is observe-only: each response body data chunk is pushed through
 the phase (readable via `body_chunk` / `body_is_last`) and then yielded to the
@@ -105,6 +108,12 @@ req_meta(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
         "body" (raw request body bytes, capped at 16 MiB; buffered before
         the content phase, so content/balancer/header_filter/body_filter/log
         see it while post_read/rewrite/access see an empty body)
+req_set_uri(ptr: i32, len: i32) -> i32       # 0 ok, -1 invalid (see "Request rewriting")
+req_set_query(ptr: i32, len: i32) -> i32     # 0 ok, -1 invalid; empty string clears the query
+req_set_header(name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32) -> i32
+  # 0 ok, -1 invalid; replaces all case-insensitive occurrences
+req_del_header(name_ptr: i32, name_len: i32) -> i32
+  # 0 ok, -1 invalid; removes all occurrences
 req_peer_count() -> i32                     # total peers of the routed upstream
 req_peer_get(idx: i32, out_ptr: i32, out_cap: i32) -> i32
   writes TLV: name, addr, healthy("1"/"0"); -2 = invalid index (nothing written)
@@ -166,6 +175,38 @@ cfg_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32
 gateway re-validates the plugin's pick against the current health registry
 before each attempt and falls back to the configured default balancer when
 the chosen peer is invalid or unhealthy (see `pipeline_peer.rs`).
+
+### Request rewriting
+
+Four imports mutate the request itself, aligned with nginx `ngx.req.set_*`:
+`req_set_uri` rewrites the path, `req_set_query` the query string, and
+`req_set_header` / `req_del_header` the request headers. All return `0` on
+success and `-1` on invalid input; a `-1` mutates nothing.
+
+- Callable from post_read / rewrite / access / content. Effects are applied
+  immediately to the request facts — `req_meta` reads from later plugins and
+  later phases see the rewritten values — and are recorded as edits consumed
+  by the gateway.
+- The rewritten path, query and headers are what gets forwarded upstream
+  (this replaces the old pre-phase clone behavior). Route matching is NOT
+  re-run: the route stays the one matched on the original path;
+  OpenResty-style internal redirect is future work.
+- Limits: uri and query are capped at 8 KiB each; the uri must be non-empty,
+  an absolute path (leading `/`), and contain no `?`, `#` or control
+  characters; the query must not start with `?` (an empty string clears it);
+  header name/value validation is identical to `resp_header_set`.
+- `req_set_header` replaces ALL existing case-insensitive occurrences of the
+  name; `req_del_header` removes all of them. `content-length` is protected:
+  setting it is rejected with `-1`, deleting it is a no-op.
+- Purely additive: old plugins that never import these are unaffected, and no
+  ABI version bump is required.
+
+SDK conveniences: `openrusty-sdk` wraps these as `set_req_uri` /
+`set_req_query` / `set_req_header` / `del_req_header`, and adds
+`respond_redirect(status, location) -> Decision::Deny(status)` for nginx
+`return 302` semantics: `status` must be `300..=399` (anything else is
+coerced to `302`) and the helper sets the `Location` response header — Deny
+short-circuit responses do apply plugin-written response headers.
 
 ## Timeouts & memory
 
